@@ -860,12 +860,7 @@ mod tests {
 
     #[test]
     fn test_typecheck_binary_flag() {
-        let args = parse_dev(&[
-            "vtz",
-            "dev",
-            "--typecheck-binary",
-            "/usr/local/bin/tsgo",
-        ]);
+        let args = parse_dev(&["vtz", "dev", "--typecheck-binary", "/usr/local/bin/tsgo"]);
         assert_eq!(
             args.typecheck_binary,
             Some(PathBuf::from("/usr/local/bin/tsgo"))
@@ -918,12 +913,7 @@ mod tests {
 
     #[test]
     fn test_test_with_paths() {
-        let args = parse_test(&[
-            "vtz",
-            "test",
-            "src/math.test.ts",
-            "src/string.test.ts",
-        ]);
+        let args = parse_test(&["vtz", "test", "src/math.test.ts", "src/string.test.ts"]);
         assert_eq!(args.paths.len(), 2);
         assert_eq!(args.paths[0], PathBuf::from("src/math.test.ts"));
         assert_eq!(args.paths[1], PathBuf::from("src/string.test.ts"));
@@ -943,13 +933,7 @@ mod tests {
 
     #[test]
     fn test_test_coverage() {
-        let args = parse_test(&[
-            "vtz",
-            "test",
-            "--coverage",
-            "--coverage-threshold",
-            "80",
-        ]);
+        let args = parse_test(&["vtz", "test", "--coverage", "--coverage-threshold", "80"]);
         assert!(args.coverage);
         assert_eq!(args.coverage_threshold, Some(80));
     }
@@ -1231,14 +1215,7 @@ mod tests {
 
     #[test]
     fn test_update_all_flags_combined() {
-        let args = parse_update(&[
-            "vtz",
-            "update",
-            "zod",
-            "--latest",
-            "--dry-run",
-            "--json",
-        ]);
+        let args = parse_update(&["vtz", "update", "zod", "--latest", "--dry-run", "--json"]);
         assert_eq!(args.packages, vec!["zod"]);
         assert!(args.latest);
         assert!(args.dry_run);
@@ -1365,13 +1342,7 @@ mod tests {
 
     #[test]
     fn test_run_workspace_long_flag() {
-        let args = parse_run(&[
-            "vtz",
-            "run",
-            "--workspace",
-            "packages/api",
-            "test",
-        ]);
+        let args = parse_run(&["vtz", "run", "--workspace", "packages/api", "test"]);
         assert_eq!(args.workspace, Some("packages/api".to_string()));
         assert_eq!(args.script, Some("test".to_string()));
     }
@@ -1440,13 +1411,7 @@ mod tests {
 
     #[test]
     fn test_remove_workspace_long_flag() {
-        let args = parse_remove(&[
-            "vtz",
-            "remove",
-            "zod",
-            "--workspace",
-            "@myorg/api",
-        ]);
+        let args = parse_remove(&["vtz", "remove", "zod", "--workspace", "@myorg/api"]);
         assert_eq!(args.workspace, Some("@myorg/api".to_string()));
     }
 
@@ -1468,14 +1433,7 @@ mod tests {
 
     #[test]
     fn test_config_set_trust_scripts() {
-        let args = parse_config(&[
-            "vtz",
-            "config",
-            "set",
-            "trust-scripts",
-            "esbuild",
-            "prisma",
-        ]);
+        let args = parse_config(&["vtz", "config", "set", "trust-scripts", "esbuild", "prisma"]);
         match args.command {
             ConfigCommand::Set(set_args) => {
                 assert_eq!(set_args.key, "trust-scripts");
@@ -1499,13 +1457,7 @@ mod tests {
 
     #[test]
     fn test_config_remove_trust_scripts() {
-        let args = parse_config(&[
-            "vtz",
-            "config",
-            "remove",
-            "trust-scripts",
-            "esbuild",
-        ]);
+        let args = parse_config(&["vtz", "config", "remove", "trust-scripts", "esbuild"]);
         match args.command {
             ConfigCommand::Remove(remove_args) => {
                 assert_eq!(remove_args.key, "trust-scripts");
@@ -1555,12 +1507,7 @@ mod tests {
 
     #[test]
     fn test_install_run_scripts_conflicts_with_ignore_scripts() {
-        let result = Cli::try_parse_from([
-            "vtz",
-            "install",
-            "--run-scripts",
-            "--ignore-scripts",
-        ]);
+        let result = Cli::try_parse_from(["vtz", "install", "--run-scripts", "--ignore-scripts"]);
         assert!(
             result.is_err(),
             "--run-scripts and --ignore-scripts should conflict"
@@ -1575,13 +1522,8 @@ mod tests {
 
     #[test]
     fn test_add_run_scripts_conflicts_with_ignore_scripts() {
-        let result = Cli::try_parse_from([
-            "vtz",
-            "add",
-            "zod",
-            "--run-scripts",
-            "--ignore-scripts",
-        ]);
+        let result =
+            Cli::try_parse_from(["vtz", "add", "zod", "--run-scripts", "--ignore-scripts"]);
         assert!(
             result.is_err(),
             "--run-scripts and --ignore-scripts should conflict"
