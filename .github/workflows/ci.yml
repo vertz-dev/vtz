@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-checks:
+    name: Rust Checks
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Check formatting
+        working-directory: native
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: native
+        run: cargo clippy --all-targets --release -- -D warnings
+
+      - name: Run tests
+        working-directory: native
+        run: cargo test --all
+
+  napi-build:
+    name: NAPI Compiler Build & Test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build native compiler
+        working-directory: native
+        run: cargo build --release -p vertz-compiler
+
+      - name: Copy dylib to .node
+        run: |
+          cp native/target/release/libvertz_compiler.dylib native/vertz-compiler/vertz-compiler.darwin-arm64.node
+
+      - name: Install test dependencies
+        working-directory: native/vertz-compiler
+        run: bun install
+
+      - name: Run NAPI binding tests
+        working-directory: native/vertz-compiler
+        run: bun test

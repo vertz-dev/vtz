@@ -1,0 +1,16 @@
+# Rust
+native/target/
+*.node
+
+# Node
+node_modules/
+npm/runtime/index.js
+npm/runtime/index.d.ts
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
