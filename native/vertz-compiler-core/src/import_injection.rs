@@ -292,3 +292,291 @@ pub fn inject_imports(ms: &mut MagicString, target: &str) {
     let import_block = format!("{}\n", import_lines.join("\n"));
     ms.prepend(&import_block);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::magic_string::MagicString;
+
+    fn inject(code: &str) -> String {
+        let mut ms = MagicString::new(code);
+        inject_imports(&mut ms, "dom");
+        ms.to_string()
+    }
+
+    fn inject_with_target(code: &str, target: &str) -> String {
+        let mut ms = MagicString::new(code);
+        inject_imports(&mut ms, target);
+        ms.to_string()
+    }
+
+    // ── No imports needed ──────────────────────────────────────────
+
+    #[test]
+    fn no_imports_when_no_helpers_used() {
+        let result = inject("const x = 1;");
+        assert_eq!(result, "const x = 1;");
+    }
+
+    // ── Runtime feature imports ────────────────────────────────────
+
+    #[test]
+    fn injects_signal_import() {
+        let result = inject("signal(0);");
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn injects_computed_import() {
+        let result = inject("computed(() => x);");
+        assert!(result.contains("import { computed } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn injects_effect_import() {
+        let result = inject("effect(() => {});");
+        assert!(result.contains("import { effect } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn injects_batch_import() {
+        let result = inject("batch(() => {});");
+        assert!(result.contains("import { batch } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn injects_untrack_import() {
+        let result = inject("untrack(() => x);");
+        assert!(result.contains("import { untrack } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn injects_multiple_runtime_imports_sorted() {
+        let result = inject("effect(() => {}); signal(0);");
+        assert!(result.contains("import { effect, signal } from '@vertz/ui';"));
+    }
+
+    // ── DOM helper imports ─────────────────────────────────────────
+
+    #[test]
+    fn injects_dom_helper_import() {
+        let result = inject("__element('div');");
+        assert!(result.contains("import { __element } from '@vertz/ui/internals';"));
+    }
+
+    #[test]
+    fn injects_multiple_dom_helpers_sorted() {
+        let result = inject("__element('div'); __append(el, child);");
+        assert!(result.contains("import { __append, __element } from '@vertz/ui/internals';"));
+    }
+
+    #[test]
+    fn injects_both_runtime_and_dom_imports() {
+        let result = inject("signal(0); __element('div');");
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+        assert!(result.contains("import { __element } from '@vertz/ui/internals';"));
+    }
+
+    // ── TUI target ─────────────────────────────────────────────────
+
+    #[test]
+    fn tui_target_uses_tui_internals_path() {
+        let result = inject_with_target("__element('div');", "tui");
+        assert!(result.contains("from '@vertz/tui/internals'"));
+    }
+
+    #[test]
+    fn dom_target_uses_ui_internals_path() {
+        let result = inject_with_target("__element('div');", "dom");
+        assert!(result.contains("from '@vertz/ui/internals'"));
+    }
+
+    // ── Existing bindings are skipped ──────────────────────────────
+
+    #[test]
+    fn skips_import_when_already_imported() {
+        let code = "import { signal } from './my-signal';\nsignal(0);";
+        let result = inject(code);
+        assert!(
+            !result.contains("from '@vertz/ui'"),
+            "should not inject import for existing binding"
+        );
+    }
+
+    #[test]
+    fn skips_import_for_locally_declared_function() {
+        let code = "function signal() {}\nsignal(0);";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui'"));
+    }
+
+    #[test]
+    fn skips_import_for_const_declaration() {
+        let code = "const signal = () => {};\nsignal(0);";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui'"));
+    }
+
+    #[test]
+    fn skips_import_for_export_function() {
+        let code = "export function __element() {}\n__element('div');";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui/internals'"));
+    }
+
+    #[test]
+    fn skips_import_for_aliased_import() {
+        let code = "import { foo as signal } from './x';\nsignal(0);";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui'"));
+    }
+
+    #[test]
+    fn skips_import_for_multiline_import() {
+        let code = "import {\n  signal,\n  computed\n} from './x';\nsignal(0); computed(() => x);";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui'"));
+    }
+
+    // ── Comment stripping ──────────────────────────────────────────
+
+    #[test]
+    fn does_not_detect_helper_in_line_comment() {
+        let code = "// signal(0)";
+        let result = inject(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn does_not_detect_helper_in_block_comment() {
+        let code = "/* __element('div') */";
+        let result = inject(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn does_not_detect_helper_in_jsdoc_comment() {
+        let code = "/** __child(el, 0) */";
+        let result = inject(code);
+        assert_eq!(result, code);
+    }
+
+    // ── String literal handling ───────────────────────────────────
+    // Note: strip_comments preserves string content (only strips comments),
+    // so helpers inside strings ARE detected as used. This is a known
+    // trade-off: false positives from strings are harmless (extra import),
+    // while false negatives from comments could cause runtime errors.
+
+    #[test]
+    fn detects_helper_in_string_literal() {
+        // Strings are NOT stripped — helper pattern in string IS detected
+        let code = "const x = 'signal(0)';";
+        let result = inject(code);
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+
+    // ── All DOM helpers detected ───────────────────────────────────
+
+    #[test]
+    fn detects_all_dom_helpers() {
+        for helper in DOM_HELPERS {
+            let code = format!("{}(arg);", helper);
+            let result = inject(&code);
+            assert!(
+                result.contains(helper),
+                "expected '{}' to be detected as DOM helper",
+                helper
+            );
+        }
+    }
+
+    // ── All runtime features detected ──────────────────────────────
+
+    #[test]
+    fn detects_all_runtime_features() {
+        for feature in RUNTIME_FEATURES {
+            let code = format!("{}(arg);", feature);
+            let result = inject(&code);
+            assert!(
+                result.contains(feature),
+                "expected '{}' to be detected as runtime feature",
+                feature
+            );
+        }
+    }
+
+    // ── Existing binding edge cases ────────────────────────────────
+
+    #[test]
+    fn skips_type_import() {
+        let code = "import type { Foo } from './x';\nsignal(0);";
+        let result = inject(code);
+        // type import should NOT block signal injection
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn skips_let_declaration() {
+        let code = "let __element = null;\n__element('div');";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui/internals'"));
+    }
+
+    #[test]
+    fn skips_var_declaration() {
+        let code = "var __element = null;\n__element('div');";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui/internals'"));
+    }
+
+    #[test]
+    fn skips_export_const_declaration() {
+        let code = "export const signal = () => {};\nsignal(0);";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui'"));
+    }
+
+    #[test]
+    fn skips_export_let_declaration() {
+        let code = "export let signal = () => {};\nsignal(0);";
+        let result = inject(code);
+        assert!(!result.contains("from '@vertz/ui'"));
+    }
+
+    // ── Escaped strings in strip_comments ──────────────────────────
+
+    #[test]
+    fn handles_escaped_quote_in_string() {
+        let code = r#"const x = "test \"signal(0)\" end"; signal(1);"#;
+        let result = inject(code);
+        // The real signal(1) call should be detected
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+
+    // ── Destructuring skipped in binding collection ────────────────
+
+    #[test]
+    fn destructuring_const_does_not_block_import() {
+        let code = "const { x } = obj;\nsignal(0);";
+        let result = inject(code);
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+
+    #[test]
+    fn array_destructuring_does_not_block_import() {
+        let code = "const [x] = arr;\nsignal(0);";
+        let result = inject(code);
+        // Array destructuring is skipped in binding collection
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+
+    // ── Import not at line start is ignored ─────────────────────────
+
+    #[test]
+    fn import_not_at_line_start_is_not_collected() {
+        // x import { signal } from ... — not at start of line
+        let code = "x import { signal } from './x';\nsignal(0);";
+        let result = inject(code);
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+    }
+}

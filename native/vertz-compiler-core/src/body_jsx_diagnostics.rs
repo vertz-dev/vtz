@@ -153,3 +153,113 @@ impl<'a, 'b> Visit<'b> for JsxCollector<'a> {
         oxc_ast_visit::walk::walk_jsx_fragment(self, frag);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, CompileOptions};
+
+    fn compile_tsx(source: &str) -> Vec<crate::Diagnostic> {
+        let result = compile(
+            source,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                ..Default::default()
+            },
+        );
+        result.diagnostics.unwrap_or_default()
+    }
+
+    fn has_body_jsx_diagnostic(diagnostics: &[crate::Diagnostic]) -> bool {
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("[jsx-outside-tree]"))
+    }
+
+    // ── JSX in return → no diagnostic ──────────────────────────────
+
+    #[test]
+    fn no_diagnostic_for_jsx_in_return() {
+        let diagnostics = compile_tsx(
+            r#"function App() {
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(!has_body_jsx_diagnostic(&diagnostics));
+    }
+
+    // ── JSX outside return → diagnostic ────────────────────────────
+
+    #[test]
+    fn diagnostic_for_jsx_outside_return() {
+        let diagnostics = compile_tsx(
+            r#"function App() {
+    const el = <span>outside</span>;
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(has_body_jsx_diagnostic(&diagnostics));
+    }
+
+    // ── JSX in nested function → no diagnostic ─────────────────────
+
+    #[test]
+    fn no_diagnostic_for_jsx_in_arrow_function() {
+        let diagnostics = compile_tsx(
+            r#"function App() {
+    const render = () => <span>nested</span>;
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(!has_body_jsx_diagnostic(&diagnostics));
+    }
+
+    #[test]
+    fn no_diagnostic_for_jsx_in_function_expression() {
+        let diagnostics = compile_tsx(
+            r#"function App() {
+    const render = function() { return <span>nested</span>; };
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(!has_body_jsx_diagnostic(&diagnostics));
+    }
+
+    // ── JSX fragment outside return → diagnostic ───────────────────
+
+    #[test]
+    fn diagnostic_for_fragment_outside_return() {
+        let diagnostics = compile_tsx(
+            r#"function App() {
+    const el = <><span>frag</span></>;
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(has_body_jsx_diagnostic(&diagnostics));
+    }
+
+    // ── Diagnostic has line/column info ─────────────────────────────
+
+    #[test]
+    fn diagnostic_includes_line_and_column() {
+        let diagnostics = compile_tsx(
+            r#"function App() {
+    const el = <span>outside</span>;
+    return <div>Hello</div>;
+}"#,
+        );
+        let diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("[jsx-outside-tree]"))
+            .unwrap();
+        assert!(diag.line.is_some());
+        assert!(diag.column.is_some());
+    }
+
+    // ── No component → no diagnostics ──────────────────────────────
+
+    #[test]
+    fn no_diagnostic_when_no_component() {
+        let diagnostics = compile_tsx("const x = 1;");
+        assert!(!has_body_jsx_diagnostic(&diagnostics));
+    }
+}

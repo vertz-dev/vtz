@@ -314,3 +314,292 @@ impl<'a, 'b> Visit<'b> for SsrUnsafeDetector<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, CompileOptions};
+
+    fn compile_tsx(source: &str) -> Vec<crate::Diagnostic> {
+        let result = compile(
+            source,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                ..Default::default()
+            },
+        );
+        result.diagnostics.unwrap_or_default()
+    }
+
+    fn ssr_diagnostics(diagnostics: &[crate::Diagnostic]) -> Vec<&crate::Diagnostic> {
+        diagnostics
+            .iter()
+            .filter(|d| d.message.contains("[ssr-unsafe-api]"))
+            .collect()
+    }
+
+    // ── Browser globals at top level → diagnostic ──────────────────
+
+    #[test]
+    fn reports_localstorage_at_top_level() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const x = localStorage.getItem('key');
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("localStorage"));
+    }
+
+    #[test]
+    fn reports_navigator_at_top_level() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const ua = navigator.userAgent;
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("navigator"));
+    }
+
+    #[test]
+    fn reports_intersection_observer() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const obs = IntersectionObserver;
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("IntersectionObserver"));
+    }
+
+    #[test]
+    fn reports_request_animation_frame() {
+        let diags = compile_tsx(
+            r#"function App() {
+    requestAnimationFrame(() => {});
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("requestAnimationFrame"));
+    }
+
+    // ── Browser global in nested function → no diagnostic ──────────
+
+    #[test]
+    fn no_report_in_arrow_function() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const handler = () => { localStorage.setItem('x', '1'); };
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    #[test]
+    fn no_report_in_function_expression() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const handler = function() { localStorage.setItem('x', '1'); };
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    // ── typeof guard → no diagnostic ───────────────────────────────
+
+    #[test]
+    fn no_report_with_typeof_guard_if() {
+        let diags = compile_tsx(
+            r#"function App() {
+    if (typeof localStorage !== 'undefined') {
+        localStorage.getItem('key');
+    }
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    #[test]
+    fn no_report_with_typeof_guard_ternary() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const x = typeof localStorage !== 'undefined' ? localStorage.getItem('key') : null;
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    #[test]
+    fn no_report_with_typeof_guard_logical_and() {
+        let diags = compile_tsx(
+            r#"function App() {
+    typeof localStorage !== 'undefined' && localStorage.getItem('key');
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    // ── typeof operand is safe ─────────────────────────────────────
+
+    #[test]
+    fn no_report_for_typeof_operand() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const hasStorage = typeof localStorage;
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    // ── window guard protects all globals ──────────────────────────
+
+    #[test]
+    fn window_guard_protects_all_globals() {
+        let diags = compile_tsx(
+            r#"function App() {
+    if (typeof window !== 'undefined') {
+        localStorage.getItem('key');
+        navigator.userAgent;
+    }
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    // ── document property access ───────────────────────────────────
+
+    #[test]
+    fn reports_document_query_selector() {
+        let diags = compile_tsx(
+            r#"function App() {
+    document.querySelector('.foo');
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("document.querySelector"));
+    }
+
+    #[test]
+    fn reports_document_get_element_by_id() {
+        let diags = compile_tsx(
+            r#"function App() {
+    document.getElementById('foo');
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("document.getElementById"));
+    }
+
+    #[test]
+    fn reports_document_cookie() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const c = document.cookie;
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].message.contains("document.cookie"));
+    }
+
+    // ── Multiple diagnostics ───────────────────────────────────────
+
+    #[test]
+    fn reports_multiple_browser_globals() {
+        let diags = compile_tsx(
+            r#"function App() {
+    const a = localStorage;
+    const b = sessionStorage;
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.len() >= 2);
+    }
+
+    // ── Diagnostic line/column ─────────────────────────────────────
+
+    #[test]
+    fn diagnostic_has_line_and_column() {
+        let diags = compile_tsx(
+            r#"function App() {
+    localStorage.getItem('key');
+    return <div>Hello</div>;
+}"#,
+        );
+        let ssr = ssr_diagnostics(&diags);
+        assert!(!ssr.is_empty());
+        assert!(ssr[0].line.is_some());
+        assert!(ssr[0].column.is_some());
+    }
+
+    // ── No component → no diagnostics ──────────────────────────────
+
+    #[test]
+    fn no_diagnostic_when_no_component() {
+        let diags = compile_tsx("const x = localStorage.getItem('key');");
+        let ssr = ssr_diagnostics(&diags);
+        assert!(ssr.is_empty());
+    }
+
+    // ── All browser globals are detected ───────────────────────────
+
+    #[test]
+    fn detects_all_browser_globals() {
+        for global in super::BROWSER_GLOBALS {
+            let source = format!(
+                "function App() {{\n    const x = {};\n    return <div>Hello</div>;\n}}",
+                global
+            );
+            let diags = compile_tsx(&source);
+            let ssr = ssr_diagnostics(&diags);
+            assert!(!ssr.is_empty(), "expected diagnostic for '{}'", global);
+        }
+    }
+
+    // ── All document properties are detected ───────────────────────
+
+    #[test]
+    fn detects_all_document_properties() {
+        for prop in super::DOCUMENT_PROPERTIES {
+            let source = format!(
+                "function App() {{\n    document.{};\n    return <div>Hello</div>;\n}}",
+                prop
+            );
+            let diags = compile_tsx(&source);
+            let ssr = ssr_diagnostics(&diags);
+            assert!(
+                !ssr.is_empty(),
+                "expected diagnostic for 'document.{}'",
+                prop
+            );
+        }
+    }
+}

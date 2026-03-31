@@ -292,3 +292,232 @@ impl<'a, 'c> Visit<'c> for ArrowExprFinder<'a> {
         oxc_ast_visit::walk::walk_arrow_function_expression(self, func);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, CompileOptions};
+
+    fn compile_tsx(source: &str) -> String {
+        let result = compile(
+            source,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                ..Default::default()
+            },
+        );
+        result.code
+    }
+
+    // ── Basic return with expression ───────────────────────────────
+
+    #[test]
+    fn wraps_return_with_mount_frame() {
+        let code = compile_tsx(
+            r#"function App() {
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should inject pushMountFrame: {}",
+            code
+        );
+        assert!(
+            code.contains("__flushMountFrame"),
+            "should inject flushMountFrame: {}",
+            code
+        );
+    }
+
+    #[test]
+    fn wraps_return_in_try_catch() {
+        let code = compile_tsx(
+            r#"function App() {
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(code.contains("try {"), "should have try block: {}", code);
+        assert!(
+            code.contains("__discardMountFrame"),
+            "should have discard in catch: {}",
+            code
+        );
+    }
+
+    // ── Bare return ────────────────────────────────────────────────
+
+    #[test]
+    fn handles_bare_return() {
+        let code = compile_tsx(
+            r#"function App() {
+    if (true) return;
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(
+            code.contains("__flushMountFrame"),
+            "should handle bare return: {}",
+            code
+        );
+    }
+
+    // ── Multiple returns ───────────────────────────────────────────
+
+    #[test]
+    fn handles_multiple_returns() {
+        let code = compile_tsx(
+            r#"function App() {
+    if (true) {
+        return <span>A</span>;
+    }
+    return <div>B</div>;
+}"#,
+        );
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should inject pushMountFrame: {}",
+            code
+        );
+        // Both returns should be wrapped
+        assert!(
+            code.matches("__flushMountFrame").count() >= 2,
+            "should wrap both returns: {}",
+            code
+        );
+    }
+
+    // ── Braceless if return ────────────────────────────────────────
+
+    #[test]
+    fn handles_braceless_if_return() {
+        let code = compile_tsx(
+            r#"function App() {
+    if (false) return <span>A</span>;
+    return <div>B</div>;
+}"#,
+        );
+        // Braceless returns should be wrapped in { ... }
+        assert!(
+            code.contains("__flushMountFrame"),
+            "should handle braceless return: {}",
+            code
+        );
+    }
+
+    // ── Arrow expression body ──────────────────────────────────────
+
+    #[test]
+    fn wraps_arrow_expression_body() {
+        let code = compile_tsx("const App = () => <div>Hello</div>;");
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should wrap arrow expression: {}",
+            code
+        );
+        assert!(
+            code.contains("__flushMountFrame"),
+            "should flush in arrow expression: {}",
+            code
+        );
+    }
+
+    // ── Arrow block body ───────────────────────────────────────────
+
+    #[test]
+    fn wraps_arrow_block_body() {
+        let code = compile_tsx(
+            r#"const App = () => {
+    return <div>Hello</div>;
+};"#,
+        );
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should wrap arrow block body: {}",
+            code
+        );
+    }
+
+    // ── Nested function returns are not wrapped ────────────────────
+
+    #[test]
+    fn does_not_wrap_nested_function_return() {
+        let code = compile_tsx(
+            r#"function App() {
+    const helper = () => { return 42; };
+    return <div>Hello</div>;
+}"#,
+        );
+        // Should only have mount frame wrapping for the component, not the nested function
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should wrap component: {}",
+            code
+        );
+    }
+
+    // ── Return expression is preserved ─────────────────────────────
+
+    #[test]
+    fn preserves_return_expression() {
+        let code = compile_tsx(
+            r#"function App() {
+    return <div>Hello</div>;
+}"#,
+        );
+        // The expression content should still be in the output
+        assert!(
+            code.contains("__mfResult"),
+            "should use result variable: {}",
+            code
+        );
+    }
+
+    // ── Braceless else return ──────────────────────────────────────
+
+    #[test]
+    fn handles_braceless_else_return() {
+        let code = compile_tsx(
+            r#"function App() {
+    if (true) return <span>A</span>;
+    else return <div>B</div>;
+}"#,
+        );
+        assert!(
+            code.matches("__flushMountFrame").count() >= 2,
+            "should handle both braceless returns: {}",
+            code
+        );
+    }
+
+    // ── Export function ────────────────────────────────────────────
+
+    #[test]
+    fn wraps_export_function() {
+        let code = compile_tsx(
+            r#"export function App() {
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should wrap exported function: {}",
+            code
+        );
+    }
+
+    // ── Export default function ─────────────────────────────────────
+
+    #[test]
+    fn wraps_export_default_function() {
+        let code = compile_tsx(
+            r#"export default function App() {
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(
+            code.contains("__pushMountFrame"),
+            "should wrap export default function: {}",
+            code
+        );
+    }
+}
