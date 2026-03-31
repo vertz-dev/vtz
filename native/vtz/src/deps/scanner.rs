@@ -366,6 +366,33 @@ import React from 'react';
     }
 
     #[test]
+    fn test_scan_local_dependencies_includes_css_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let app_path = src.join("app.tsx");
+        let css_path = src.join("styles.css");
+
+        std::fs::write(
+            &app_path,
+            r#"import './styles.css';
+import { signal } from '@vertz/ui';
+export function App() { return <div>App</div>; }
+"#,
+        )
+        .unwrap();
+        std::fs::write(&css_path, "body { margin: 0; }").unwrap();
+
+        let deps = scan_local_dependencies(&std::fs::read_to_string(&app_path).unwrap(), &app_path);
+
+        assert!(
+            deps.contains(&css_path),
+            "CSS files should be tracked as local dependencies"
+        );
+    }
+
+    #[test]
     fn test_scan_entry_recursive_handles_cycles() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");

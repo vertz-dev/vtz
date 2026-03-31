@@ -162,6 +162,33 @@ mod tests {
     }
 
     #[test]
+    fn test_css_imported_by_js_produces_module_update() {
+        // When a CSS file is imported by JS, the watcher sets is_css_only=false
+        // and includes the CSS file + its JS dependents in invalidated_files.
+        // This should produce a module Update, not a CssUpdate.
+        let result = InvalidationResult {
+            changed_file: PathBuf::from("/project/src/App.css"),
+            change_kind: FileChangeKind::Modify,
+            invalidated_files: vec![
+                PathBuf::from("/project/src/App.css"),
+                PathBuf::from("/project/src/App.tsx"),
+            ],
+            is_entry_file: false,
+            is_css_only: false, // Not CSS-only because it has JS dependents
+        };
+
+        let msg = invalidation_to_message(&result, Path::new("/project"));
+        match msg {
+            HmrMessage::Update { modules, .. } => {
+                assert_eq!(modules.len(), 2);
+                assert!(modules.contains(&"/src/App.css".to_string()));
+                assert!(modules.contains(&"/src/App.tsx".to_string()));
+            }
+            _ => panic!("Expected Update for CSS imported by JS, got {:?}", msg),
+        }
+    }
+
+    #[test]
     fn test_path_to_url_outside_root() {
         assert_eq!(
             path_to_url(Path::new("/other/file.tsx"), Path::new("/project")),
