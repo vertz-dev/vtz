@@ -14,3 +14,4 @@ npm/runtime/index.d.ts
 .idea/
 .vscode/
 *.swp
+bun.lockb
