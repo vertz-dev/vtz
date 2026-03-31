@@ -108,7 +108,9 @@ pub async fn handle_source_file(
     // Asset files (images, fonts): serve raw file or synthetic JS module
     if is_asset_path(clean_path) {
         let query = req.uri().query().unwrap_or("");
-        let is_import = query.contains("import");
+        let is_import = query
+            .split('&')
+            .any(|p| p == "import" || p.starts_with("import="));
         return handle_asset_source_file(&file_path, clean_path, is_import);
     }
 
@@ -235,7 +237,10 @@ fn is_asset_path(path: &str) -> bool {
 fn handle_asset_source_file(file_path: &Path, url_path: &str, is_import: bool) -> Response<Body> {
     if is_import {
         // Synthetic JS module: export default '<url_path>'
-        let js_module = format!("export default \"{}\";\n", url_path);
+        // Use serde_json to properly escape the string for JS embedding (handles \, ", newlines, etc.)
+        let escaped =
+            serde_json::to_string(url_path).unwrap_or_else(|_| format!("\"{}\"", url_path));
+        let js_module = format!("export default {};\n", escaped);
         Response::builder()
             .status(StatusCode::OK)
             .header(
@@ -257,10 +262,10 @@ fn handle_asset_source_file(file_path: &Path, url_path: &str, is_import: bool) -
                     .body(Body::from(content))
                     .unwrap()
             }
-            Err(e) => Response::builder()
+            Err(_) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(format!("Failed to read asset file: {}", e)))
+                .body(Body::from("Failed to read asset file"))
                 .unwrap(),
         }
     }

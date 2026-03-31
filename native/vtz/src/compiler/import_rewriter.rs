@@ -891,6 +891,57 @@ const x = 1;"#;
     }
 
     #[test]
+    fn test_rewrite_dynamic_import_of_asset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"const logo = import('./logo.svg');"#;
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("import('/src/logo.svg?import')"),
+            "Dynamic asset import should have ?import. Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_side_effect_asset_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"import './logo.svg';"#;
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("import '/src/logo.svg?import'"),
+            "Side-effect asset import should have ?import. Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_export_from_asset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"export { default as logo } from './logo.svg';"#;
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("from '/src/logo.svg?import'"),
+            "Re-export of asset should have ?import. Result: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_rewrite_path_alias_svg_import_appends_import_query() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
