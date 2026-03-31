@@ -901,3 +901,511 @@ fn get_call_expression_name(expr: &Expression) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn analyze(source: &str) -> Vec<VariableInfo> {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let components = crate::component_analyzer::analyze_components(&parsed.program);
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, dynamic_configs) = build_import_aliases(&parsed.program, &manifests);
+        let import_ctx = ImportContext {
+            aliases,
+            dynamic_configs,
+        };
+        assert!(!components.is_empty(), "no component found");
+        analyze_reactivity(&parsed.program, &components[0], &import_ctx)
+    }
+
+    fn find_var<'a>(vars: &'a [VariableInfo], name: &str) -> &'a VariableInfo {
+        vars.iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("var '{}' not found", name))
+    }
+
+    // ── ReactivityKind::as_str ─────────────────────────────────────────
+
+    #[test]
+    fn reactivity_kind_as_str() {
+        assert_eq!(ReactivityKind::Signal.as_str(), "signal");
+        assert_eq!(ReactivityKind::Computed.as_str(), "computed");
+        assert_eq!(ReactivityKind::Static.as_str(), "static");
+    }
+
+    // ── Basic let/const classification ─────────────────────────────────
+
+    #[test]
+    fn let_in_jsx_is_signal() {
+        let vars = analyze("function C() { let x = 0; return <div>{x}</div>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn let_not_in_jsx_is_static() {
+        let vars = analyze("function C() { let x = 0; return <div/>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Static);
+    }
+
+    #[test]
+    fn const_dep_on_signal_is_computed() {
+        let vars = analyze("function C() { let x = 0; const y = x + 1; return <div>{y}</div>; }");
+        let y = find_var(&vars, "y");
+        assert_eq!(y.kind, ReactivityKind::Computed);
+    }
+
+    #[test]
+    fn const_no_reactive_dep_is_static() {
+        let vars = analyze("function C() { const x = 42; return <div>{x}</div>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Static);
+    }
+
+    // ── Function/structural literal ────────────────────────────────────
+
+    #[test]
+    fn arrow_fn_init_is_static() {
+        let vars = analyze("function C() { const f = () => {}; return <div>{f}</div>; }");
+        let f = find_var(&vars, "f");
+        assert_eq!(f.kind, ReactivityKind::Static);
+    }
+
+    #[test]
+    fn function_expr_init_is_static() {
+        let vars = analyze("function C() { const f = function() {}; return <div>{f}</div>; }");
+        let f = find_var(&vars, "f");
+        assert_eq!(f.kind, ReactivityKind::Static);
+    }
+
+    #[test]
+    fn object_literal_is_static() {
+        let vars = analyze("function C() { const obj = {}; return <div>{obj}</div>; }");
+        let obj = find_var(&vars, "obj");
+        assert_eq!(obj.kind, ReactivityKind::Static);
+    }
+
+    #[test]
+    fn array_literal_is_static() {
+        let vars = analyze("function C() { const arr = []; return <div>{arr}</div>; }");
+        let arr = find_var(&vars, "arr");
+        assert_eq!(arr.kind, ReactivityKind::Static);
+    }
+
+    // ── Signal API detection ───────────────────────────────────────────
+
+    #[test]
+    fn query_call_detected_as_signal_api() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); return <div>{tasks.data}</div>; }",
+        );
+        let tasks = find_var(&vars, "tasks");
+        let sig = tasks.signal_properties.as_ref().expect("signal_properties");
+        assert!(sig.contains(&"data".to_string()));
+        assert!(sig.contains(&"loading".to_string()));
+        assert!(sig.contains(&"error".to_string()));
+    }
+
+    #[test]
+    fn query_plain_properties_present() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); return <div>{tasks.data}</div>; }",
+        );
+        let tasks = find_var(&vars, "tasks");
+        let plain = tasks.plain_properties.as_ref().expect("plain_properties");
+        assert!(plain.contains(&"refetch".to_string()));
+    }
+
+    // ── Destructured bindings ──────────────────────────────────────────
+
+    #[test]
+    fn destructured_signal_prop_is_signal() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const { data } = query(fetch); return <div>{data}</div>; }",
+        );
+        let data = find_var(&vars, "data");
+        assert_eq!(data.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn destructured_plain_prop_is_static() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const { refetch } = query(fetch); return <div>{refetch}</div>; }",
+        );
+        let refetch = find_var(&vars, "refetch");
+        assert_eq!(refetch.kind, ReactivityKind::Static);
+    }
+
+    #[test]
+    fn destructured_unknown_prop_from_signal_api_is_static() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const { foo } = query(fetch); return <div>{foo}</div>; }",
+        );
+        let foo = find_var(&vars, "foo");
+        assert_eq!(foo.kind, ReactivityKind::Static);
+    }
+
+    // ── Property access tracking ───────────────────────────────────────
+
+    #[test]
+    fn const_accessing_signal_property_is_computed() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); const d = tasks.data; return <div>{d}</div>; }",
+        );
+        let d = find_var(&vars, "d");
+        assert_eq!(d.kind, ReactivityKind::Computed);
+    }
+
+    #[test]
+    fn const_accessing_plain_property_is_static() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); const r = tasks.refetch; return <div>{r}</div>; }",
+        );
+        let r = find_var(&vars, "r");
+        assert_eq!(r.kind, ReactivityKind::Static);
+    }
+
+    // ── Transitive dependency ──────────────────────────────────────────
+
+    #[test]
+    fn transitive_dep_is_computed() {
+        let vars =
+            analyze("function C() { let x = 0; const y = x; const z = y; return <div>{z}</div>; }");
+        let z = find_var(&vars, "z");
+        assert_eq!(z.kind, ReactivityKind::Computed);
+    }
+
+    // ── Reactive source ────────────────────────────────────────────────
+
+    #[test]
+    fn use_context_is_reactive_source() {
+        let vars = analyze(
+            "import { useContext } from '@vertz/ui';\nfunction C() { const ctx = useContext(MyCtx); return <div>{ctx}</div>; }",
+        );
+        let ctx = find_var(&vars, "ctx");
+        assert!(ctx.is_reactive_source);
+    }
+
+    #[test]
+    fn dep_on_reactive_source_is_computed() {
+        let vars = analyze(
+            "import { useContext } from '@vertz/ui';\nfunction C() { const ctx = useContext(MyCtx); const x = ctx.name; return <div>{x}</div>; }",
+        );
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Computed);
+    }
+
+    // ── build_import_aliases ───────────────────────────────────────────
+
+    #[test]
+    fn alias_for_signal_api() {
+        let source = "import { query as q } from '@vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, _) = build_import_aliases(&parsed.program, &manifests);
+        assert_eq!(aliases.get("q"), Some(&"query".to_string()));
+    }
+
+    #[test]
+    fn alias_for_reactive_source() {
+        let source = "import { useContext as uc } from '@vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, _) = build_import_aliases(&parsed.program, &manifests);
+        assert_eq!(aliases.get("uc"), Some(&"useContext".to_string()));
+    }
+
+    #[test]
+    fn unrecognized_import_not_aliased() {
+        let source = "import { foo } from '@vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, _) = build_import_aliases(&parsed.program, &manifests);
+        assert!(!aliases.contains_key("foo"));
+    }
+
+    // ── build_import_aliases with manifests ────────────────────────────
+
+    #[test]
+    fn manifest_signal_api_registered() {
+        let source = "import { myQuery } from './api';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "myQuery".to_string(),
+            ManifestExportInfo {
+                reactivity_type: "signal-api".to_string(),
+                signal_properties: Some(HashSet::from(["data".to_string()])),
+                plain_properties: None,
+                field_signal_properties: None,
+            },
+        );
+        let mut manifests: ManifestRegistry = HashMap::new();
+        manifests.insert("./api".to_string(), module_exports);
+
+        let (aliases, dynamic_configs) = build_import_aliases(&parsed.program, &manifests);
+        let key = aliases.get("myQuery").expect("myQuery alias");
+        assert!(key.starts_with("__manifest__"));
+        assert!(dynamic_configs.contains_key(key));
+        let config = dynamic_configs.get(key).unwrap();
+        assert!(config.signal_properties.contains("data"));
+    }
+
+    #[test]
+    fn manifest_reactive_source_registered() {
+        let source = "import { myCtx } from './ctx';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "myCtx".to_string(),
+            ManifestExportInfo {
+                reactivity_type: "reactive-source".to_string(),
+                signal_properties: None,
+                plain_properties: None,
+                field_signal_properties: None,
+            },
+        );
+        let mut manifests: ManifestRegistry = HashMap::new();
+        manifests.insert("./ctx".to_string(), module_exports);
+
+        let (aliases, dynamic_configs) = build_import_aliases(&parsed.program, &manifests);
+        let key = aliases.get("myCtx").expect("myCtx alias");
+        assert!(key.starts_with("__manifest__"));
+        assert!(dynamic_configs.contains_key(key));
+    }
+
+    #[test]
+    fn manifest_unknown_type_ignored() {
+        let source = "import { myThing } from './stuff';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "myThing".to_string(),
+            ManifestExportInfo {
+                reactivity_type: "other".to_string(),
+                signal_properties: None,
+                plain_properties: None,
+                field_signal_properties: None,
+            },
+        );
+        let mut manifests: ManifestRegistry = HashMap::new();
+        manifests.insert("./stuff".to_string(), module_exports);
+
+        let (aliases, _) = build_import_aliases(&parsed.program, &manifests);
+        assert!(!aliases.contains_key("myThing"));
+    }
+
+    // ── build_query_aliases ────────────────────────────────────────────
+
+    #[test]
+    fn query_from_vertz_ui() {
+        let source = "import { query } from '@vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let aliases = build_query_aliases(&parsed.program);
+        assert!(aliases.contains("query"));
+    }
+
+    #[test]
+    fn query_aliased() {
+        let source = "import { query as q } from '@vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let aliases = build_query_aliases(&parsed.program);
+        assert!(aliases.contains("q"));
+    }
+
+    #[test]
+    fn query_from_other_lib_not_included() {
+        let source = "import { query } from 'other';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let aliases = build_query_aliases(&parsed.program);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn query_from_vertz_ui_subpath() {
+        let source = "import { query } from 'vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let aliases = build_query_aliases(&parsed.program);
+        assert!(aliases.contains("query"));
+    }
+
+    // ── ImportContext methods ───────────────────────────────────────────
+
+    #[test]
+    fn import_ctx_is_reactive_source_static_api() {
+        let ctx = ImportContext {
+            aliases: HashMap::new(),
+            dynamic_configs: HashMap::new(),
+        };
+        assert!(ctx.is_reactive_source("useContext"));
+    }
+
+    #[test]
+    fn import_ctx_is_reactive_source_dynamic() {
+        let key = "__manifest__./ctx__myCtx".to_string();
+        let mut dynamic_configs = HashMap::new();
+        dynamic_configs.insert(
+            key.clone(),
+            DynamicApiConfig {
+                signal_properties: HashSet::new(),
+                plain_properties: HashSet::new(),
+                field_signal_properties: None,
+            },
+        );
+        let ctx = ImportContext {
+            aliases: HashMap::new(),
+            dynamic_configs,
+        };
+        assert!(ctx.is_reactive_source(&key));
+    }
+
+    #[test]
+    fn import_ctx_is_reactive_source_false_for_signal_api() {
+        let key = "__manifest__./api__myQuery".to_string();
+        let mut dynamic_configs = HashMap::new();
+        dynamic_configs.insert(
+            key.clone(),
+            DynamicApiConfig {
+                signal_properties: HashSet::from(["data".to_string()]),
+                plain_properties: HashSet::new(),
+                field_signal_properties: None,
+            },
+        );
+        let ctx = ImportContext {
+            aliases: HashMap::new(),
+            dynamic_configs,
+        };
+        assert!(!ctx.is_reactive_source(&key));
+    }
+
+    #[test]
+    fn import_ctx_get_signal_api_config_static() {
+        let ctx = ImportContext {
+            aliases: HashMap::new(),
+            dynamic_configs: HashMap::new(),
+        };
+        let config = ctx.get_signal_api_config("query");
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert!(config.signal_properties.contains("data"));
+    }
+
+    #[test]
+    fn import_ctx_get_signal_api_config_dynamic() {
+        let key = "__manifest__./api__myQuery".to_string();
+        let mut dynamic_configs = HashMap::new();
+        dynamic_configs.insert(
+            key.clone(),
+            DynamicApiConfig {
+                signal_properties: HashSet::from(["data".to_string()]),
+                plain_properties: HashSet::from(["refetch".to_string()]),
+                field_signal_properties: None,
+            },
+        );
+        let ctx = ImportContext {
+            aliases: HashMap::new(),
+            dynamic_configs,
+        };
+        let config = ctx.get_signal_api_config(&key);
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert!(config.signal_properties.contains("data"));
+        assert!(config.plain_properties.contains("refetch"));
+    }
+
+    #[test]
+    fn import_ctx_get_signal_api_config_none() {
+        let ctx = ImportContext {
+            aliases: HashMap::new(),
+            dynamic_configs: HashMap::new(),
+        };
+        assert!(ctx.get_signal_api_config("unknown").is_none());
+    }
+
+    // ── Component form variants ────────────────────────────────────────
+
+    #[test]
+    fn export_named_function_vars_collected() {
+        let vars = analyze("export function C() { let x = 0; return <div>{x}</div>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn export_named_const_arrow_vars_collected() {
+        let vars = analyze("export const C = () => { let x = 0; return <div>{x}</div>; };");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn export_default_function_vars_collected() {
+        let vars = analyze("export default function C() { let x = 0; return <div>{x}</div>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    // ── TS expression unwrapping ───────────────────────────────────────
+
+    #[test]
+    fn parenthesized_component_init_vars_collected() {
+        let vars = analyze("const C = (() => { let x = 0; return <div>{x}</div>; });");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    // ── Cycle avoidance ────────────────────────────────────────────────
+
+    #[test]
+    fn cycle_does_not_hang() {
+        let vars = analyze("function C() { const a = b; const b = a; return <div>{a}{b}</div>; }");
+        // Both should be classified without hanging; exact kind may vary
+        let _a = find_var(&vars, "a");
+        let _b = find_var(&vars, "b");
+    }
+
+    // ── Destructured props → computed ──────────────────────────────────
+
+    #[test]
+    fn const_dep_on_destructured_prop_is_computed() {
+        let vars =
+            analyze("function C({ title }) { const upper = title; return <div>{upper}</div>; }");
+        let upper = find_var(&vars, "upper");
+        assert_eq!(upper.kind, ReactivityKind::Computed);
+    }
+
+    // ── TSNonNull unwrapping ───────────────────────────────────────────
+
+    #[test]
+    fn ts_non_null_unwrapped_for_signal_api() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch)!; return <div>{tasks.data}</div>; }",
+        );
+        let tasks = find_var(&vars, "tasks");
+        assert!(
+            tasks.signal_properties.is_some(),
+            "tasks should be detected as signal API"
+        );
+        let sig = tasks.signal_properties.as_ref().unwrap();
+        assert!(sig.contains(&"data".to_string()));
+    }
+}

@@ -404,3 +404,320 @@ impl<'a, 'b, 'c> Visit<'c> for SignalApiPropTransformer<'a, 'b> {
         oxc_ast_visit::walk::walk_member_expression(self, expr);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component_analyzer::analyze_components;
+    use crate::magic_string::MagicString;
+    use crate::reactivity_analyzer::{
+        analyze_reactivity, build_import_aliases, ImportContext, ManifestRegistry,
+    };
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::{Expression, Statement};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+    use std::collections::HashMap;
+
+    fn transform(source: &str) -> String {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let components = analyze_components(&parsed.program);
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, dynamic_configs) = build_import_aliases(&parsed.program, &manifests);
+        let import_ctx = ImportContext {
+            aliases,
+            dynamic_configs,
+        };
+        let comp = &components[0];
+        let variables = analyze_reactivity(&parsed.program, comp, &import_ctx);
+        let mutations =
+            crate::mutation_analyzer::analyze_mutations(&parsed.program, comp, &variables);
+        let mutation_ranges: Vec<(u32, u32)> = mutations.iter().map(|m| (m.start, m.end)).collect();
+        let mut ms = MagicString::new(source);
+        transform_signals(&mut ms, &parsed.program, comp, &variables, &mutation_ranges);
+        ms.to_string()
+    }
+
+    fn param_names(source: &str) -> HashSet<String> {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        for stmt in &parsed.program.body {
+            if let Statement::VariableDeclaration(vd) = stmt {
+                for decl in &vd.declarations {
+                    if let Some(Expression::ArrowFunctionExpression(arrow)) = &decl.init {
+                        return collect_param_names(&arrow.params);
+                    }
+                }
+            }
+        }
+        HashSet::new()
+    }
+
+    // ── Phase 1: DeclTransformer ──────────────────────────────────────
+
+    #[test]
+    fn let_becomes_const_signal() {
+        let out = transform("function C() { let count = 0; return <div>{count}</div>; }");
+        assert!(
+            out.contains("const count = signal(0, 'count')"),
+            "expected const+signal wrapping, got: {out}"
+        );
+    }
+
+    #[test]
+    fn multiple_let_signals_transformed() {
+        let out = transform("function C() { let a = 1; let b = 2; return <div>{a}{b}</div>; }");
+        assert!(
+            out.contains("signal(1, 'a')"),
+            "expected signal wrap for a, got: {out}"
+        );
+        assert!(
+            out.contains("signal(2, 'b')"),
+            "expected signal wrap for b, got: {out}"
+        );
+    }
+
+    #[test]
+    fn const_not_transformed_to_signal() {
+        let out = transform("function C() { const x = 1; return <div>{x}</div>; }");
+        assert!(
+            !out.contains("signal("),
+            "const should not become signal, got: {out}"
+        );
+    }
+
+    // ── Phase 2: RefTransformer reads ─────────────────────────────────
+
+    #[test]
+    fn signal_ref_in_expression_gets_dot_value() {
+        let out = transform("function C() { let x = 0; const y = x + 1; return <div>{y}</div>; }");
+        assert!(
+            out.contains("x.value + 1"),
+            "expected x.value in expression, got: {out}"
+        );
+    }
+
+    #[test]
+    fn non_signal_ref_no_dot_value() {
+        let out = transform("function C() { const x = 1; return <div>{x}</div>; }");
+        assert!(
+            !out.contains(".value"),
+            "const ref should not get .value, got: {out}"
+        );
+    }
+
+    // ── Phase 2: Assignments ──────────────────────────────────────────
+
+    #[test]
+    fn assignment_to_signal_gets_dot_value() {
+        let out = transform(
+            "function C() { let x = 0; const set = () => { x = 5; }; return <div>{x}</div>; }",
+        );
+        assert!(
+            out.contains("x.value = 5"),
+            "expected x.value = 5, got: {out}"
+        );
+    }
+
+    #[test]
+    fn compound_assignment_gets_dot_value() {
+        let out = transform(
+            "function C() { let x = 0; const add = () => { x += 1; }; return <div>{x}</div>; }",
+        );
+        assert!(
+            out.contains("x.value += 1"),
+            "expected x.value += 1, got: {out}"
+        );
+    }
+
+    // ── Phase 2: Update expressions ───────────────────────────────────
+
+    #[test]
+    fn postfix_increment_gets_dot_value() {
+        let out = transform(
+            "function C() { let x = 0; const inc = () => { x++; }; return <div>{x}</div>; }",
+        );
+        assert!(out.contains("x.value++"), "expected x.value++, got: {out}");
+    }
+
+    #[test]
+    fn prefix_decrement_gets_dot_value() {
+        let out = transform(
+            "function C() { let x = 0; const dec = () => { --x; }; return <div>{x}</div>; }",
+        );
+        assert!(out.contains("--x.value"), "expected --x.value, got: {out}");
+    }
+
+    // ── Phase 2: Shorthand skip ───────────────────────────────────────
+
+    #[test]
+    fn shorthand_object_property_not_unwrapped() {
+        let out =
+            transform("function C() { let x = 0; const obj = { x }; return <div>{x}</div>; }");
+        // The shorthand `{ x }` should NOT get .value inserted
+        assert!(
+            out.contains("{ x }"),
+            "shorthand property should stay as {{ x }}, got: {out}"
+        );
+        // But the JSX reference `{x}` should get .value
+        assert!(
+            out.contains("{x.value}"),
+            "JSX reference should get .value, got: {out}"
+        );
+    }
+
+    // ── Phase 2: Shadowing ────────────────────────────────────────────
+
+    #[test]
+    fn shadowed_in_arrow_params_not_transformed() {
+        let out =
+            transform("function C() { let x = 0; const fn2 = (x) => x; return <div>{x}</div>; }");
+        // The inner `x` in the arrow body should NOT get .value
+        assert!(
+            out.contains("(x) => x;"),
+            "shadowed x in arrow should not get .value, got: {out}"
+        );
+        // The outer JSX `{x}` should get .value
+        assert!(
+            out.contains("{x.value}"),
+            "outer JSX x should get .value, got: {out}"
+        );
+    }
+
+    #[test]
+    fn shadowed_in_function_params_not_transformed() {
+        let out = transform(
+            "function C() { let x = 0; function inner(x) { return x; } return <div>{x}</div>; }",
+        );
+        // The inner `x` in the function body should NOT get .value
+        assert!(
+            out.contains("return x;"),
+            "shadowed x in function should not get .value, got: {out}"
+        );
+        // The outer JSX `{x}` should get .value
+        assert!(
+            out.contains("{x.value}"),
+            "outer JSX x should get .value, got: {out}"
+        );
+    }
+
+    // ── Phase 3: Signal API properties ────────────────────────────────
+
+    #[test]
+    fn signal_api_signal_prop_gets_dot_value() {
+        let out = transform(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); return <div>{tasks.data}</div>; }",
+        );
+        assert!(
+            out.contains("tasks.data.value"),
+            "expected tasks.data.value, got: {out}"
+        );
+    }
+
+    #[test]
+    fn signal_api_plain_prop_no_dot_value() {
+        let out = transform(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); return <div>{tasks.refetch}</div>; }",
+        );
+        assert!(
+            !out.contains("tasks.refetch.value"),
+            "plain prop refetch should not get .value, got: {out}"
+        );
+    }
+
+    #[test]
+    fn signal_api_already_has_dot_value_no_double() {
+        let out = transform(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); return <div>{tasks.data.value}</div>; }",
+        );
+        assert!(
+            !out.contains("tasks.data.value.value"),
+            "should not double .value, got: {out}"
+        );
+        assert!(
+            out.contains("tasks.data.value"),
+            "should preserve existing .value, got: {out}"
+        );
+    }
+
+    // ── Phase 3: Field signal properties ──────────────────────────────
+
+    #[test]
+    fn field_signal_prop_gets_dot_value() {
+        let out = transform(
+            "import { form } from '@vertz/ui';\nfunction C() { const taskForm = form({ title: '' }); return <div>{taskForm.title.error}</div>; }",
+        );
+        assert!(
+            out.contains("taskForm.title.error.value"),
+            "expected taskForm.title.error.value, got: {out}"
+        );
+    }
+
+    #[test]
+    fn signal_prop_not_treated_as_field_signal() {
+        let out = transform(
+            "import { form } from '@vertz/ui';\nfunction C() { const taskForm = form({ title: '' }); return <div>{taskForm.submitting}</div>; }",
+        );
+        // submitting is a signal prop, should get .value
+        assert!(
+            out.contains("taskForm.submitting.value"),
+            "signal prop submitting should get .value, got: {out}"
+        );
+        // But should not get double .value if already present
+        let out2 = transform(
+            "import { form } from '@vertz/ui';\nfunction C() { const taskForm = form({ title: '' }); return <div>{taskForm.submitting.value}</div>; }",
+        );
+        assert!(
+            !out2.contains("taskForm.submitting.value.value"),
+            "should not double .value on signal prop, got: {out2}"
+        );
+    }
+
+    // ── No signals, no transform ──────────────────────────────────────
+
+    #[test]
+    fn no_signals_no_transform() {
+        let source = "function C() { const x = 1; return <div>{x}</div>; }";
+        let out = transform(source);
+        assert_eq!(out, source, "no signals should leave source unchanged");
+    }
+
+    // ── collect_param_names ───────────────────────────────────────────
+
+    #[test]
+    fn collect_params_simple_ident() {
+        let names = param_names("const f = (x) => {};");
+        assert_eq!(names, HashSet::from(["x".to_string()]));
+    }
+
+    #[test]
+    fn collect_params_destructured_object() {
+        let names = param_names("const f = ({ a, b }) => {};");
+        assert_eq!(names, HashSet::from(["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn collect_params_rest_param() {
+        let names = param_names("const f = (...args) => {};");
+        assert_eq!(names, HashSet::from(["args".to_string()]));
+    }
+
+    #[test]
+    fn collect_params_nested_destructuring() {
+        let names = param_names("const f = ({ a: { b } }) => {};");
+        assert_eq!(names, HashSet::from(["b".to_string()]));
+    }
+
+    #[test]
+    fn collect_params_array_pattern() {
+        let names = param_names("const f = ([a, , b]) => {};");
+        assert_eq!(names, HashSet::from(["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn collect_params_assignment_default() {
+        let names = param_names("const f = (x = 5) => {};");
+        assert_eq!(names, HashSet::from(["x".to_string()]));
+    }
+}
