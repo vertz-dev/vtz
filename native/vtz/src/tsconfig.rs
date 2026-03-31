@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::compiler::import_rewriter::is_asset_extension;
+
 /// Resolved path alias mappings from tsconfig.json `compilerOptions.paths`.
 #[derive(Debug, Clone, Default)]
 pub struct TsconfigPaths {
@@ -73,7 +75,9 @@ fn substitute_wildcard(target: &str, capture: &str) -> String {
 fn resolve_with_extensions(path: &Path) -> Option<PathBuf> {
     // If path already has a known extension and exists
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs" | "css") && path.exists() {
+        if (matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs" | "css") || is_asset_extension(ext))
+            && path.exists()
+        {
             return Some(path.to_path_buf());
         }
     }
