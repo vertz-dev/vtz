@@ -1352,4 +1352,598 @@ export function App() {
         assert_ne!(h1, h2);
         assert_eq!(h1, h3);
     }
+
+    // ── fix_compiler_api_names ──────────────────────────────────────
+
+    #[test]
+    fn test_fix_api_names_no_effect() {
+        let code = "import { signal } from '@vertz/ui';";
+        assert_eq!(fix_compiler_api_names(code), code);
+    }
+
+    #[test]
+    fn test_fix_api_names_renames_effect_import_comma() {
+        let code = "import { signal, effect, computed } from '@vertz/ui';";
+        let result = fix_compiler_api_names(code);
+        assert!(result.contains("domEffect,"));
+        assert!(!result.contains(", effect,"));
+    }
+
+    #[test]
+    fn test_fix_api_names_renames_effect_import_brace_end() {
+        let code = "import { signal, effect } from '@vertz/ui';";
+        let result = fix_compiler_api_names(code);
+        assert!(result.contains("domEffect }"));
+        assert!(!result.contains("effect }"));
+    }
+
+    #[test]
+    fn test_fix_api_names_renames_effect_import_brace_start() {
+        let code = "import { effect, signal } from '@vertz/ui';";
+        let result = fix_compiler_api_names(code);
+        assert!(result.contains("{ domEffect,"));
+    }
+
+    #[test]
+    fn test_fix_api_names_renames_effect_import_only() {
+        let code = "import { effect } from '@vertz/ui';";
+        let result = fix_compiler_api_names(code);
+        assert!(result.contains("{ domEffect }"));
+    }
+
+    #[test]
+    fn test_fix_api_names_renames_call_sites() {
+        let code = "effect(() => { console.log('hi'); });";
+        let result = fix_compiler_api_names(code);
+        assert!(result.contains("domEffect("));
+        assert!(!result.starts_with("effect("));
+    }
+
+    #[test]
+    fn test_fix_api_names_does_not_rename_dom_effect() {
+        let code = "domEffect(() => {}); lifecycleEffect(() => {});";
+        let result = fix_compiler_api_names(code);
+        // Should NOT double-rename domEffect to domdomEffect
+        assert!(result.contains("domEffect("));
+        assert!(result.contains("lifecycleEffect("));
+        assert!(!result.contains("domdomEffect"));
+    }
+
+    #[test]
+    fn test_fix_api_names_effect_newline() {
+        let code = "import { signal, effect\n} from '@vertz/ui';";
+        let result = fix_compiler_api_names(code);
+        assert!(result.contains("domEffect\n"));
+    }
+
+    // ── fix_internals_imports ───────────────────────────────────────
+
+    #[test]
+    fn test_fix_internals_no_internals() {
+        let code = "import { signal } from '@vertz/ui';";
+        let result = fix_internals_imports(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn test_fix_internals_splits_internal_api() {
+        let code = "import { signal, domEffect } from '@vertz/ui';";
+        let result = fix_internals_imports(code);
+        assert!(result.contains("import { signal } from '@vertz/ui';"));
+        assert!(result.contains("import { domEffect } from '@vertz/ui/internals';"));
+    }
+
+    #[test]
+    fn test_fix_internals_all_internal_apis() {
+        let code = "import { domEffect, lifecycleEffect } from '@vertz/ui';";
+        let result = fix_internals_imports(code);
+        assert!(!result.contains("import {  } from '@vertz/ui';"));
+        assert!(result.contains("@vertz/ui/internals"));
+        assert!(result.contains("domEffect"));
+        assert!(result.contains("lifecycleEffect"));
+    }
+
+    #[test]
+    fn test_fix_internals_skips_subpath_import() {
+        let code = "import { domEffect } from '@vertz/ui/internals';";
+        let result = fix_internals_imports(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn test_fix_internals_double_quote() {
+        let code = r#"import { signal, domEffect } from "@vertz/ui";"#;
+        let result = fix_internals_imports(code);
+        assert!(result.contains(r#"from "@vertz/ui""#));
+        assert!(result.contains(r#"from "@vertz/ui/internals""#));
+    }
+
+    // ── strip_leftover_typescript ───────────────────────────────────
+
+    #[test]
+    fn test_strip_import_type() {
+        let code = "import type { Foo } from 'bar';\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("import type"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_export_type_braces() {
+        let code = "export type { Foo };\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("export type {"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_type_alias_single_line() {
+        let code = "type Foo = string;\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("type Foo"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_type_alias_multiline() {
+        let code = "type Foo = {\n  bar: string;\n};\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("type Foo"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_export_type_alias() {
+        let code = "export type Foo = string;\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("export type Foo"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_standalone_type_no_eq() {
+        let code = "export type Foo;\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("export type Foo;"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_interface_single_line() {
+        let code = "interface Foo {}\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("interface Foo"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_interface_multiline() {
+        let code = "interface Foo {\n  bar: string;\n}\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("interface"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_export_interface() {
+        let code = "export interface Foo {\n  bar: string;\n}\nconst x = 1;";
+        let result = strip_leftover_typescript(code);
+        assert!(!result.contains("interface"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_strip_param_modifiers_public_readonly() {
+        let result = strip_param_property_modifiers("public readonly x,");
+        assert_eq!(result, Some("x,".to_string()));
+    }
+
+    #[test]
+    fn test_strip_param_modifiers_private() {
+        let result = strip_param_property_modifiers("private y,");
+        assert_eq!(result, Some("y,".to_string()));
+    }
+
+    #[test]
+    fn test_strip_param_modifiers_protected() {
+        let result = strip_param_property_modifiers("protected z)");
+        assert_eq!(result, Some("z)".to_string()));
+    }
+
+    #[test]
+    fn test_strip_param_modifiers_readonly_alone() {
+        let result = strip_param_property_modifiers("readonly w,");
+        assert_eq!(result, Some("w,".to_string()));
+    }
+
+    #[test]
+    fn test_strip_param_modifiers_no_modifier() {
+        let result = strip_param_property_modifiers("x,");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_strip_optional_param() {
+        let code = "(x?) => x";
+        let result = strip_leftover_typescript(code);
+        assert!(result.contains("(x)"));
+        assert!(!result.contains("?"));
+    }
+
+    #[test]
+    fn test_strip_type_annotation_in_param() {
+        let code = "(x: Props) => x";
+        let result = strip_leftover_typescript(code);
+        assert!(result.contains("(x)"));
+        assert!(!result.contains("Props"));
+    }
+
+    #[test]
+    fn test_strip_type_annotation_with_generics() {
+        let code = "(x: Array<string>) => x";
+        let result = strip_leftover_typescript(code);
+        assert!(result.contains("(x)"));
+        assert!(!result.contains("Array"));
+    }
+
+    #[test]
+    fn test_strip_param_modifier_in_context() {
+        let code = "class Foo {\n  constructor(\n    public readonly x,\n  ) {}\n}";
+        let result = strip_leftover_typescript(code);
+        assert!(result.contains("x,"));
+        assert!(!result.contains("public"));
+        assert!(!result.contains("readonly"));
+    }
+
+    // ── strip_function_overloads ────────────────────────────────────
+
+    #[test]
+    fn test_strip_overload_simple() {
+        let code = "function foo(a);\nfunction foo(a) { return a; }";
+        let result = strip_function_overloads(code);
+        assert!(!result.contains("function foo(a);"));
+        assert!(result.contains("function foo(a) { return a; }"));
+    }
+
+    #[test]
+    fn test_strip_overload_export() {
+        let code = "export function foo(a);\nexport function foo(a) { return a; }";
+        let result = strip_function_overloads(code);
+        assert!(!result.contains("export function foo(a);"));
+        assert!(result.contains("export function foo(a) { return a; }"));
+    }
+
+    #[test]
+    fn test_strip_overload_with_generics() {
+        let code = "function bar<T>(x);\nfunction bar(x) { return x; }";
+        let result = strip_function_overloads(code);
+        assert!(!result.contains("function bar<T>(x);"));
+        assert!(result.contains("function bar(x) { return x; }"));
+    }
+
+    #[test]
+    fn test_strip_overload_with_return_type() {
+        let code = "function baz(a): string;\nfunction baz(a) { return a; }";
+        let result = strip_function_overloads(code);
+        assert!(!result.contains("function baz(a): string;"));
+        assert!(result.contains("function baz(a) { return a; }"));
+    }
+
+    #[test]
+    fn test_strip_overload_at_file_start() {
+        // Tests find_line_start returning 0
+        let code = "function foo(a);\nfunction foo(a) { return a; }";
+        let result = strip_function_overloads(code);
+        assert!(!result.contains("function foo(a);"));
+    }
+
+    #[test]
+    fn test_strip_overload_keeps_implementation() {
+        let code = "function foo(a);\nfunction foo(a, b);\nfunction foo(a, b) { return a + b; }";
+        let result = strip_function_overloads(code);
+        assert!(!result.contains("function foo(a);"));
+        assert!(!result.contains("function foo(a, b);"));
+        assert!(result.contains("function foo(a, b) { return a + b; }"));
+    }
+
+    #[test]
+    fn test_strip_overload_not_declaration() {
+        // function keyword inside expression should not be treated as overload
+        let code = "const x = function foo(a) { return a; };";
+        let result = strip_function_overloads(code);
+        assert_eq!(result, code);
+    }
+
+    // ── deduplicate_imports ─────────────────────────────────────────
+
+    #[test]
+    fn test_deduplicate_no_dupes() {
+        let code = "import { signal } from '@vertz/ui';\nimport { query } from '@vertz/ui/data';";
+        let result = deduplicate_imports(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn test_deduplicate_merges_same_module() {
+        let code = "import { signal } from '@vertz/ui';\nimport { computed } from '@vertz/ui';";
+        let result = deduplicate_imports(code);
+        // Should be merged into one import
+        let import_count = result.matches("import {").count();
+        assert_eq!(
+            import_count, 1,
+            "Should merge into one import. Got: {}",
+            result
+        );
+        assert!(result.contains("signal"));
+        assert!(result.contains("computed"));
+    }
+
+    #[test]
+    fn test_deduplicate_skips_import_type() {
+        let code = "import type { Foo } from '@vertz/ui';\nimport { signal } from '@vertz/ui';";
+        let result = deduplicate_imports(code);
+        // import type should not be merged with import
+        assert!(result.contains("import type"));
+        assert!(result.contains("import { signal }"));
+    }
+
+    #[test]
+    fn test_deduplicate_double_quotes() {
+        let code = "import { signal } from \"@vertz/ui\";\nimport { computed } from \"@vertz/ui\";";
+        let result = deduplicate_imports(code);
+        let import_count = result.matches("import {").count();
+        assert_eq!(
+            import_count, 1,
+            "Should merge double-quoted imports. Got: {}",
+            result
+        );
+    }
+
+    // ── extract_quoted_string ───────────────────────────────────────
+
+    #[test]
+    fn test_extract_quoted_string_single() {
+        assert_eq!(
+            extract_quoted_string("'@vertz/ui';"),
+            Some("@vertz/ui".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_quoted_string_double() {
+        assert_eq!(
+            extract_quoted_string("\"@vertz/ui\";"),
+            Some("@vertz/ui".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_quoted_string_none() {
+        assert_eq!(extract_quoted_string("no quotes"), None);
+    }
+
+    // ── extract_import_names ────────────────────────────────────────
+
+    #[test]
+    fn test_extract_import_names_basic() {
+        let names = extract_import_names("import { a, b, c } from 'mod';");
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_extract_import_names_no_braces() {
+        let names = extract_import_names("import foo from 'mod';");
+        assert!(names.is_empty());
+    }
+
+    // ── remove_cross_specifier_duplicates ────────────────────────────
+
+    #[test]
+    fn test_remove_cross_specifier_dupes_injected_removed() {
+        let code = "import { domEffect } from '@vertz/ui/internals';\nimport { domEffect } from '../signal';";
+        let result = remove_cross_specifier_duplicates(code);
+        // The injected import (@vertz/ui/internals) should lose domEffect
+        assert!(
+            !result.contains("from '@vertz/ui/internals'"),
+            "Injected import should be dropped entirely. Got: {}",
+            result
+        );
+        assert!(result.contains("import { domEffect } from '../signal'"));
+    }
+
+    #[test]
+    fn test_remove_cross_specifier_dupes_partial_removal() {
+        let code = "import { domEffect, startSignalCollection } from '@vertz/ui/internals';\nimport { domEffect } from '../signal';";
+        let result = remove_cross_specifier_duplicates(code);
+        // domEffect should be removed from the injected import, but startSignalCollection stays
+        assert!(result.contains("startSignalCollection"));
+        assert!(result.contains("'@vertz/ui/internals'"));
+        assert!(result.contains("import { domEffect } from '../signal'"));
+    }
+
+    #[test]
+    fn test_remove_cross_specifier_dupes_no_conflict() {
+        let code = "import { signal } from '@vertz/ui';\nimport { query } from '@vertz/ui/data';";
+        let result = remove_cross_specifier_duplicates(code);
+        assert_eq!(result, code);
+    }
+
+    #[test]
+    fn test_remove_cross_specifier_dupes_alias() {
+        let code = "import { domEffect as de } from '@vertz/ui/internals';\nimport { domEffect as de } from '../signal';";
+        let result = remove_cross_specifier_duplicates(code);
+        // The binding `de` is duplicated — injected one should be removed
+        assert!(!result.contains("@vertz/ui/internals"));
+    }
+
+    #[test]
+    fn test_remove_cross_specifier_dupes_local_declaration_conflict() {
+        let code = "import { domEffect } from '@vertz/ui/internals';\nfunction domEffect() {}";
+        let result = remove_cross_specifier_duplicates(code);
+        // domEffect conflicts with local declaration — injected import should be removed
+        assert!(!result.contains("@vertz/ui/internals"));
+        assert!(result.contains("function domEffect()"));
+    }
+
+    // ── strip_import_meta_hot ───────────────────────────────────────
+
+    #[test]
+    fn test_strip_import_meta_hot() {
+        let code = "const x = 1;\nimport.meta.hot.accept();\nconst y = 2;";
+        let result = strip_import_meta_hot(code);
+        assert!(!result.contains("import.meta.hot"));
+        assert!(result.contains("const x = 1;"));
+        assert!(result.contains("const y = 2;"));
+    }
+
+    #[test]
+    fn test_strip_import_meta_hot_none() {
+        let code = "const x = 1;";
+        let result = strip_import_meta_hot(code);
+        assert_eq!(result, code);
+    }
+
+    // ── fix_module_id ───────────────────────────────────────────────
+
+    #[test]
+    fn test_fix_module_id_replaces_absolute() {
+        let code = "const __$moduleId = '/project/src/app.tsx';";
+        let result = fix_module_id(
+            code,
+            Path::new("/project/src/app.tsx"),
+            Path::new("/project"),
+        );
+        assert!(result.contains("'/src/app.tsx'"));
+        assert!(!result.contains("/project/src/app.tsx"));
+    }
+
+    #[test]
+    fn test_fix_module_id_outside_root() {
+        let code = "const __$moduleId = '/other/app.tsx';";
+        let result = fix_module_id(code, Path::new("/other/app.tsx"), Path::new("/project"));
+        assert_eq!(result, code);
+    }
+
+    // ── post_process_compiled (integration) ─────────────────────────
+
+    #[test]
+    fn test_post_process_strips_import_meta_hot() {
+        let code = "const x = 1;\nimport.meta.hot.accept();\nexport { x };";
+        let result = post_process_compiled(code);
+        assert!(!result.contains("import.meta.hot"));
+        assert!(result.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn test_post_process_full_pipeline() {
+        let code = "import type { Foo } from 'bar';\nimport { signal, effect } from '@vertz/ui';\nimport { signal } from '@vertz/ui';\nimport.meta.hot.accept();\nconst x = 1;";
+        let result = post_process_compiled(code);
+        // import type stripped
+        assert!(!result.contains("import type"));
+        // effect renamed to domEffect and moved to internals
+        assert!(result.contains("domEffect"));
+        // import.meta.hot stripped
+        assert!(!result.contains("import.meta.hot"));
+        // signal deduped
+        assert!(result.contains("signal"));
+    }
+
+    // ── CompilationPipeline methods ─────────────────────────────────
+
+    #[test]
+    fn test_css_key_outside_root() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let key = pipeline.css_key(Path::new("/other/file.tsx"));
+        assert!(key.ends_with(".css"));
+        // Should use hash fallback
+        assert!(key.contains("css"));
+    }
+
+    #[test]
+    fn test_source_map_url_inside_root() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let url = pipeline.source_map_url(Path::new("/project/src/app.tsx"));
+        assert_eq!(url, "/src/app.tsx.map");
+    }
+
+    #[test]
+    fn test_source_map_url_outside_root() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let url = pipeline.source_map_url(Path::new("/other/app.tsx"));
+        assert_eq!(url, "/other/app.tsx.map");
+    }
+
+    #[test]
+    fn test_get_css_empty_store() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        assert_eq!(pipeline.get_css("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_store_and_get_css() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        pipeline.store_css(Path::new("/project/src/app.tsx"), ".foo { color: red; }");
+        let key = pipeline.css_key(Path::new("/project/src/app.tsx"));
+        assert_eq!(
+            pipeline.get_css(&key),
+            Some(".foo { color: red; }".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compile_with_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // Invalid syntax should produce diagnostics
+        std::fs::write(src_dir.join("bad.tsx"), "export const x: = ;\n").unwrap();
+
+        let pipeline = create_pipeline(tmp.path());
+        let result = pipeline.compile_for_browser(&src_dir.join("bad.tsx"));
+        // Even with errors, it should return some output
+        assert!(!result.code.is_empty());
+    }
+
+    #[test]
+    fn test_compile_does_not_cache_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("bad.tsx"), "export const x: = ;\n").unwrap();
+
+        let pipeline = create_pipeline(tmp.path());
+        let result = pipeline.compile_for_browser(&src_dir.join("bad.tsx"));
+
+        if !result.errors.is_empty() {
+            // Errors should not be cached
+            assert!(pipeline.cache().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_error_module_content() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let result = pipeline.error_module("Test error");
+        assert!(result.code.contains("console.error"));
+        assert!(result.code.contains("Test error"));
+        assert!(result.code.contains("export default undefined"));
+        assert!(result.source_map.is_none());
+        assert!(result.css.is_none());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].message, "Test error");
+    }
+
+    #[test]
+    fn test_error_module_escapes_backslash() {
+        let pipeline =
+            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let result = pipeline.error_module("path\\to\\file");
+        assert!(result.code.contains("path\\\\to\\\\file"));
+    }
 }

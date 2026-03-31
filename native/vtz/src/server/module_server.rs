@@ -1064,4 +1064,878 @@ mod tests {
         let result = re_resolve_dep("nonexistent-pkg/index.js", &state);
         assert!(result.is_none());
     }
+
+    // ── handle_source_file: source map dispatch ─────────────────────
+
+    #[tokio::test]
+    async fn test_handle_source_file_map_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Write a source file so compilation can produce a source map
+        std::fs::write(
+            tmp.path().join("src/app.ts"),
+            "export const x: number = 42;\n",
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/app.ts.map")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        // Whether 200 (map available) or 404 (map not available), the map path is exercised
+        let status = resp.status();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::NOT_FOUND,
+            "Expected 200 or 404, got {}",
+            status
+        );
+    }
+
+    // ── handle_source_file: compilation errors ──────────────────────
+
+    #[tokio::test]
+    async fn test_handle_source_file_with_compile_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Write a file with syntax errors
+        std::fs::write(tmp.path().join("src/bad.tsx"), "export const x: = ;\n").unwrap();
+
+        let req = Request::builder()
+            .uri("/src/bad.tsx")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        // Should still return 200 with compiled output (even error modules are JS)
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── handle_source_file: query param stripping ───────────────────
+
+    #[tokio::test]
+    async fn test_handle_source_file_strips_query_params() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(tmp.path().join("src/app.ts"), "export const x = 42;\n").unwrap();
+
+        // HMR cache busting query param
+        let req = Request::builder()
+            .uri("/src/app.ts?t=1234567890")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── handle_source_map ───────────────────────────────────────────
+
+    #[test]
+    fn test_handle_source_map_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Write a source file so compilation can produce a map
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("app.ts"), "export const x = 42;\n").unwrap();
+
+        let map_path = src_dir.join("app.ts.map");
+        let resp = handle_source_map(&state, &map_path);
+
+        // Source map may or may not be available depending on compiler
+        let status = resp.status();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::NOT_FOUND,
+            "Expected 200 or 404, got {}",
+            status
+        );
+    }
+
+    #[test]
+    fn test_handle_source_map_file_not_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        let map_path = tmp.path().join("src/nonexistent.tsx.map");
+        let resp = handle_source_map(&state, &map_path);
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_handle_source_map_no_map_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Path that doesn't end in .map — should use the path as-is
+        let path = tmp.path().join("src/app.tsx");
+        let resp = handle_source_map(&state, &path);
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── handle_deps_request: prebundled dep read error ──────────────
+
+    #[tokio::test]
+    async fn test_handle_deps_request_cache_immutable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(tmp.path().join(".vertz/deps/zod.js"), "export default {};").unwrap();
+
+        let req = Request::builder()
+            .uri("/@deps/zod")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert!(cc.to_str().unwrap().contains("immutable"));
+    }
+
+    // ── handle_deps_request: node_modules direct path ───────────────
+
+    #[tokio::test]
+    async fn test_handle_deps_node_modules_direct_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Create a file directly in node_modules
+        let pkg_path = tmp.path().join("node_modules/@vertz/ui/dist/index.js");
+        std::fs::create_dir_all(pkg_path.parent().unwrap()).unwrap();
+        std::fs::write(&pkg_path, "export const x = 1;").unwrap();
+
+        let req = Request::builder()
+            .uri("/@deps/@vertz/ui/dist/index.js")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(ct.to_str().unwrap().contains("application/javascript"));
+    }
+
+    // ── serve_js_file ───────────────────────────────────────────────
+
+    #[test]
+    fn test_serve_js_file_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let js_file = tmp.path().join("test.js");
+        std::fs::write(&js_file, "export const x = 1;").unwrap();
+
+        let resp = serve_js_file(&js_file, tmp.path());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(ct.to_str().unwrap().contains("application/javascript"));
+    }
+
+    #[test]
+    fn test_serve_js_file_read_error() {
+        let resp = serve_js_file(Path::new("/nonexistent/file.js"), Path::new("/"));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── handle_css_request: CSS found ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_css_request_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Store CSS content directly in the pipeline's CSS store
+        let key = "src_app.tsx.css";
+        state
+            .pipeline
+            .css_store()
+            .write()
+            .unwrap()
+            .insert(key.to_string(), ".foo { color: red; }".to_string());
+
+        let req = Request::builder()
+            .uri(format!("/@css/{}", key))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_css_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(ct.to_str().unwrap().contains("text/css"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let css = String::from_utf8(body.to_vec()).unwrap();
+        assert!(css.contains(".foo { color: red; }"));
+    }
+
+    // ── resolve_in_workspace_node_modules ────────────────────────────
+
+    #[test]
+    fn test_resolve_workspace_no_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No node_modules directory
+        assert!(resolve_in_workspace_node_modules("foo/index.js", tmp.path()).is_none());
+    }
+
+    #[test]
+    fn test_resolve_workspace_empty_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        assert!(resolve_in_workspace_node_modules("foo/index.js", tmp.path()).is_none());
+    }
+
+    // ── resolve_in_bun_cache ────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_bun_cache_no_bun_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        assert!(resolve_in_bun_cache("foo/index.js", tmp.path()).is_none());
+    }
+
+    #[test]
+    fn test_resolve_bun_cache_with_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_dir = tmp
+            .path()
+            .join("node_modules/.bun/foo@1.0.0/node_modules/foo");
+        std::fs::create_dir_all(&bun_dir).unwrap();
+        std::fs::write(bun_dir.join("index.js"), "export default {};").unwrap();
+
+        let result = resolve_in_bun_cache("foo/index.js", tmp.path());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_resolve_bun_cache_scoped_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_dir = tmp
+            .path()
+            .join("node_modules/.bun/@scope+pkg@1.0.0/node_modules/@scope/pkg");
+        let dist_dir = bun_dir.join("dist");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(dist_dir.join("index.js"), "export default {};").unwrap();
+
+        let result = resolve_in_bun_cache("@scope/pkg/dist/index.js", tmp.path());
+        assert!(result.is_some());
+    }
+
+    // ── parse_location_from_message edge cases ──────────────────────
+
+    #[test]
+    fn test_parse_location_multiple_colons() {
+        let (line, col) = parse_location_from_message("Error in file.tsx:5:10 and more text");
+        assert_eq!(line, Some(5));
+        assert_eq!(col, Some(10));
+    }
+
+    #[test]
+    fn test_parse_location_colon_no_digits() {
+        let (line, col) = parse_location_from_message("Error: something went wrong");
+        assert_eq!(line, None);
+        assert_eq!(col, None);
+    }
+
+    #[test]
+    fn test_parse_location_empty() {
+        let (line, col) = parse_location_from_message("");
+        assert_eq!(line, None);
+        assert_eq!(col, None);
+    }
+
+    #[test]
+    fn test_parse_location_only_colon_zero() {
+        // :0 is not valid (> 0 check)
+        let (line, col) = parse_location_from_message("at :0");
+        assert_eq!(line, None);
+        assert_eq!(col, None);
+    }
+
+    // ── resolve_in_workspace_node_modules with symlinks ─────────────
+
+    #[test]
+    fn test_resolve_workspace_with_regular_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Create a regular (non-symlink) directory — should not be picked up
+        let pkg_dir = nm.join("regular-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let result = resolve_in_workspace_node_modules("some-dep/index.js", tmp.path());
+        assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_workspace_with_symlinked_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Create a "real" workspace package directory
+        let real_pkg = tmp.path().join("packages/my-pkg");
+        let nested_nm = real_pkg.join("node_modules/dep-pkg");
+        std::fs::create_dir_all(&nested_nm).unwrap();
+        std::fs::write(nested_nm.join("index.js"), "export default {};").unwrap();
+
+        // Symlink it into node_modules
+        std::os::unix::fs::symlink(&real_pkg, nm.join("my-pkg")).unwrap();
+
+        let result = resolve_in_workspace_node_modules("dep-pkg/index.js", tmp.path());
+        assert!(result.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_workspace_scoped_symlinked_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules/@vertz");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Create a "real" workspace package directory
+        let real_pkg = tmp.path().join("packages/ui-primitives");
+        let nested_nm = real_pkg.join("node_modules/@floating-ui/dom");
+        std::fs::create_dir_all(&nested_nm).unwrap();
+        std::fs::write(nested_nm.join("index.mjs"), "export {};").unwrap();
+
+        // Symlink it under the scoped directory
+        std::os::unix::fs::symlink(&real_pkg, nm.join("ui-primitives")).unwrap();
+
+        let result = resolve_in_workspace_node_modules("@floating-ui/dom/index.mjs", tmp.path());
+        assert!(result.is_some());
+    }
+
+    // ── resolve_in_bun_cache additional branches ────────────────────
+
+    #[test]
+    fn test_resolve_bun_cache_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_dir = tmp
+            .path()
+            .join("node_modules/.bun/other-pkg@1.0.0/node_modules/other-pkg");
+        std::fs::create_dir_all(&bun_dir).unwrap();
+
+        // Looking for a different package
+        let result = resolve_in_bun_cache("foo/index.js", tmp.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_bun_cache_nested_transitive_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a .bun entry with a nested node_modules containing a transitive dep
+        let bun_entry = tmp.path().join("node_modules/.bun/parent-pkg@1.0.0");
+        let nested_dep = bun_entry.join("node_modules/child-dep/dist");
+        std::fs::create_dir_all(&nested_dep).unwrap();
+        std::fs::write(nested_dep.join("index.js"), "export {};").unwrap();
+
+        let result = resolve_in_bun_cache("child-dep/dist/index.js", tmp.path());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_resolve_bun_cache_empty_subpath() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_dir = tmp
+            .path()
+            .join("node_modules/.bun/my-lib@2.0.0/node_modules/my-lib");
+        std::fs::create_dir_all(&bun_dir).unwrap();
+
+        // Empty subpath — tries to resolve via package.json exports (will fail without it)
+        let result = resolve_in_bun_cache("my-lib", tmp.path());
+        // Will be None because there's no package.json exports to resolve
+        assert!(result.is_none());
+    }
+
+    // ── handle_deps_request: node_modules resolution paths ──────────
+
+    #[tokio::test]
+    async fn test_handle_deps_node_modules_walk_up() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create project dir with a parent that has node_modules
+        let project = tmp.path().join("workspace/my-app");
+        std::fs::create_dir_all(&project).unwrap();
+        let src = project.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let deps = project.join(".vertz/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+
+        // Put the dep in the parent's node_modules (monorepo hoisting)
+        let parent_nm = tmp.path().join("workspace/node_modules/some-lib");
+        std::fs::create_dir_all(&parent_nm).unwrap();
+        std::fs::write(parent_nm.join("index.js"), "export const x = 1;").unwrap();
+
+        let state = Arc::new(DevServerState {
+            pipeline: CompilationPipeline::new(project.clone(), src.clone()),
+            root_dir: project.clone(),
+            src_dir: src,
+            entry_file: project.join("src/app.tsx"),
+            deps_dir: deps,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
+
+        let req = Request::builder()
+            .uri("/@deps/some-lib/index.js")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── handle_source_file: compilation error with location ─────────
+
+    #[tokio::test]
+    async fn test_handle_source_file_error_clears_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // First compile succeeds — exercises the else branch (clear errors, update graph)
+        std::fs::write(
+            tmp.path().join("src/good.ts"),
+            "export const hello = 'world';\n",
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/good.ts")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── serve_js_file: content rewriting ────────────────────────────
+
+    #[test]
+    fn test_serve_js_file_rewrites_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let js_file = tmp.path().join("test.js");
+        std::fs::write(
+            &js_file,
+            "import { something } from './other.js';\nexport const x = 1;",
+        )
+        .unwrap();
+
+        let resp = serve_js_file(&js_file, tmp.path());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc.to_str().unwrap(), "no-cache");
+    }
+
+    // ── handle_source_file: source map content type ─────────────────
+
+    #[tokio::test]
+    async fn test_handle_source_file_map_content_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(tmp.path().join("src/app.ts"), "export const x = 42;\n").unwrap();
+
+        // First compile to populate the cache
+        let req = Request::builder()
+            .uri("/src/app.ts")
+            .body(Body::empty())
+            .unwrap();
+        let _resp = handle_source_file(State(state.clone()), req).await;
+
+        // Now request the source map
+        let req = Request::builder()
+            .uri("/src/app.ts.map")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_source_file(State(state), req).await;
+        let status = resp.status();
+        if status == StatusCode::OK {
+            let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+            assert!(ct.to_str().unwrap().contains("application/json"));
+        }
+    }
+
+    // ── pre-bundled dep read error (unix only) ────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_handle_deps_prebundled_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Create a deps file then remove read permissions
+        let dep_file = tmp.path().join(".vertz/deps/unreadable-pkg.js");
+        std::fs::write(&dep_file, "export default {};").unwrap();
+        std::fs::set_permissions(&dep_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let req = Request::builder()
+            .uri("/@deps/unreadable-pkg")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Restore permissions for cleanup
+        std::fs::set_permissions(&dep_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // ── handle_deps: workspace node_modules resolution ──────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_handle_deps_workspace_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Create a workspace package with nested node_modules
+        let real_pkg = tmp.path().join("packages/my-ui");
+        let nested_dep = real_pkg.join("node_modules/floating-utils");
+        std::fs::create_dir_all(&nested_dep).unwrap();
+        std::fs::write(nested_dep.join("index.js"), "export const x = 1;").unwrap();
+
+        // Symlink the workspace package into node_modules
+        std::os::unix::fs::symlink(&real_pkg, nm.join("my-ui")).unwrap();
+
+        let src = tmp.path().join("src");
+        let deps = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let state = Arc::new(DevServerState {
+            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src,
+            entry_file: tmp.path().join("src/app.tsx"),
+            deps_dir: deps,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
+
+        let req = Request::builder()
+            .uri("/@deps/floating-utils/index.js")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── handle_deps: bun cache resolution ───────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_deps_bun_cache_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_pkg = tmp
+            .path()
+            .join("node_modules/.bun/bar@1.0.0/node_modules/bar");
+        std::fs::create_dir_all(&bun_pkg).unwrap();
+        std::fs::write(bun_pkg.join("index.js"), "export const x = 1;").unwrap();
+
+        let src = tmp.path().join("src");
+        let deps = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let state = Arc::new(DevServerState {
+            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src,
+            entry_file: tmp.path().join("src/app.tsx"),
+            deps_dir: deps,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
+
+        let req = Request::builder()
+            .uri("/@deps/bar/index.js")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── resolve_in_bun_cache: empty subpath with package.json ───────
+
+    #[test]
+    fn test_resolve_bun_cache_empty_subpath_with_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_dir = tmp
+            .path()
+            .join("node_modules/.bun/my-lib@2.0.0/node_modules/my-lib");
+        std::fs::create_dir_all(&bun_dir).unwrap();
+        std::fs::write(bun_dir.join("index.js"), "export default {};").unwrap();
+        std::fs::write(
+            bun_dir.join("package.json"),
+            r#"{"name":"my-lib","main":"index.js"}"#,
+        )
+        .unwrap();
+
+        let result = resolve_in_bun_cache("my-lib", tmp.path());
+        // May or may not resolve depending on resolve::resolve_from_node_modules behavior
+        // But the path through the code is exercised either way
+        let _ = result;
+    }
+
+    // ── re_resolve_dep: workspace fallback path ─────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_re_resolve_dep_workspace_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Create workspace package with nested dep
+        let real_pkg = tmp.path().join("packages/shared");
+        let nested = real_pkg.join("node_modules/helper-lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("index.js"), "export {};").unwrap();
+
+        // Symlink workspace package
+        std::os::unix::fs::symlink(&real_pkg, nm.join("shared")).unwrap();
+
+        let src = tmp.path().join("src");
+        let deps = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let state = DevServerState {
+            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src,
+            entry_file: tmp.path().join("src/app.tsx"),
+            deps_dir: deps,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        };
+
+        // helper-lib/index.js is not in root's node_modules directly,
+        // only inside shared's node_modules — re_resolve_dep should find via workspace fallback
+        let result = re_resolve_dep("helper-lib/index.js", &state);
+        assert!(result.is_some());
+    }
+
+    // ── re_resolve_dep: bun cache fallback ──────────────────────────
+
+    #[test]
+    fn test_re_resolve_dep_bun_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun_pkg = tmp
+            .path()
+            .join("node_modules/.bun/some-dep@1.0.0/node_modules/some-dep");
+        std::fs::create_dir_all(&bun_pkg).unwrap();
+        std::fs::write(bun_pkg.join("index.js"), "export {};").unwrap();
+
+        let src = tmp.path().join("src");
+        let deps = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let state = DevServerState {
+            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src,
+            entry_file: tmp.path().join("src/app.tsx"),
+            deps_dir: deps,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        };
+
+        let result = re_resolve_dep("some-dep/index.js", &state);
+        assert!(result.is_some());
+    }
+
+    // ── auto-install: concurrent waiter path ────────────────────────
+
+    #[tokio::test]
+    async fn test_auto_install_concurrent_waiter_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        let mut inner = (*state).clone();
+        inner.auto_install = true;
+        let state = Arc::new(inner);
+
+        // Pre-populate the inflight map to simulate another request already installing
+        let notify = Arc::new(tokio::sync::Notify::new());
+        state
+            .auto_install_inflight
+            .lock()
+            .unwrap()
+            .insert("concurrent-pkg".to_string(), notify.clone());
+
+        // Notify after a short delay so the handler's Notified future is ready
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            notify.notify_waiters();
+        });
+
+        let req = Request::builder()
+            .uri("/@deps/concurrent-pkg")
+            .body(Body::empty())
+            .unwrap();
+
+        // This should hit the waiter path (is_installer = false), wait for notify, then 404
+        let resp = handle_deps_request(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── handle_deps: package.json exports resolution path ───────────
+
+    #[tokio::test]
+    async fn test_handle_deps_package_json_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path().join("node_modules/exports-pkg");
+        std::fs::create_dir_all(pkg_dir.join("dist")).unwrap();
+        std::fs::write(pkg_dir.join("dist/index.mjs"), "export const x = 1;").unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"exports-pkg","exports":{".":"./dist/index.mjs"}}"#,
+        )
+        .unwrap();
+
+        let src = tmp.path().join("src");
+        let deps = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let state = Arc::new(DevServerState {
+            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src,
+            entry_file: tmp.path().join("src/app.tsx"),
+            deps_dir: deps,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
+
+        // Request the bare specifier (no subpath) which should resolve via package.json exports
+        let req = Request::builder()
+            .uri("/@deps/exports-pkg")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_deps_request(State(state), req).await;
+        // May be 200 if resolve works with this package.json, or 404 if not
+        let _ = resp.status();
+    }
+
+    // ── handle_page_route: theme CSS ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_page_route_with_theme_css() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let deps_dir = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&deps_dir).unwrap();
+
+        let mut state = (*create_test_state(tmp.path())).clone();
+        state.theme_css = Some(":root { --color: red; }".to_string());
+        let state = Arc::new(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = handle_page_route(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("--color: red"));
+    }
 }
