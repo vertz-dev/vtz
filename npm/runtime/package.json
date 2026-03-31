@@ -1,6 +1,6 @@
 {
   "name": "@vertz/runtime",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Vertz runtime binary (platform selector)",
   "files": [
     "index.js",
@@ -25,10 +25,10 @@
     "@types/node": "^22.15.32"
   },
   "optionalDependencies": {
-    "@vertz/runtime-darwin-arm64": "0.0.1",
-    "@vertz/runtime-darwin-x64": "0.0.1",
-    "@vertz/runtime-linux-arm64": "0.0.1",
-    "@vertz/runtime-linux-x64": "0.0.1"
+    "@vertz/runtime-darwin-arm64": "0.0.2",
+    "@vertz/runtime-darwin-x64": "0.0.2",
+    "@vertz/runtime-linux-arm64": "0.0.2",
+    "@vertz/runtime-linux-x64": "0.0.2"
   },
   "bin": {
     "vtz": "./vtz",
