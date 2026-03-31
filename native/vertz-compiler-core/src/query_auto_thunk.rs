@@ -206,3 +206,285 @@ impl<'a, 'c> Visit<'c> for ReactiveRefChecker<'a> {
         self.shadowed_stack.pop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, CompileOptions};
+
+    fn compile_tsx(source: &str) -> crate::CompileResult {
+        compile(
+            source,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    // ── Basic thunk wrapping ─────────────────────────────────────
+
+    #[test]
+    fn wraps_query_arg_with_thunk_when_reactive_var_present() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(fetch('/api', { offset }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        assert!(
+            result.code.contains("() => "),
+            "expected thunk wrapper, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn no_thunk_when_no_reactive_vars() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    const q = query(fetch('/api'));
+    return <div>hello</div>;
+}"#,
+        );
+        // No reactive vars → no thunk wrapping
+        assert!(
+            !result.code.contains("() => fetch"),
+            "should not wrap, code: {}",
+            result.code
+        );
+    }
+
+    // ── Skip already-wrapped functions ───────────────────────────
+
+    #[test]
+    fn skip_arrow_function_argument() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(() => fetch('/api', { offset }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        // Already an arrow function — should NOT double-wrap
+        assert!(
+            !result.code.contains("() => () =>"),
+            "should not double-wrap, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn skip_function_expression_argument() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(function() { return fetch('/api', { offset }); });
+    return <div>{offset}</div>;
+}"#,
+        );
+        assert!(
+            !result.code.contains("() => function"),
+            "should not wrap function expression, code: {}",
+            result.code
+        );
+    }
+
+    // ── Skip spread arguments ────────────────────────────────────
+
+    #[test]
+    fn skip_spread_argument() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let args = [];
+    const q = query(...args);
+    return <div>{args.length}</div>;
+}"#,
+        );
+        // Spread arguments should not be wrapped
+        assert!(
+            !result.code.contains("() => ..."),
+            "should not wrap spread, code: {}",
+            result.code
+        );
+    }
+
+    // ── Shorthand object properties ──────────────────────────────
+
+    #[test]
+    fn detects_reactive_var_in_shorthand_object_property() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(apiCall({ offset }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        assert!(
+            result.code.contains("() => "),
+            "shorthand prop should trigger thunk, code: {}",
+            result.code
+        );
+    }
+
+    // ── Aliased query import ─────────────────────────────────────
+
+    #[test]
+    fn works_with_aliased_query_import() {
+        let result = compile_tsx(
+            r#"import { query as myQuery } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = myQuery(fetch('/api', { offset }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        assert!(
+            result.code.contains("() => "),
+            "aliased query should still wrap, code: {}",
+            result.code
+        );
+    }
+
+    // ── Non-query callee not affected ────────────────────────────
+
+    #[test]
+    fn non_query_callee_not_wrapped() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const result = someOtherFn(fetch('/api', { offset }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        // someOtherFn is not query — should not wrap
+        assert!(
+            !result.code.contains("() => fetch"),
+            "non-query should not wrap, code: {}",
+            result.code
+        );
+    }
+
+    // ── Member expression property skipping ──────────────────────
+
+    #[test]
+    fn skips_property_names_in_member_expressions() {
+        // If reactive var name appears as a property (not object), should not trigger
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(api.offset);
+    return <div>{offset}</div>;
+}"#,
+        );
+        // `offset` in `api.offset` is a property name, not a variable reference
+        assert!(
+            !result.code.contains("() => api"),
+            "property name should not trigger thunk, code: {}",
+            result.code
+        );
+    }
+
+    // ── Shadowed variables ───────────────────────────────────────
+
+    #[test]
+    fn shadowed_var_in_arrow_does_not_trigger_thunk() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(((offset) => doSomething(offset))(5));
+    return <div>{offset}</div>;
+}"#,
+        );
+        // offset is shadowed by the arrow param, so no reactive ref
+        assert!(
+            !result.code.contains("() => ((offset)"),
+            "shadowed var should not trigger thunk, code: {}",
+            result.code
+        );
+    }
+
+    // ── No query import → no transform ───────────────────────────
+
+    #[test]
+    fn no_query_import_no_transform() {
+        let result = compile_tsx(
+            r#"function App() {
+    let offset = 0;
+    const q = query(fetch('/api', { offset }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        // query is not imported from @vertz/ui — should not wrap
+        assert!(
+            !result.code.contains("() => fetch"),
+            "no import should not wrap, code: {}",
+            result.code
+        );
+    }
+
+    // ── Computed member expression visits both parts ──────────────
+
+    #[test]
+    fn computed_member_expression_detects_reactive_in_expression() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let idx = 0;
+    const q = query(items[idx]);
+    return <div>{idx}</div>;
+}"#,
+        );
+        assert!(
+            result.code.contains("() => "),
+            "computed member expr should detect reactive, code: {}",
+            result.code
+        );
+    }
+
+    // ── No arguments → no crash ──────────────────────────────────
+
+    #[test]
+    fn query_with_no_args_does_not_crash() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let x = 0;
+    const q = query();
+    return <div>{x}</div>;
+}"#,
+        );
+        // Should not panic
+        assert!(!result.code.is_empty());
+    }
+
+    // ── Object property key not treated as reference ─────────────
+
+    #[test]
+    fn object_key_not_treated_as_reactive_ref() {
+        let result = compile_tsx(
+            r#"import { query } from '@vertz/ui';
+function App() {
+    let offset = 0;
+    const q = query(doStuff({ offset: 42 }));
+    return <div>{offset}</div>;
+}"#,
+        );
+        // `offset` in `{ offset: 42 }` is a key, not a reactive reference
+        // The value is 42 (literal), not a reactive var
+        assert!(
+            !result.code.contains("() => doStuff"),
+            "object key should not trigger thunk, code: {}",
+            result.code
+        );
+    }
+}
