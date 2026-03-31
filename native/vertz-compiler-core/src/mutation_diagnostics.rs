@@ -200,3 +200,397 @@ fn get_root_identifier<'a>(expr: &'a Expression) -> Option<&'a str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, CompileOptions};
+
+    fn compile_tsx(source: &str) -> crate::CompileResult {
+        compile(
+            source,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn has_mutation_diag(result: &crate::CompileResult) -> bool {
+        result
+            .diagnostics
+            .as_ref()
+            .map(|ds| {
+                ds.iter()
+                    .any(|d| d.message.contains("non-reactive-mutation"))
+            })
+            .unwrap_or(false)
+    }
+
+    fn mutation_diags(result: &crate::CompileResult) -> Vec<&crate::Diagnostic> {
+        result
+            .diagnostics
+            .as_ref()
+            .map(|ds| {
+                ds.iter()
+                    .filter(|d| d.message.contains("non-reactive-mutation"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // ── Method call mutations on const → diagnostic ──────────────
+
+    #[test]
+    fn push_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(
+            has_mutation_diag(&result),
+            "diags: {:?}",
+            result.diagnostics
+        );
+        let diags = mutation_diags(&result);
+        assert!(diags[0].message.contains(".push()"));
+        assert!(diags[0].message.contains("const items"));
+    }
+
+    #[test]
+    fn pop_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1, 2];
+    items.pop();
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".pop()"));
+    }
+
+    #[test]
+    fn shift_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1];
+    items.shift();
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".shift()"));
+    }
+
+    #[test]
+    fn unshift_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.unshift(1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".unshift()"));
+    }
+
+    #[test]
+    fn splice_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1, 2, 3];
+    items.splice(0, 1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".splice()"));
+    }
+
+    #[test]
+    fn sort_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [3, 1, 2];
+    items.sort();
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".sort()"));
+    }
+
+    #[test]
+    fn reverse_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1, 2];
+    items.reverse();
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".reverse()"));
+    }
+
+    #[test]
+    fn fill_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1, 2, 3];
+    items.fill(0);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".fill()"));
+    }
+
+    #[test]
+    fn copy_within_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1, 2, 3];
+    items.copyWithin(0, 1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+        assert!(mutation_diags(&result)[0].message.contains(".copyWithin()"));
+    }
+
+    // ── Property assignment mutation on const → diagnostic ───────
+
+    #[test]
+    fn property_assignment_on_const_in_jsx_produces_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const obj = { name: '' };
+    obj.name = 'test';
+    return <div>{obj.name}</div>;
+}"#,
+        );
+        assert!(
+            has_mutation_diag(&result),
+            "diags: {:?}",
+            result.diagnostics
+        );
+        let diags = mutation_diags(&result);
+        assert!(diags[0].message.contains("Property assignment"));
+        assert!(diags[0].message.contains("const obj"));
+    }
+
+    // ── No diagnostic when const not in JSX ──────────────────────
+
+    #[test]
+    fn no_diagnostic_when_const_not_in_jsx() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>hello</div>;
+}"#,
+        );
+        assert!(
+            !has_mutation_diag(&result),
+            "diags: {:?}",
+            result.diagnostics
+        );
+    }
+
+    // ── No diagnostic for let variables ──────────────────────────
+
+    #[test]
+    fn no_diagnostic_for_let_variables() {
+        let result = compile_tsx(
+            r#"function App() {
+    let items = [];
+    items.push(1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(
+            !has_mutation_diag(&result),
+            "diags: {:?}",
+            result.diagnostics
+        );
+    }
+
+    // ── Non-mutating methods produce no diagnostic ───────────────
+
+    #[test]
+    fn non_mutation_methods_no_diagnostic() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [1, 2, 3];
+    const mapped = items.map(x => x * 2);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        assert!(
+            !has_mutation_diag(&result),
+            "diags: {:?}",
+            result.diagnostics
+        );
+    }
+
+    // ── Line and column in diagnostics ───────────────────────────
+
+    #[test]
+    fn diagnostic_includes_line_and_column() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        let diags = mutation_diags(&result);
+        assert!(!diags.is_empty());
+        assert!(diags[0].line.is_some());
+        assert!(diags[0].column.is_some());
+    }
+
+    // ── Multiple diagnostics ─────────────────────────────────────
+
+    #[test]
+    fn multiple_mutations_produce_multiple_diagnostics() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    items.pop();
+    return <div>{items.length}</div>;
+}"#,
+        );
+        let diags = mutation_diags(&result);
+        assert!(diags.len() >= 2, "expected 2+ diags, got: {:?}", diags);
+    }
+
+    #[test]
+    fn diagnostics_on_different_const_vars() {
+        let result = compile_tsx(
+            r#"function App() {
+    const a = [];
+    const b = [];
+    a.push(1);
+    b.push(2);
+    return <div>{a.length}{b.length}</div>;
+}"#,
+        );
+        let diags = mutation_diags(&result);
+        assert!(diags.len() >= 2, "expected 2+ diags, got: {:?}", diags);
+    }
+
+    // ── Diagnostic message suggests changing to let ──────────────
+
+    #[test]
+    fn diagnostic_suggests_let() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{items.length}</div>;
+}"#,
+        );
+        let diags = mutation_diags(&result);
+        assert!(diags[0].message.contains("Change `const` to `let`"));
+    }
+
+    // ── JSX reference collection patterns ────────────────────────
+
+    #[test]
+    fn jsx_member_expression_reference() {
+        let result = compile_tsx(
+            r#"function App() {
+    const obj = { name: 'x' };
+    obj.name = 'y';
+    return <div>{obj.name}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+    }
+
+    #[test]
+    fn jsx_conditional_expression_reference() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{items.length > 0 ? 'yes' : 'no'}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+    }
+
+    #[test]
+    fn jsx_binary_expression_reference() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{items.length + 1}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+    }
+
+    #[test]
+    fn jsx_template_literal_reference() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{`count: ${items.length}`}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+    }
+
+    #[test]
+    fn jsx_call_expression_reference() {
+        let result = compile_tsx(
+            r#"function App() {
+    const items = [];
+    items.push(1);
+    return <div>{items.join(',')}</div>;
+}"#,
+        );
+        // items is referenced via call expression callee in JSX
+        assert!(has_mutation_diag(&result));
+    }
+
+    // ── Chained member expression ────────────────────────────────
+
+    #[test]
+    fn chained_member_expression_detects_root() {
+        let result = compile_tsx(
+            r#"function App() {
+    const obj = { nested: [] };
+    obj.nested.push(1);
+    return <div>{obj.nested.length}</div>;
+}"#,
+        );
+        assert!(has_mutation_diag(&result));
+    }
+
+    // ── Property assignment with both push and assign ────────────
+
+    #[test]
+    fn mixed_mutation_types_produce_diagnostics() {
+        let result = compile_tsx(
+            r#"function App() {
+    const obj = { items: [], name: '' };
+    obj.items.push(1);
+    obj.name = 'test';
+    return <div>{obj.name}</div>;
+}"#,
+        );
+        let diags = mutation_diags(&result);
+        assert!(diags.len() >= 2, "expected 2+ diags, got: {:?}", diags);
+    }
+}
