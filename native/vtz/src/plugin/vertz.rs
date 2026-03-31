@@ -115,6 +115,10 @@ impl FrameworkPlugin for VertzPlugin {
         ]
     }
 
+    fn env_public_prefixes(&self) -> Vec<String> {
+        vec!["VERTZ_".into(), "VITE_".into()]
+    }
+
     fn mcp_tool_definitions(&self) -> Vec<PluginMcpTool> {
         vec![PluginMcpTool {
             name: "api_spec".into(),
