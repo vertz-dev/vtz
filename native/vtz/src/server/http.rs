@@ -91,8 +91,15 @@ pub async fn try_bind(config: &ServerConfig) -> io::Result<BindResult> {
 /// 6. `/src/**` → on-demand compilation + serving
 /// 7. Static files from public_dir
 /// 8. Fallback → HTML shell for SPA routing (page routes)
-pub fn build_router(config: &ServerConfig) -> (Router, Arc<DevServerState>) {
-    let pipeline = CompilationPipeline::new(config.root_dir.clone(), config.src_dir.clone());
+pub fn build_router(
+    config: &ServerConfig,
+    plugin: Arc<dyn crate::plugin::FrameworkPlugin>,
+) -> (Router, Arc<DevServerState>) {
+    let pipeline = CompilationPipeline::new(
+        config.root_dir.clone(),
+        config.src_dir.clone(),
+        plugin.clone(),
+    );
 
     // Load theme CSS from the project (if available)
     let theme_css = theme_css::load_theme_css(&config.root_dir);
@@ -134,6 +141,7 @@ pub fn build_router(config: &ServerConfig) -> (Router, Arc<DevServerState>) {
     };
 
     let state = Arc::new(DevServerState {
+        plugin,
         pipeline,
         root_dir: config.root_dir.clone(),
         src_dir: config.src_dir.clone(),
@@ -621,6 +629,7 @@ async fn dev_server_handler(
             &[],
             state.theme_css.as_deref(),
             "Vertz App",
+            state.plugin.as_ref(),
         );
         return axum::response::Response::builder()
             .status(StatusCode::OK)
@@ -831,7 +840,15 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
 
     print_banner_with_upstream(&actual_config, start.elapsed(), &upstream_package_names);
 
-    let (router, state) = build_router(&config);
+    // Select plugin based on config (CLI flag > .vertzrc > auto-detect > default)
+    let plugin: Arc<dyn crate::plugin::FrameworkPlugin> = match config.plugin {
+        crate::config::PluginChoice::React => {
+            Arc::new(crate::plugin::react::ReactPlugin::default())
+        }
+        crate::config::PluginChoice::Vertz => Arc::new(crate::plugin::vertz::VertzPlugin),
+    };
+
+    let (router, state) = build_router(&config, plugin);
 
     // Start type checker (tsc/tsgo) if enabled.
     // Kept alive until server shutdown — Drop kills the child process.
@@ -877,7 +894,9 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
         &state.hmr_hub,
     );
 
-    let restart_triggers = RestartTriggers::default();
+    let restart_triggers = RestartTriggers {
+        config_files: state.plugin.restart_triggers(),
+    };
 
     // Start the file watcher if src_dir exists
     if config.src_dir.exists() {
@@ -1083,12 +1102,15 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
                                         &entry_file,
                                     );
 
-                                    crate::hmr::broadcast_update(
-                                        &watcher_state.hmr_hub,
-                                        &result,
-                                        &root_dir,
-                                    )
-                                    .await;
+                                    // Use plugin's HMR strategy to decide what action to take
+                                    let action = watcher_state.plugin.hmr_strategy(&result);
+                                    if !matches!(action, crate::plugin::HmrAction::Handled) {
+                                        let message = crate::plugin::hmr_action_to_message(
+                                            &action,
+                                            &root_dir,
+                                        );
+                                        watcher_state.hmr_hub.broadcast(message).await;
+                                    }
                                 }
                             }
                         }
@@ -1304,7 +1326,9 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         config.enable_ssr = false;
-        let (router, state) = build_router(&config);
+        let plugin: Arc<dyn crate::plugin::FrameworkPlugin> =
+            Arc::new(crate::plugin::vertz::VertzPlugin);
+        let (router, state) = build_router(&config, plugin);
         (router, state, tmp)
     }
 
@@ -1377,6 +1401,10 @@ mod tests {
 
     // ─── build_router ────────────────────────────────────────────────
 
+    fn test_plugin() -> Arc<dyn crate::plugin::FrameworkPlugin> {
+        Arc::new(crate::plugin::vertz::VertzPlugin)
+    }
+
     #[test]
     fn test_build_router_returns_router_and_state() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1386,7 +1414,7 @@ mod tests {
             PathBuf::from("public"),
             tmp.path().to_path_buf(),
         );
-        let (_router, state) = build_router(&config);
+        let (_router, state) = build_router(&config, test_plugin());
         assert_eq!(state.root_dir, tmp.path().to_path_buf());
     }
 
@@ -1400,7 +1428,7 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         config.enable_ssr = false;
-        let (_router, state) = build_router(&config);
+        let (_router, state) = build_router(&config, test_plugin());
         assert!(!state.enable_ssr);
     }
 
@@ -1413,7 +1441,7 @@ mod tests {
             PathBuf::from("public"),
             tmp.path().to_path_buf(),
         );
-        let (_router, state) = build_router(&config);
+        let (_router, state) = build_router(&config, test_plugin());
         assert_eq!(state.port, 4000);
         assert_eq!(state.root_dir, tmp.path().to_path_buf());
         assert_eq!(state.src_dir, tmp.path().join("src"));

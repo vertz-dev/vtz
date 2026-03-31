@@ -38,12 +38,17 @@ fn linear_clone_path() -> PathBuf {
         .join("linear-clone-app")
 }
 
+fn test_plugin() -> std::sync::Arc<dyn vertz_runtime::plugin::FrameworkPlugin> {
+    std::sync::Arc::new(vertz_runtime::plugin::vertz::VertzPlugin)
+}
+
 fn create_pipeline(
     root: &std::path::Path,
 ) -> vertz_runtime::compiler::pipeline::CompilationPipeline {
     vertz_runtime::compiler::pipeline::CompilationPipeline::new(
         root.to_path_buf(),
         root.join("src"),
+        test_plugin(),
     )
 }
 
@@ -55,12 +60,14 @@ fn create_pipeline(
 async fn test_html_shell_for_root_page() {
     let root = minimal_app_path();
 
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
         &root,
         &[],
         None,
         "Vertz App",
+        &plugin,
     );
 
     assert!(html.contains("<!DOCTYPE html>"), "Should have doctype");
@@ -107,12 +114,14 @@ fn test_html_shell_includes_preload_hints() {
         "/@deps/@vertz/ui".to_string(),
         "/src/components/Hello.tsx".to_string(),
     ];
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
         &root,
         &hints,
         None,
         "Vertz App",
+        &plugin,
     );
 
     assert!(html.contains(r#"<link rel="modulepreload" href="/@deps/@vertz/ui""#));
@@ -148,12 +157,14 @@ fn test_theme_css_injection_task_manager() {
     );
 
     // Verify it's included in the HTML shell
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
         &root,
         &[],
         Some(&css),
         "Task Manager",
+        &plugin,
     );
 
     assert!(
@@ -774,7 +785,7 @@ mod http_integration {
         // Disable SSR for client-only rendering tests
         config.enable_ssr = false;
 
-        let (router, _state) = vertz_runtime::server::http::build_router(&config);
+        let (router, _state) = vertz_runtime::server::http::build_router(&config, test_plugin());
 
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 

@@ -98,6 +98,10 @@ pub struct DevArgs {
     /// Disable upstream dependency watching (auto-discovery + extra paths)
     #[arg(long)]
     pub no_watch_deps: bool,
+
+    /// Framework plugin to use (vertz, react). Auto-detected from package.json if omitted.
+    #[arg(long)]
+    pub plugin: Option<String>,
 }
 
 #[derive(Parser, Debug)]

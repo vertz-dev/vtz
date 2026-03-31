@@ -5,6 +5,7 @@ pub mod deps;
 pub mod errors;
 pub mod hmr;
 pub mod native_handler;
+pub mod plugin;
 pub mod pm;
 pub mod runtime;
 pub mod server;

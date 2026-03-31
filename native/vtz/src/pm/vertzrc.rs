@@ -21,6 +21,11 @@ pub struct VertzConfig {
     #[serde(rename = "extraWatchPaths", default)]
     pub extra_watch_paths: Vec<String>,
 
+    /// Framework plugin to use (e.g., "vertz", "react").
+    /// When set, overrides auto-detection from package.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+
     /// Preserve unknown fields for forward compatibility.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -36,6 +41,7 @@ impl Default for VertzConfig {
             trust_scripts: Vec::new(),
             auto_install: true,
             extra_watch_paths: Vec::new(),
+            plugin: None,
             extra: serde_json::Map::new(),
         }
     }

@@ -117,12 +117,22 @@
   // ── Fast Refresh Integration ───────────────────────────────────
 
   function performFastRefresh(moduleId) {
+    // Vertz-native Fast Refresh (Vertz framework)
     var fr = globalThis[Symbol.for('vertz:fast-refresh')];
     if (fr && typeof fr.__$refreshPerform === 'function') {
       try {
         fr.__$refreshPerform(moduleId);
       } catch (err) {
         console.error('[vertz-hmr] Fast Refresh failed for', moduleId, err);
+      }
+      return;
+    }
+    // React Refresh fallback (React framework plugin)
+    if (typeof globalThis.__vtz_react_refresh_perform === 'function') {
+      try {
+        globalThis.__vtz_react_refresh_perform();
+      } catch (err) {
+        console.error('[vertz-hmr] React Refresh failed:', err);
       }
     }
   }

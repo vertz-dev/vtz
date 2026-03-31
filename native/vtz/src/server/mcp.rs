@@ -799,6 +799,10 @@ mod tests {
     use crate::watcher;
     use std::time::Instant;
 
+    fn test_plugin() -> std::sync::Arc<dyn crate::plugin::FrameworkPlugin> {
+        std::sync::Arc::new(crate::plugin::vertz::VertzPlugin)
+    }
+
     fn create_test_state() -> Arc<DevServerState> {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -806,7 +810,8 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
 
         Arc::new(DevServerState {
-            pipeline: CompilationPipeline::new(root.clone(), src.clone()),
+            plugin: test_plugin(),
+            pipeline: CompilationPipeline::new(root.clone(), src.clone(), test_plugin()),
             root_dir: root.clone(),
             src_dir: src,
             entry_file: root.join("src/main.tsx"),

@@ -10,6 +10,10 @@
 /// - Source map resolution
 use std::path::PathBuf;
 
+fn test_plugin() -> std::sync::Arc<dyn vertz_runtime::plugin::FrameworkPlugin> {
+    std::sync::Arc::new(vertz_runtime::plugin::vertz::VertzPlugin)
+}
+
 fn minimal_app_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -287,6 +291,7 @@ async fn test_diagnostics_includes_active_errors() {
 #[test]
 fn test_html_shell_includes_error_overlay_script() {
     let root = minimal_app_path();
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
 
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
@@ -294,6 +299,7 @@ fn test_html_shell_includes_error_overlay_script() {
         &[],
         None,
         "Vertz App",
+        &plugin,
     );
 
     assert!(
@@ -309,6 +315,7 @@ fn test_html_shell_includes_error_overlay_script() {
 #[test]
 fn test_html_shell_without_hmr_excludes_error_overlay() {
     let root = minimal_app_path();
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
 
     let html = vertz_runtime::server::html_shell::generate_html_shell_with_hmr(
         &root.join("src/app.tsx"),
@@ -317,6 +324,7 @@ fn test_html_shell_without_hmr_excludes_error_overlay() {
         None,
         "Vertz App",
         false,
+        &plugin,
     );
 
     assert!(
@@ -328,6 +336,7 @@ fn test_html_shell_without_hmr_excludes_error_overlay() {
 #[test]
 fn test_html_shell_error_overlay_before_app_module() {
     let root = minimal_app_path();
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
 
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
@@ -335,6 +344,7 @@ fn test_html_shell_error_overlay_before_app_module() {
         &[],
         None,
         "Vertz App",
+        &plugin,
     );
 
     let overlay_pos = html.find("__vertz_errors").unwrap();
@@ -461,7 +471,7 @@ mod http_integration {
             root,
         );
 
-        let (router, _state) = vertz_runtime::server::http::build_router(&config);
+        let (router, _state) = vertz_runtime::server::http::build_router(&config, test_plugin());
 
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
