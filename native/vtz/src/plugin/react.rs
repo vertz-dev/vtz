@@ -12,7 +12,7 @@ pub struct ReactPlugin {
 }
 
 /// Which JSX runtime to use for React compilation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsxRuntime {
     /// `import { jsx } from 'react/jsx-runtime'` (React 17+, default)
     Automatic,
@@ -37,17 +37,9 @@ impl FrameworkPlugin for ReactPlugin {
         compile_react(source, ctx, self.jsx_runtime)
     }
 
-    fn resolve_import(&self, specifier: &str) -> Option<String> {
-        // React core packages are bare specifiers — resolved via /@deps/
-        match specifier {
-            "react"
-            | "react-dom"
-            | "react-dom/client"
-            | "react/jsx-runtime"
-            | "react/jsx-dev-runtime" => None, // default /@deps/ resolution
-            _ => None,
-        }
-    }
+    // resolve_import: uses default (None → /@deps/ resolution).
+    // React packages (react, react-dom, react/jsx-runtime) are all bare
+    // specifiers resolved via the default /@deps/ route.
 
     fn hmr_client_scripts(&self) -> Vec<ClientScript> {
         // Phase 2: no HMR scripts yet (added in Phase 3)
@@ -118,10 +110,12 @@ fn compile_react(source: &str, ctx: &CompileContext, jsx_runtime: JsxRuntime) ->
     }
 
     if parser_ret.panicked {
+        let escaped_path =
+            serde_json::to_string(&ctx.file_path.display().to_string()).unwrap_or_default();
         return CompileOutput {
             code: format!(
-                "console.error(`[react] Parse error in {}`);",
-                ctx.file_path.display()
+                "console.error(\"[react] Parse error in \" + {});",
+                escaped_path
             ),
             css: None,
             source_map: None,
@@ -133,6 +127,16 @@ fn compile_react(source: &str, ctx: &CompileContext, jsx_runtime: JsxRuntime) ->
 
     // 2. Build semantic (needed for transformer scoping)
     let semantic_ret = SemanticBuilder::new().build(&program);
+
+    for error in &semantic_ret.errors {
+        diagnostics.push(CompileDiagnostic {
+            message: error.to_string(),
+            line: None,
+            column: None,
+            is_warning: true,
+        });
+    }
+
     let scoping = semantic_ret.semantic.into_scoping();
 
     // 3. Configure React JSX transform
@@ -407,6 +411,74 @@ mod tests {
         };
         let output = plugin.compile("export function { broken syntax }", &ctx);
         assert!(!output.diagnostics.is_empty(), "Should have parse errors");
+    }
+
+    #[test]
+    fn test_compile_tsx_spread_attributes() {
+        let plugin = make_plugin();
+        let (fp, root, src) = make_ctx("/project/src/Spread.tsx");
+        let ctx = CompileContext {
+            file_path: fp,
+            root_dir: root,
+            src_dir: src,
+            target: "dom",
+        };
+        let output = plugin.compile(
+            "export function Spread(props: any) { return <div {...props} />; }",
+            &ctx,
+        );
+        let errors: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|d| !d.is_warning)
+            .collect();
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert!(
+            output.code.contains("jsx(") || output.code.contains("jsxs("),
+            "Expected jsx() call, got: {}",
+            output.code
+        );
+    }
+
+    #[test]
+    fn test_compile_tsx_nested_jsx() {
+        let plugin = make_plugin();
+        let (fp, root, src) = make_ctx("/project/src/Nested.tsx");
+        let ctx = CompileContext {
+            file_path: fp,
+            root_dir: root,
+            src_dir: src,
+            target: "dom",
+        };
+        let source = r#"
+            export function Layout() {
+                return (
+                    <div>
+                        <header><h1>Title</h1></header>
+                        <main><p>Body</p></main>
+                    </div>
+                );
+            }
+        "#;
+        let output = plugin.compile(source, &ctx);
+        let errors: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|d| !d.is_warning)
+            .collect();
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        // Multi-child should use jsxs
+        assert!(
+            output.code.contains("jsxs("),
+            "Expected jsxs() for multi-child, got: {}",
+            output.code
+        );
+        // Nested elements should also have jsx calls
+        assert!(
+            output.code.contains("jsx("),
+            "Expected nested jsx() calls, got: {}",
+            output.code
+        );
     }
 
     #[test]
