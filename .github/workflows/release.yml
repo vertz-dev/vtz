@@ -26,7 +26,11 @@ jobs:
             os: ubuntu-24.04
             pkg: runtime-linux-x64
             expected_arch: x86_64
-          # linux-arm64 deferred (no ARM runners on free plan)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            pkg: runtime-linux-arm64
+            expected_arch: aarch64
+          # linux-arm64 now available (ubuntu-24.04-arm, free for public repos)
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -117,6 +121,13 @@ jobs:
         with:
           name: runtime-linux-x64
           path: npm/runtime-linux-x64/
+        continue-on-error: true
+
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-linux-arm64
+          path: npm/runtime-linux-arm64/
         continue-on-error: true
 
       - name: Make binaries executable
