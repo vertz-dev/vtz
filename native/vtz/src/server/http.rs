@@ -17,6 +17,7 @@ use crate::server::mcp::{self, McpSessions};
 use crate::server::mcp_events::{self, McpEventHub};
 use crate::server::module_server::{self, DevServerState};
 use crate::server::theme_css;
+use crate::tsconfig;
 use crate::typecheck::process;
 use crate::watcher;
 use crate::watcher::dep_watcher::{DepWatcher, DepWatcherConfig};
@@ -95,11 +96,26 @@ pub fn build_router(
     config: &ServerConfig,
     plugin: Arc<dyn crate::plugin::FrameworkPlugin>,
 ) -> (Router, Arc<DevServerState>) {
+    // Parse tsconfig.json path aliases for import resolution
+    let tsconfig_path = config
+        .tsconfig_path
+        .clone()
+        .unwrap_or_else(|| config.root_dir.join("tsconfig.json"));
+    let tsconfig_paths = tsconfig::parse_tsconfig_paths(&tsconfig_path);
+    if !tsconfig_paths.is_empty() {
+        eprintln!(
+            "[config] Loaded {} path alias(es) from {}",
+            tsconfig_paths.paths.len(),
+            tsconfig_path.display()
+        );
+    }
+
     let pipeline = CompilationPipeline::new(
         config.root_dir.clone(),
         config.src_dir.clone(),
         plugin.clone(),
-    );
+    )
+    .with_tsconfig_paths(tsconfig_paths);
 
     // Load theme CSS from the project (if available)
     let theme_css = theme_css::load_theme_css(&config.root_dir);

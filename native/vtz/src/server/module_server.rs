@@ -667,8 +667,9 @@ fn serve_js_file(path: &Path, root_dir: &Path) -> Response<Body> {
             // node_modules layout where transitive deps live next to the package.
             let real_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             // Rewrite bare specifiers in the file (e.g., `@vertz/errors` → `/@deps/@vertz/errors/dist/index.js`)
+            // No tsconfig path aliases for node_modules files
             let rewritten = crate::compiler::import_rewriter::rewrite_imports(
-                &content, &real_path, &real_path, root_dir,
+                &content, &real_path, &real_path, root_dir, None,
             );
             Response::builder()
                 .status(StatusCode::OK)

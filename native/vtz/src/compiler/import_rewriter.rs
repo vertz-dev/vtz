@@ -1,15 +1,23 @@
 use std::path::{Path, PathBuf};
 
 use crate::deps::resolve;
+use crate::tsconfig::TsconfigPaths;
 
 /// Rewrite import specifiers in compiled JavaScript for browser consumption.
 ///
 /// Transforms:
 /// - Bare specifiers (`@vertz/ui`, `zod`) → `/@deps/@vertz/ui`, `/@deps/zod`
+/// - Path aliases (`@/components/Button`) → resolved file path via tsconfig paths
 /// - Relative specifiers (`./Foo`, `../utils/format`) → absolute paths with extensions
 /// - Already-absolute URLs (`http://`, `https://`) → unchanged
 /// - Already-rewritten paths (`/@deps/`, `/@css/`) → unchanged
-pub fn rewrite_imports(code: &str, file_path: &Path, src_dir: &Path, root_dir: &Path) -> String {
+pub fn rewrite_imports(
+    code: &str,
+    file_path: &Path,
+    src_dir: &Path,
+    root_dir: &Path,
+    tsconfig_paths: Option<&TsconfigPaths>,
+) -> String {
     let mut result = String::with_capacity(code.len() + 256);
     let chars: Vec<char> = code.chars().collect();
     let len = chars.len();
@@ -36,6 +44,7 @@ pub fn rewrite_imports(code: &str, file_path: &Path, src_dir: &Path, root_dir: &
                     file_path,
                     src_dir,
                     root_dir,
+                    tsconfig_paths,
                     &mut result,
                 );
                 continue;
@@ -52,6 +61,7 @@ pub fn rewrite_imports(code: &str, file_path: &Path, src_dir: &Path, root_dir: &
                     file_path,
                     src_dir,
                     root_dir,
+                    tsconfig_paths,
                     &mut result,
                 );
                 continue;
@@ -70,6 +80,7 @@ pub fn rewrite_imports(code: &str, file_path: &Path, src_dir: &Path, root_dir: &
                         file_path,
                         src_dir,
                         root_dir,
+                        tsconfig_paths,
                         &mut result,
                     );
                     continue;
@@ -98,6 +109,7 @@ pub fn rewrite_imports(code: &str, file_path: &Path, src_dir: &Path, root_dir: &
                         file_path,
                         src_dir,
                         root_dir,
+                        tsconfig_paths,
                         &mut result,
                     );
                     continue;
@@ -212,6 +224,9 @@ fn find_from_keyword(chars: &[char], start: usize, len: usize) -> Option<usize> 
 /// Rewrite a string-quoted specifier at position `pos`.
 /// `pos` points to the opening quote character.
 /// Returns the new position after the closing quote.
+// All parameters are needed: chars+pos+len for parsing, file_path+src_dir+root_dir+tsconfig_paths
+// for resolution, result for output.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_string_specifier(
     chars: &[char],
     pos: usize,
@@ -219,6 +234,7 @@ fn rewrite_string_specifier(
     file_path: &Path,
     src_dir: &Path,
     root_dir: &Path,
+    tsconfig_paths: Option<&TsconfigPaths>,
     result: &mut String,
 ) -> usize {
     if pos >= len {
@@ -241,7 +257,7 @@ fn rewrite_string_specifier(
     }
 
     let specifier: String = chars[pos + 1..end].iter().collect();
-    let rewritten = rewrite_specifier(&specifier, file_path, src_dir, root_dir);
+    let rewritten = rewrite_specifier(&specifier, file_path, src_dir, root_dir, tsconfig_paths);
 
     result.push(quote);
     result.push_str(&rewritten);
@@ -258,6 +274,7 @@ pub fn rewrite_specifier(
     file_path: &Path,
     src_dir: &Path,
     root_dir: &Path,
+    tsconfig_paths: Option<&TsconfigPaths>,
 ) -> String {
     // Already-absolute URLs — don't touch
     if specifier.starts_with("http://")
@@ -276,6 +293,19 @@ pub fn rewrite_specifier(
     // Relative specifiers: ./foo, ../bar
     if specifier.starts_with("./") || specifier.starts_with("../") {
         return resolve_relative_specifier(specifier, file_path, src_dir, root_dir);
+    }
+
+    // Path aliases: resolve via tsconfig.json compilerOptions.paths
+    // This must happen before bare specifier handling so that aliases like
+    // `@/components/Button` don't get routed to `/@deps/@/components/Button`.
+    if let Some(paths) = tsconfig_paths {
+        if let Some(resolved) = paths.resolve_alias(specifier, root_dir) {
+            // Convert resolved absolute path to a URL path relative to root_dir
+            if let Ok(rel) = resolved.strip_prefix(root_dir) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                return format!("/{}", rel_str);
+            }
+        }
     }
 
     // Bare specifiers: resolve via package.json exports to get full file path,
@@ -382,6 +412,7 @@ mod tests {
             Path::new("/project/src/app.tsx"),
             Path::new("/project/src"),
             Path::new("/project"),
+            None,
         );
         assert_eq!(result, "/@deps/@vertz/ui");
     }
@@ -393,6 +424,7 @@ mod tests {
             Path::new("/project/src/app.tsx"),
             Path::new("/project/src"),
             Path::new("/project"),
+            None,
         );
         assert_eq!(result, "/@deps/zod");
     }
@@ -404,6 +436,7 @@ mod tests {
             Path::new("/project/src/app.tsx"),
             Path::new("/project/src"),
             Path::new("/project"),
+            None,
         );
         assert_eq!(result, "/@deps/@vertz/ui/components");
     }
@@ -415,6 +448,7 @@ mod tests {
             Path::new("/project/src/app.tsx"),
             Path::new("/project/src"),
             Path::new("/project"),
+            None,
         );
         assert_eq!(result, "https://cdn.example.com/lib.js");
     }
@@ -426,6 +460,7 @@ mod tests {
             Path::new("/project/src/app.tsx"),
             Path::new("/project/src"),
             Path::new("/project"),
+            None,
         );
         assert_eq!(result, "/@deps/@vertz/ui");
     }
@@ -437,6 +472,7 @@ mod tests {
             Path::new("/project/src/app.tsx"),
             Path::new("/project/src"),
             Path::new("/project"),
+            None,
         );
         assert_eq!(result, "/@css/button.css");
     }
@@ -453,6 +489,7 @@ mod tests {
             &src_dir.join("app.tsx"),
             &src_dir,
             tmp.path(),
+            None,
         );
         assert_eq!(result, "/src/components/Button.tsx");
     }
@@ -470,6 +507,7 @@ mod tests {
             &src_dir.join("components/Button.tsx"),
             &src_dir,
             tmp.path(),
+            None,
         );
         assert_eq!(result, "/src/utils/format.ts");
     }
@@ -484,7 +522,7 @@ mod tests {
 import { z } from 'zod';
 const x = 1;"#;
 
-        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
 
         assert!(
             result.contains("from '/@deps/@vertz/ui'"),
@@ -502,7 +540,7 @@ const x = 1;"#;
 
         let code = r#"const mod = import('@vertz/ui');"#;
 
-        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
 
         assert!(
             result.contains("import('/@deps/@vertz/ui')"),
@@ -519,7 +557,7 @@ const x = 1;"#;
 
         let code = r#"export { signal } from '@vertz/ui';"#;
 
-        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
 
         assert!(
             result.contains("from '/@deps/@vertz/ui'"),
@@ -536,7 +574,7 @@ const x = 1;"#;
 
         let code = r#"import '@vertz/ui/styles';"#;
 
-        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
 
         assert!(
             result.contains("import '/@deps/@vertz/ui/styles'"),
@@ -555,7 +593,7 @@ const x = 1;"#;
 function foo() { return x + 2; }
 export default foo;"#;
 
-        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
 
         assert_eq!(result, code);
     }
@@ -578,6 +616,7 @@ export default foo;"#;
             &src_dir.join("app.tsx"),
             &src_dir,
             tmp.path(),
+            None,
         );
         assert_eq!(result, "/src/styles.css");
     }
@@ -593,7 +632,7 @@ export default foo;"#;
 import { signal } from '@vertz/ui';
 const x = 1;"#;
 
-        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
 
         assert!(
             result.contains("import '/src/App.css'"),
@@ -611,5 +650,101 @@ const x = 1;"#;
     fn test_normalize_path_with_dot() {
         let p = normalize_path(Path::new("/project/src/./utils/format"));
         assert_eq!(p, PathBuf::from("/project/src/utils/format"));
+    }
+
+    // ── Path alias tests ──
+
+    #[test]
+    fn test_rewrite_path_alias_to_resolved_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(src_dir.join("components")).unwrap();
+        std::fs::write(src_dir.join("components/Button.tsx"), "").unwrap();
+
+        let paths = TsconfigPaths {
+            base_url: None,
+            paths: vec![("@/*".to_string(), vec!["./src/*".to_string()])],
+        };
+
+        let result = rewrite_specifier(
+            "@/components/Button",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            root,
+            Some(&paths),
+        );
+        assert_eq!(result, "/src/components/Button.tsx");
+    }
+
+    #[test]
+    fn test_rewrite_alias_falls_through_to_bare_specifier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let paths = TsconfigPaths {
+            base_url: None,
+            paths: vec![("@/*".to_string(), vec!["./src/*".to_string()])],
+        };
+
+        // "react" doesn't match @/* so it falls through to bare specifier handling
+        let result = rewrite_specifier(
+            "react",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            root,
+            Some(&paths),
+        );
+        assert_eq!(result, "/@deps/react");
+    }
+
+    #[test]
+    fn test_rewrite_imports_with_path_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(src_dir.join("components")).unwrap();
+        std::fs::write(src_dir.join("components/Button.tsx"), "").unwrap();
+
+        let paths = TsconfigPaths {
+            base_url: None,
+            paths: vec![("@/*".to_string(), vec!["./src/*".to_string()])],
+        };
+
+        let code = "import Button from '@/components/Button';";
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, root, Some(&paths));
+
+        assert!(
+            result.contains("from '/src/components/Button.tsx'"),
+            "Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_alias_unresolved_file_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let paths = TsconfigPaths {
+            base_url: None,
+            paths: vec![("@/*".to_string(), vec!["./src/*".to_string()])],
+        };
+
+        // @/nonexistent matches the alias pattern, but no file exists.
+        // Falls through to bare specifier handling.
+        let result = rewrite_specifier(
+            "@/nonexistent",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            root,
+            Some(&paths),
+        );
+        // When alias matches but file not found, falls through to /@deps/
+        assert_eq!(result, "/@deps/@/nonexistent");
     }
 }
