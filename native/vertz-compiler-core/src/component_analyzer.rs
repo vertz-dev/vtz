@@ -459,4 +459,44 @@ mod tests {
         assert_eq!(result[0].name, "App");
         assert_eq!(result[1].name, "Header");
     }
+
+    // ── Export default non-function not detected ──────────────────────
+
+    #[test]
+    fn export_default_class_not_detected() {
+        let result = analyze("export default class App { render() { return <div/>; } }");
+        assert!(result.is_empty());
+    }
+
+    // ── Export named function with no jsx ──────────────────────────────
+
+    #[test]
+    fn export_named_function_no_jsx_not_detected() {
+        let result = analyze("export function helper() { return 42; }");
+        assert!(result.is_empty());
+    }
+
+    // ── Variable declaration without init ──────────────────────────────
+
+    #[test]
+    fn var_decl_without_init_not_detected() {
+        let result = analyze("let App;");
+        assert!(result.is_empty());
+    }
+
+    // ── Export named with non-variable non-function declaration ────────
+
+    #[test]
+    fn export_named_enum_not_detected() {
+        let result = analyze("export enum Direction { Up, Down }");
+        assert!(result.is_empty());
+    }
+
+    // ── Empty program ─────────────────────────────────────────────────
+
+    #[test]
+    fn empty_program_no_components() {
+        let result = analyze("");
+        assert!(result.is_empty());
+    }
 }

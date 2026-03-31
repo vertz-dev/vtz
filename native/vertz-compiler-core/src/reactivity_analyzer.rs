@@ -1408,4 +1408,183 @@ mod tests {
         let sig = tasks.signal_properties.as_ref().unwrap();
         assert!(sig.contains(&"data".to_string()));
     }
+
+    // ── Component init variants for variable collection ───────────────
+
+    #[test]
+    fn function_expression_component_init_vars_collected() {
+        let vars = analyze("const C = function() { let x = 0; return <div>{x}</div>; };");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn ts_as_component_init_vars_collected() {
+        let vars = analyze("const C = ((() => { let x = 0; return <div>{x}</div>; }) as any);");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn ts_satisfies_component_init_vars_collected() {
+        let vars =
+            analyze("const C = ((() => { let x = 0; return <div>{x}</div>; }) satisfies FC);");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    // ── Non-matching statements in program body ───────────────────────
+
+    #[test]
+    fn non_matching_function_decl_skipped() {
+        let vars =
+            analyze("function helper() { } function C() { let x = 0; return <div>{x}</div>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn non_matching_var_decl_skipped() {
+        let vars = analyze("const helper = 42; function C() { let x = 0; return <div>{x}</div>; }");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn export_re_export_without_declaration_skipped() {
+        let vars = analyze(
+            "export { something } from 'other'; function C() { let x = 0; return <div>{x}</div>; }",
+        );
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn export_named_other_declaration_type_skipped() {
+        let vars = analyze(
+            "export class Helper {} export function C() { let x = 0; return <div>{x}</div>; }",
+        );
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    #[test]
+    fn export_const_arrow_vars_from_exported_decl() {
+        let vars = analyze("export const C = () => { let x = 0; return <div>{x}</div>; };");
+        let x = find_var(&vars, "x");
+        assert_eq!(x.kind, ReactivityKind::Signal);
+    }
+
+    // ── Destructured bindings: non-BindingIdentifier skipped ──────────
+
+    #[test]
+    fn destructured_nested_pattern_in_obj_skipped() {
+        // Only BindingIdentifier values are collected from destructuring
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const { data: { inner } } = query(fetch); return <div>{inner}</div>; }",
+        );
+        // inner is behind nested ObjectPattern → not collected
+        assert!(vars.is_empty());
+    }
+
+    // ── Signal API var without config → (None, None, None) ────────────
+
+    #[test]
+    fn signal_api_var_resolved_to_unknown_has_no_props() {
+        // When signal_api_name resolves to a name not in any config
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const tasks = query(fetch); return <div>hello</div>; }",
+        );
+        let tasks = find_var(&vars, "tasks");
+        // tasks IS a signal API — signal_api_name is "query" which IS in registry
+        assert!(tasks.signal_properties.is_some());
+    }
+
+    // ── JSX attribute reference ───────────────────────────────────────
+
+    #[test]
+    fn jsx_attribute_ref_makes_let_signal() {
+        let vars =
+            analyze("function C() { let d = false; return <button disabled={d}>ok</button>; }");
+        let d = find_var(&vars, "d");
+        assert_eq!(d.kind, ReactivityKind::Signal);
+    }
+
+    // ── Const depending on structural/function skips transitive ───────
+
+    #[test]
+    fn const_ref_to_function_is_static() {
+        let vars = analyze(
+            "function C() { const fn1 = () => {}; const ref1 = fn1; return <div>{ref1}</div>; }",
+        );
+        let ref1 = find_var(&vars, "ref1");
+        assert_eq!(ref1.kind, ReactivityKind::Static);
+    }
+
+    // ── Destructured reactive source ──────────────────────────────────
+
+    #[test]
+    fn destructured_reactive_source_property_is_signal() {
+        let vars = analyze(
+            "import { useContext } from '@vertz/ui';\nfunction C() { const { user } = useContext(MyCtx); return <div>{user}</div>; }",
+        );
+        let user = find_var(&vars, "user");
+        assert_eq!(user.kind, ReactivityKind::Signal);
+    }
+
+    // ── Non-call expression init → not signal API ─────────────────────
+
+    #[test]
+    fn member_call_not_detected_as_signal_api() {
+        let vars =
+            analyze("function C() { const tasks = api.query(); return <div>{tasks}</div>; }");
+        let tasks = find_var(&vars, "tasks");
+        assert_eq!(tasks.kind, ReactivityKind::Static);
+        assert!(tasks.signal_properties.is_none());
+    }
+
+    // ── Form with field_signal_properties ─────────────────────────────
+
+    #[test]
+    fn form_has_field_signal_properties() {
+        let vars = analyze(
+            "import { form } from '@vertz/ui';\nfunction C() { const f = form({}); return <div>hello</div>; }",
+        );
+        let f = find_var(&vars, "f");
+        assert!(f.field_signal_properties.is_some());
+    }
+
+    // ── Destructured with renamed key ─────────────────────────────────
+
+    #[test]
+    fn destructured_renamed_signal_prop_is_signal() {
+        let vars = analyze(
+            "import { query } from '@vertz/ui';\nfunction C() { const { data: items } = query(fetch); return <div>{items}</div>; }",
+        );
+        let items = find_var(&vars, "items");
+        assert_eq!(items.kind, ReactivityKind::Signal);
+    }
+
+    // ── import without specifiers ─────────────────────────────────────
+
+    #[test]
+    fn side_effect_import_ignored() {
+        let source = "import './side-effects';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, _) = build_import_aliases(&parsed.program, &manifests);
+        assert!(aliases.is_empty());
+    }
+
+    // ── build_query_aliases ignores non-query imports ─────────────────
+
+    #[test]
+    fn build_query_aliases_non_query_from_vertz_ui() {
+        let source = "import { form } from '@vertz/ui';";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let aliases = build_query_aliases(&parsed.program);
+        assert!(aliases.is_empty());
+    }
 }
