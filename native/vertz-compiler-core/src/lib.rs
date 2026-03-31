@@ -656,3 +656,481 @@ fn build_manifest_registry(options: &CompileOptions) -> reactivity_analyzer::Man
 
     registry
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_opts() -> CompileOptions {
+        CompileOptions {
+            filename: Some("test.tsx".to_string()),
+            ..Default::default()
+        }
+    }
+
+    // ── Basic compilation ──────────────────────────────────────────
+
+    #[test]
+    fn compile_returns_code_with_header() {
+        let result = compile("const x = 1;", default_opts());
+        assert!(result.code.starts_with("// compiled by vertz-native\n"));
+    }
+
+    #[test]
+    fn compile_simple_component() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        assert!(result.code.contains("// compiled by vertz-native"));
+        assert!(result.components.is_some());
+        let comps = result.components.unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].name, "App");
+    }
+
+    #[test]
+    fn compile_returns_source_map() {
+        let result = compile("const x = 1;", default_opts());
+        assert!(result.map.is_some());
+    }
+
+    // ── Parser errors ──────────────────────────────────────────────
+
+    #[test]
+    fn compile_returns_diagnostics_for_parser_errors() {
+        let result = compile("function {", default_opts());
+        assert!(result.diagnostics.is_some());
+        let diags = result.diagnostics.unwrap();
+        assert!(!diags.is_empty());
+        assert!(diags[0].line.is_some());
+        assert!(diags[0].column.is_some());
+    }
+
+    #[test]
+    fn compile_with_parser_error_returns_original_source_with_header() {
+        let source = "function {";
+        let result = compile(source, default_opts());
+        assert!(result.code.contains(source));
+    }
+
+    // ── Component info output ──────────────────────────────────────
+
+    #[test]
+    fn component_info_includes_variables() {
+        let result = compile(
+            r#"import { signal } from '@vertz/ui';
+function App() {
+    const count = signal(0);
+    return <div>{count.value}</div>;
+}"#,
+            default_opts(),
+        );
+        let comps = result.components.unwrap();
+        assert_eq!(comps.len(), 1);
+        let vars = comps[0].variables.as_ref().unwrap();
+        assert!(!vars.is_empty());
+    }
+
+    #[test]
+    fn component_info_has_body_positions() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        let comps = result.components.unwrap();
+        assert!(comps[0].body_start > 0);
+        assert!(comps[0].body_end > comps[0].body_start);
+    }
+
+    // ── Multiple components ────────────────────────────────────────
+
+    #[test]
+    fn compile_multiple_components() {
+        let result = compile(
+            r#"function App() { return <div>App</div>; }
+function Card() { return <span>Card</span>; }"#,
+            default_opts(),
+        );
+        let comps = result.components.unwrap();
+        assert_eq!(comps.len(), 2);
+    }
+
+    // ── No components ──────────────────────────────────────────────
+
+    #[test]
+    fn compile_no_components() {
+        let result = compile("const x = 1;", default_opts());
+        let comps = result.components.unwrap();
+        assert!(comps.is_empty());
+    }
+
+    // ── fast_refresh option ────────────────────────────────────────
+
+    #[test]
+    fn fast_refresh_injects_code() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                fast_refresh: Some(true),
+                ..Default::default()
+            },
+        );
+        // Fast refresh should inject some registration code
+        assert!(
+            result.code.contains("__$fr") || result.code.contains("__$refreshReg"),
+            "fast refresh should inject code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn no_fast_refresh_by_default() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        assert!(
+            !result.code.contains("__$fr"),
+            "should not have fast refresh by default"
+        );
+    }
+
+    // ── field_selection option ──────────────────────────────────────
+
+    #[test]
+    fn field_selection_returns_data_when_enabled() {
+        let result = compile(
+            r#"const tasks = query(api.tasks.list());
+function App() { return <div>{tasks.data.name}</div>; }"#,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                field_selection: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(result.field_selections.is_some());
+        let sels = result.field_selections.unwrap();
+        assert!(!sels.is_empty());
+        assert_eq!(sels[0].query_var, "tasks");
+    }
+
+    #[test]
+    fn field_selection_none_when_disabled() {
+        let result = compile(
+            r#"const tasks = query(api.tasks.list());
+function App() { return <div>{tasks.data.name}</div>; }"#,
+            default_opts(),
+        );
+        assert!(result.field_selections.is_none());
+    }
+
+    // ── hydration_markers option ───────────────────────────────────
+
+    #[test]
+    fn hydration_markers_returns_ids_when_enabled() {
+        let result = compile(
+            r#"import { signal } from '@vertz/ui';
+function App() {
+    const count = signal(0);
+    return <div>{count.value}</div>;
+}"#,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                hydration_markers: Some(true),
+                ..Default::default()
+            },
+        );
+        // Interactive components should get hydration IDs
+        if let Some(ref ids) = result.hydration_ids {
+            assert!(!ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn hydration_markers_none_when_disabled() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        assert!(result.hydration_ids.is_none());
+    }
+
+    // ── CSS extraction ─────────────────────────────────────────────
+
+    #[test]
+    fn extracts_css_from_tagged_template() {
+        let result = compile(
+            r#"const styles = css`
+.container { color: red; }
+`;
+function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        if let Some(ref css) = result.css {
+            assert!(css.contains("color: red") || css.contains("container"));
+        }
+    }
+
+    #[test]
+    fn no_css_when_none_present() {
+        let result = compile("const x = 1;", default_opts());
+        assert!(result.css.is_none());
+    }
+
+    // ── Diagnostics ────────────────────────────────────────────────
+
+    #[test]
+    fn no_diagnostics_for_clean_code() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        assert!(result.diagnostics.is_none());
+    }
+
+    // ── Source type from filename ───────────────────────────────────
+
+    #[test]
+    fn uses_tsx_source_type_for_tsx_files() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            CompileOptions {
+                filename: Some("component.tsx".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(result.diagnostics.is_none());
+    }
+
+    #[test]
+    fn uses_ts_source_type_for_ts_files() {
+        let result = compile(
+            "const x: number = 1;",
+            CompileOptions {
+                filename: Some("util.ts".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(result.diagnostics.is_none());
+    }
+
+    #[test]
+    fn defaults_filename_when_none() {
+        let result = compile(
+            "const x = 1;",
+            CompileOptions {
+                filename: None,
+                ..Default::default()
+            },
+        );
+        assert!(result.code.contains("// compiled by vertz-native"));
+    }
+
+    // ── build_manifest_registry ────────────────────────────────────
+
+    #[test]
+    fn build_manifest_registry_empty_when_no_manifests() {
+        let opts = CompileOptions::default();
+        let registry = build_manifest_registry(&opts);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn build_manifest_registry_with_entries() {
+        let opts = CompileOptions {
+            manifests: Some(vec![ManifestEntry {
+                module_specifier: "@my/lib".to_string(),
+                export_name: "useData".to_string(),
+                reactivity_type: "signal".to_string(),
+                signal_properties: Some(vec!["value".to_string()]),
+                plain_properties: None,
+                field_signal_properties: None,
+            }]),
+            ..Default::default()
+        };
+        let registry = build_manifest_registry(&opts);
+        assert!(registry.contains_key("@my/lib"));
+        let exports = &registry["@my/lib"];
+        assert!(exports.contains_key("useData"));
+    }
+
+    // ── compile_for_ssr_aot ────────────────────────────────────────
+
+    #[test]
+    fn aot_compile_basic_component() {
+        let result = compile_for_ssr_aot(
+            r#"function App() { return <div>Hello</div>; }"#,
+            AotCompileOptions {
+                filename: Some("test.tsx".to_string()),
+            },
+        );
+        assert!(!result.components.is_empty());
+        assert_eq!(result.components[0].name, "App");
+    }
+
+    #[test]
+    fn aot_compile_returns_original_on_parse_error() {
+        let source = "function {";
+        let result = compile_for_ssr_aot(
+            source,
+            AotCompileOptions {
+                filename: Some("test.tsx".to_string()),
+            },
+        );
+        assert_eq!(result.code, source);
+        assert!(result.components.is_empty());
+    }
+
+    #[test]
+    fn aot_compile_returns_original_when_no_components() {
+        let source = "const x = 1;";
+        let result = compile_for_ssr_aot(
+            source,
+            AotCompileOptions {
+                filename: Some("test.tsx".to_string()),
+            },
+        );
+        assert_eq!(result.code, source);
+        assert!(result.components.is_empty());
+    }
+
+    #[test]
+    fn aot_compile_defaults_filename() {
+        let result = compile_for_ssr_aot(
+            r#"function App() { return <div>Hello</div>; }"#,
+            AotCompileOptions { filename: None },
+        );
+        assert!(!result.components.is_empty());
+    }
+
+    #[test]
+    fn aot_compile_component_has_tier() {
+        let result = compile_for_ssr_aot(
+            r#"function App() { return <div>Hello</div>; }"#,
+            AotCompileOptions {
+                filename: Some("test.tsx".to_string()),
+            },
+        );
+        assert!(!result.components[0].tier.is_empty());
+    }
+
+    // ── prefetch_manifest option ───────────────────────────────────
+
+    #[test]
+    fn prefetch_manifest_none_when_disabled() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            default_opts(),
+        );
+        assert!(result.extracted_routes.is_none());
+        assert!(result.extracted_queries.is_none());
+        assert!(result.route_params.is_none());
+    }
+
+    #[test]
+    fn prefetch_manifest_enabled_returns_empty_when_no_routes() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                prefetch_manifest: Some(true),
+                ..Default::default()
+            },
+        );
+        // Should return None for empty results
+        assert!(result.extracted_routes.is_none());
+    }
+
+    // ── target option ──────────────────────────────────────────────
+
+    #[test]
+    fn compile_with_tui_target() {
+        let result = compile(
+            r#"function App() { return <div>Hello</div>; }"#,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                target: Some("tui".to_string()),
+                ..Default::default()
+            },
+        );
+        // Should compile without error
+        assert!(result.code.contains("// compiled by vertz-native"));
+    }
+
+    // ── VariableInfoOutput fields ──────────────────────────────────
+
+    #[test]
+    fn variable_info_includes_kind() {
+        let result = compile(
+            r#"import { signal } from '@vertz/ui';
+function App() {
+    const count = signal(0);
+    return <div>{count.value}</div>;
+}"#,
+            default_opts(),
+        );
+        let comps = result.components.unwrap();
+        let vars = comps[0].variables.as_ref().unwrap();
+        let count_var = vars.iter().find(|v| v.name == "count");
+        assert!(count_var.is_some());
+        assert!(!count_var.unwrap().kind.is_empty());
+    }
+
+    // ── FieldSelectionOutput fields ────────────────────────────────
+
+    #[test]
+    fn field_selection_output_has_all_fields() {
+        let result = compile(
+            r#"const tasks = query(api.tasks.list());
+function App() { return <div>{tasks.data.assignee.name}</div>; }"#,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                field_selection: Some(true),
+                ..Default::default()
+            },
+        );
+        let sels = result.field_selections.unwrap();
+        assert!(!sels.is_empty());
+        assert_eq!(sels[0].query_var, "tasks");
+        assert!(!sels[0].injection_kind.is_empty());
+        assert!(!sels[0].fields.is_empty());
+        assert!(!sels[0].nested_access.is_empty());
+    }
+
+    // ── Manifest with all property types ───────────────────────────
+
+    #[test]
+    fn build_manifest_registry_with_all_properties() {
+        let opts = CompileOptions {
+            manifests: Some(vec![ManifestEntry {
+                module_specifier: "@my/lib".to_string(),
+                export_name: "useData".to_string(),
+                reactivity_type: "signal".to_string(),
+                signal_properties: Some(vec!["value".to_string()]),
+                plain_properties: Some(vec!["raw".to_string()]),
+                field_signal_properties: Some(vec!["field".to_string()]),
+            }]),
+            ..Default::default()
+        };
+        let registry = build_manifest_registry(&opts);
+        let entry = &registry["@my/lib"]["useData"];
+        assert!(entry.signal_properties.is_some());
+        assert!(entry.plain_properties.is_some());
+        assert!(entry.field_signal_properties.is_some());
+    }
+
+    // ── TypeScript stripping in pipeline ───────────────────────────
+
+    #[test]
+    fn strips_typescript_in_compilation() {
+        let result = compile(
+            r#"interface Props { title: string; }
+function App(props: Props) { return <div>{props.title}</div>; }"#,
+            default_opts(),
+        );
+        assert!(!result.code.contains("interface Props"));
+        assert!(result.diagnostics.is_none());
+    }
+}

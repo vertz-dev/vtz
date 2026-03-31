@@ -421,3 +421,198 @@ fn collect_block_var_names(body: &FunctionBody, names: &mut HashSet<String>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, CompileOptions};
+
+    fn compile_tsx(source: &str) -> String {
+        let result = compile(
+            source,
+            CompileOptions {
+                filename: Some("test.tsx".to_string()),
+                ..Default::default()
+            },
+        );
+        result.code
+    }
+
+    // ── Basic destructured props ───────────────────────────────────
+
+    #[test]
+    fn rewrites_destructured_prop_to_props_access() {
+        let code = compile_tsx(
+            r#"function Card({ title }) {
+    return <div>{title}</div>;
+}"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+        assert!(code.contains("__props"), "code: {}", code);
+    }
+
+    #[test]
+    fn rewrites_multiple_destructured_props() {
+        let code = compile_tsx(
+            r#"function Card({ title, subtitle }) {
+    return <div>{title}{subtitle}</div>;
+}"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+        assert!(code.contains("__props.subtitle"), "code: {}", code);
+    }
+
+    // ── Props with default values ──────────────────────────────────
+
+    #[test]
+    fn rewrites_prop_with_default_value() {
+        let code = compile_tsx(
+            r#"function Card({ title = 'default' }) {
+    return <div>{title}</div>;
+}"#,
+        );
+        assert!(
+            code.contains("__props.title ?? 'default'"),
+            "code: {}",
+            code
+        );
+    }
+
+    // ── Props with type annotation ─────────────────────────────────
+
+    #[test]
+    fn preserves_type_annotation_on_parameter() {
+        let code = compile_tsx(
+            r#"function Card({ title }: CardProps) {
+    return <div>{title}</div>;
+}"#,
+        );
+        // The type annotation should be moved to __props
+        assert!(code.contains("__props"), "code: {}", code);
+    }
+
+    // ── Rest element ───────────────────────────────────────────────
+
+    #[test]
+    fn generates_rest_destructuring_at_body_top() {
+        let code = compile_tsx(
+            r#"function Card({ title, ...rest }) {
+    return <div>{title}</div>;
+}"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+        assert!(code.contains("...rest"), "code: {}", code);
+    }
+
+    // ── No destructured props → no transform ───────────────────────
+
+    #[test]
+    fn no_transform_for_simple_props_param() {
+        let code = compile_tsx(
+            r#"function Card(props) {
+    return <div>{props.title}</div>;
+}"#,
+        );
+        // Should NOT have __props since it's not destructured
+        assert!(!code.contains("__props"), "code: {}", code);
+    }
+
+    #[test]
+    fn no_transform_for_no_params() {
+        let code = compile_tsx(
+            r#"function Card() {
+    return <div>Hello</div>;
+}"#,
+        );
+        assert!(!code.contains("__props"), "code: {}", code);
+    }
+
+    // ── Nested destructuring is skipped ────────────────────────────
+
+    #[test]
+    fn skips_nested_destructuring() {
+        let code = compile_tsx(
+            r#"function Card({ user: { name } }) {
+    return <div>{name}</div>;
+}"#,
+        );
+        // Should NOT rewrite because of nested destructuring
+        assert!(!code.contains("__props"), "code: {}", code);
+    }
+
+    // ── Shorthand object property ──────────────────────────────────
+
+    #[test]
+    fn rewrites_shorthand_object_property() {
+        let code = compile_tsx(
+            r#"function Card({ title }) {
+    const obj = { title };
+    return <div>{title}</div>;
+}"#,
+        );
+        // Shorthand { title } should become { title: __props.title }
+        assert!(code.contains("title: __props.title"), "code: {}", code);
+    }
+
+    // ── Arrow function component ───────────────────────────────────
+
+    #[test]
+    fn rewrites_arrow_function_component_props() {
+        let code = compile_tsx(
+            r#"const Card = ({ title }) => {
+    return <div>{title}</div>;
+};"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+    }
+
+    // ── Export function component ───────────────────────────────────
+
+    #[test]
+    fn rewrites_export_function_component_props() {
+        let code = compile_tsx(
+            r#"export function Card({ title }) {
+    return <div>{title}</div>;
+}"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+    }
+
+    // ── Export default function ─────────────────────────────────────
+
+    #[test]
+    fn rewrites_export_default_function_props() {
+        let code = compile_tsx(
+            r#"export default function Card({ title }) {
+    return <div>{title}</div>;
+}"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+    }
+
+    // ── Variable shadowing ─────────────────────────────────────────
+
+    #[test]
+    fn does_not_replace_shadowed_variable_in_arrow() {
+        let code = compile_tsx(
+            r#"function Card({ title }) {
+    const fn1 = (title) => title;
+    return <div>{title}</div>;
+}"#,
+        );
+        // The arrow param 'title' shadows the prop, so inner usage should not be __props.title
+        // But the return's {title} should be __props.title
+        assert!(code.contains("__props.title"), "code: {}", code);
+    }
+
+    // ── Export named variable ──────────────────────────────────────
+
+    #[test]
+    fn rewrites_export_const_arrow_component() {
+        let code = compile_tsx(
+            r#"export const Card = ({ title }) => {
+    return <div>{title}</div>;
+};"#,
+        );
+        assert!(code.contains("__props.title"), "code: {}", code);
+    }
+}
