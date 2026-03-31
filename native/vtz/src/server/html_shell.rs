@@ -1,15 +1,10 @@
+use crate::plugin::FrameworkPlugin;
 use std::path::Path;
 
-/// The Fast Refresh runtime JS (embedded at compile time).
-const FAST_REFRESH_RUNTIME_JS: &str = include_str!("../assets/fast-refresh-runtime.js");
-
-/// The Fast Refresh helpers module that registers @vertz/ui context functions.
-const FAST_REFRESH_HELPERS_JS: &str = include_str!("../assets/fast-refresh-helpers.js");
-
-/// The HMR client JS (embedded at compile time).
+/// The HMR client JS (embedded at compile time). Runtime-provided, generic.
 const HMR_CLIENT_JS: &str = include_str!("../assets/hmr-client.js");
 
-/// The error overlay JS (embedded at compile time).
+/// The error overlay JS (embedded at compile time). Runtime-provided, generic.
 const ERROR_OVERLAY_JS: &str = include_str!("../assets/error-overlay.js");
 
 /// Generate the HTML shell document for client-side rendering.
@@ -18,23 +13,33 @@ const ERROR_OVERLAY_JS: &str = include_str!("../assets/error-overlay.js");
 /// It includes:
 /// - `<script type="module" src="/src/app.tsx">` to load the entry file
 /// - `<link rel="modulepreload">` hints for the entry file
-/// - `<div id="app">` mount point
+/// - `<div id="app">` mount point (configurable via plugin)
 /// - Standard HTML5 boilerplate (DOCTYPE, charset, viewport)
-/// - HMR client script and Fast Refresh runtime (in dev mode)
+/// - HMR client script and error overlay (runtime-provided)
+/// - Plugin-provided scripts (e.g., Fast Refresh runtime)
 pub fn generate_html_shell(
     entry_path: &Path,
     root_dir: &Path,
     preload_hints: &[String],
     inline_css: Option<&str>,
     title: &str,
+    plugin: &dyn FrameworkPlugin,
 ) -> String {
-    generate_html_shell_with_hmr(entry_path, root_dir, preload_hints, inline_css, title, true)
+    generate_html_shell_with_hmr(
+        entry_path,
+        root_dir,
+        preload_hints,
+        inline_css,
+        title,
+        true,
+        plugin,
+    )
 }
 
 /// Generate the HTML shell with optional HMR support.
 ///
-/// When `enable_hmr` is true, includes the Fast Refresh runtime and HMR client
-/// scripts inline in the HTML shell. These scripts run before the app module loads.
+/// When `enable_hmr` is true, includes the HMR client, error overlay (runtime-provided),
+/// and plugin-contributed scripts (e.g., Fast Refresh runtime) inline in the HTML shell.
 pub fn generate_html_shell_with_hmr(
     entry_path: &Path,
     root_dir: &Path,
@@ -42,8 +47,10 @@ pub fn generate_html_shell_with_hmr(
     inline_css: Option<&str>,
     title: &str,
     enable_hmr: bool,
+    plugin: &dyn FrameworkPlugin,
 ) -> String {
     let entry_url = path_to_url(entry_path, root_dir);
+    let root_id = plugin.root_element_id();
 
     let mut html = String::with_capacity(2048);
     html.push_str("<!DOCTYPE html>\n");
@@ -54,6 +61,12 @@ pub fn generate_html_shell_with_hmr(
         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n",
     );
     html.push_str(&format!("  <title>{}</title>\n", escape_html(title)));
+
+    // Plugin-provided <head> content
+    if let Some(extra_head) = plugin.head_html() {
+        html.push_str(&extra_head);
+        html.push('\n');
+    }
 
     // Module preload for the entry file
     html.push_str(&format!(
@@ -76,24 +89,28 @@ pub fn generate_html_shell_with_hmr(
 
     html.push_str("</head>\n");
     html.push_str("<body>\n");
-    html.push_str("  <div id=\"app\"></div>\n");
+    html.push_str(&format!("  <div id=\"{}\"></div>\n", root_id));
 
-    // HMR scripts: Fast Refresh runtime + HMR client + error overlay (before app module)
+    // HMR scripts (before app module)
     if enable_hmr {
-        html.push_str("  <script>\n");
-        html.push_str(FAST_REFRESH_RUNTIME_JS);
-        html.push_str("\n  </script>\n");
+        // 1. Plugin-provided scripts (e.g., Fast Refresh runtime)
+        for script in plugin.hmr_client_scripts() {
+            let script_type = if script.is_module {
+                "module"
+            } else {
+                "text/javascript"
+            };
+            html.push_str(&format!("  <script type=\"{}\">\n", script_type));
+            html.push_str(&script.content);
+            html.push_str("\n  </script>\n");
+        }
+        // 2. Runtime-provided: HMR client (generic WebSocket transport)
         html.push_str("  <script>\n");
         html.push_str(HMR_CLIENT_JS);
         html.push_str("\n  </script>\n");
+        // 3. Runtime-provided: Error overlay (generic)
         html.push_str("  <script>\n");
         html.push_str(ERROR_OVERLAY_JS);
-        html.push_str("\n  </script>\n");
-        // Module script that registers @vertz/ui context helpers with the FR runtime.
-        // Must execute before the entry module so that component wrappers capture
-        // real context scopes (needed for Fast Refresh re-mounting).
-        html.push_str("  <script type=\"module\">\n");
-        html.push_str(FAST_REFRESH_HELPERS_JS);
         html.push_str("\n  </script>\n");
     }
 
@@ -166,6 +183,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn test_plugin() -> crate::plugin::vertz::VertzPlugin {
+        crate::plugin::vertz::VertzPlugin
+    }
+
     #[test]
     fn test_generate_html_shell_basic() {
         let html = generate_html_shell(
@@ -174,6 +195,7 @@ mod tests {
             &[],
             None,
             "Vertz App",
+            &test_plugin(),
         );
 
         assert!(html.contains("<!DOCTYPE html>"));
@@ -194,6 +216,7 @@ mod tests {
             &[],
             None,
             "Vertz App",
+            &test_plugin(),
         );
 
         // HMR client and Fast Refresh runtime should be included
@@ -215,6 +238,7 @@ mod tests {
             &[],
             None,
             "Vertz App",
+            &test_plugin(),
         );
 
         let hmr_pos = html.find("__vertz_hmr").unwrap();
@@ -236,6 +260,7 @@ mod tests {
             None,
             "Vertz App",
             false,
+            &test_plugin(),
         );
 
         assert!(html.contains("<script type=\"module\" src=\"/src/app.tsx\"></script>"));
@@ -261,6 +286,7 @@ mod tests {
             &hints,
             None,
             "Vertz App",
+            &test_plugin(),
         );
 
         assert!(html.contains("<link rel=\"modulepreload\" href=\"/@deps/@vertz/ui\""));
@@ -275,6 +301,7 @@ mod tests {
             &[],
             Some("body { margin: 0; }"),
             "Vertz App",
+            &test_plugin(),
         );
 
         assert!(html.contains("<style>body { margin: 0; }</style>"));
@@ -288,6 +315,7 @@ mod tests {
             &[],
             None,
             "App <script>alert('xss')</script>",
+            &test_plugin(),
         );
 
         assert!(html.contains("&lt;script&gt;"));

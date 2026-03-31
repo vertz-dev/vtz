@@ -141,6 +141,7 @@ pub fn build_router(
     };
 
     let state = Arc::new(DevServerState {
+        plugin,
         pipeline,
         root_dir: config.root_dir.clone(),
         src_dir: config.src_dir.clone(),
@@ -628,6 +629,7 @@ async fn dev_server_handler(
             &[],
             state.theme_css.as_deref(),
             "Vertz App",
+            state.plugin.as_ref(),
         );
         return axum::response::Response::builder()
             .status(StatusCode::OK)
@@ -888,7 +890,9 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
         &state.hmr_hub,
     );
 
-    let restart_triggers = RestartTriggers::default();
+    let restart_triggers = RestartTriggers {
+        config_files: state.plugin.restart_triggers(),
+    };
 
     // Start the file watcher if src_dir exists
     if config.src_dir.exists() {
@@ -1094,12 +1098,13 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
                                         &entry_file,
                                     );
 
-                                    crate::hmr::broadcast_update(
-                                        &watcher_state.hmr_hub,
-                                        &result,
+                                    // Use plugin's HMR strategy to decide what action to take
+                                    let action = watcher_state.plugin.hmr_strategy(&result);
+                                    let message = crate::plugin::hmr_action_to_message(
+                                        &action,
                                         &root_dir,
-                                    )
-                                    .await;
+                                    );
+                                    watcher_state.hmr_hub.broadcast(message).await;
                                 }
                             }
                         }

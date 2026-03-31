@@ -23,6 +23,8 @@ use crate::watcher::SharedModuleGraph;
 /// Shared state for the dev module server.
 #[derive(Clone)]
 pub struct DevServerState {
+    /// Framework plugin for compilation, HMR, and MCP extensibility.
+    pub plugin: Arc<dyn crate::plugin::FrameworkPlugin>,
     pub pipeline: CompilationPipeline,
     pub root_dir: PathBuf,
     pub src_dir: PathBuf,
@@ -689,6 +691,7 @@ pub async fn handle_page_route(
         &[], // TODO: populate preload hints from module graph
         state.theme_css.as_deref(),
         "Vertz App",
+        state.plugin.as_ref(),
     );
 
     Response::builder()
@@ -758,6 +761,7 @@ mod tests {
         std::fs::create_dir_all(&deps_dir).unwrap();
 
         Arc::new(DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(root.to_path_buf(), src_dir.clone(), test_plugin()),
             root_dir: root.to_path_buf(),
             src_dir: src_dir.clone(),
@@ -1479,6 +1483,7 @@ mod tests {
         std::fs::write(parent_nm.join("index.js"), "export const x = 1;").unwrap();
 
         let state = Arc::new(DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(project.clone(), src.clone(), test_plugin()),
             root_dir: project.clone(),
             src_dir: src,
@@ -1630,6 +1635,7 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = Arc::new(DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(
                 tmp.path().to_path_buf(),
                 src.clone(),
@@ -1683,6 +1689,7 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = Arc::new(DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(
                 tmp.path().to_path_buf(),
                 src.clone(),
@@ -1765,6 +1772,7 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(
                 tmp.path().to_path_buf(),
                 src.clone(),
@@ -1815,6 +1823,7 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(
                 tmp.path().to_path_buf(),
                 src.clone(),
@@ -1900,6 +1909,7 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = Arc::new(DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(
                 tmp.path().to_path_buf(),
                 src.clone(),

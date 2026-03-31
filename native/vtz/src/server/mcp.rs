@@ -810,6 +810,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
 
         Arc::new(DevServerState {
+            plugin: test_plugin(),
             pipeline: CompilationPipeline::new(root.clone(), src.clone(), test_plugin()),
             root_dir: root.clone(),
             src_dir: src,

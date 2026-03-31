@@ -291,6 +291,7 @@ async fn test_diagnostics_includes_active_errors() {
 #[test]
 fn test_html_shell_includes_error_overlay_script() {
     let root = minimal_app_path();
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
 
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
@@ -298,6 +299,7 @@ fn test_html_shell_includes_error_overlay_script() {
         &[],
         None,
         "Vertz App",
+        &plugin,
     );
 
     assert!(
@@ -313,6 +315,7 @@ fn test_html_shell_includes_error_overlay_script() {
 #[test]
 fn test_html_shell_without_hmr_excludes_error_overlay() {
     let root = minimal_app_path();
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
 
     let html = vertz_runtime::server::html_shell::generate_html_shell_with_hmr(
         &root.join("src/app.tsx"),
@@ -321,6 +324,7 @@ fn test_html_shell_without_hmr_excludes_error_overlay() {
         None,
         "Vertz App",
         false,
+        &plugin,
     );
 
     assert!(
@@ -332,6 +336,7 @@ fn test_html_shell_without_hmr_excludes_error_overlay() {
 #[test]
 fn test_html_shell_error_overlay_before_app_module() {
     let root = minimal_app_path();
+    let plugin = vertz_runtime::plugin::vertz::VertzPlugin;
 
     let html = vertz_runtime::server::html_shell::generate_html_shell(
         &root.join("src/app.tsx"),
@@ -339,6 +344,7 @@ fn test_html_shell_error_overlay_before_app_module() {
         &[],
         None,
         "Vertz App",
+        &plugin,
     );
 
     let overlay_pos = html.find("__vertz_errors").unwrap();
