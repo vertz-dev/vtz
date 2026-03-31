@@ -15,5 +15,9 @@
   "exports": {
     "./package.json": "./package.json"
   },
-  "preferUnplugged": true
+  "preferUnplugged": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vertz-dev/vtz"
+  }
 }

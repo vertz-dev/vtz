@@ -155,11 +155,15 @@ mod tests {
     #[test]
     fn tampered_signature_rejected() {
         let claims = test_claims();
-        let mut token = create_hs256(&claims, SECRET);
-        // Tamper with the last character of the signature
-        let last = token.pop().unwrap();
-        token.push(if last == 'A' { 'B' } else { 'A' });
-        let result = verify_hs256(&token, SECRET);
+        let token = create_hs256(&claims, SECRET);
+        // Replace the signature with a completely different valid base64 string
+        let dot_pos = token.rfind('.').unwrap();
+        let tampered = format!(
+            "{}.{}",
+            &token[..dot_pos],
+            URL_SAFE_NO_PAD.encode(b"this-is-not-the-real-signature!!")
+        );
+        let result = verify_hs256(&tampered, SECRET);
         assert!(matches!(result, Err(JwtError::InvalidSignature)));
     }
 

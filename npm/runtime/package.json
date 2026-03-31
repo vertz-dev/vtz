@@ -33,5 +33,9 @@
   "bin": {
     "vtz": "./vtz",
     "vertz": "./vtz"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vertz-dev/vtz"
   }
 }
