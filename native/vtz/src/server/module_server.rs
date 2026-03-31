@@ -747,6 +747,10 @@ fn parse_location_from_message(message: &str) -> (Option<u32>, Option<u32>) {
 mod tests {
     use super::*;
 
+    fn test_plugin() -> Arc<dyn crate::plugin::FrameworkPlugin> {
+        Arc::new(crate::plugin::vertz::VertzPlugin)
+    }
+
     fn create_test_state(root: &std::path::Path) -> Arc<DevServerState> {
         let src_dir = root.join("src");
         let deps_dir = root.join(".vertz/deps");
@@ -754,7 +758,7 @@ mod tests {
         std::fs::create_dir_all(&deps_dir).unwrap();
 
         Arc::new(DevServerState {
-            pipeline: CompilationPipeline::new(root.to_path_buf(), src_dir.clone()),
+            pipeline: CompilationPipeline::new(root.to_path_buf(), src_dir.clone(), test_plugin()),
             root_dir: root.to_path_buf(),
             src_dir: src_dir.clone(),
             entry_file: src_dir.join("app.tsx"),
@@ -1475,7 +1479,7 @@ mod tests {
         std::fs::write(parent_nm.join("index.js"), "export const x = 1;").unwrap();
 
         let state = Arc::new(DevServerState {
-            pipeline: CompilationPipeline::new(project.clone(), src.clone()),
+            pipeline: CompilationPipeline::new(project.clone(), src.clone(), test_plugin()),
             root_dir: project.clone(),
             src_dir: src,
             entry_file: project.join("src/app.tsx"),
@@ -1626,7 +1630,11 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = Arc::new(DevServerState {
-            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            pipeline: CompilationPipeline::new(
+                tmp.path().to_path_buf(),
+                src.clone(),
+                test_plugin(),
+            ),
             root_dir: tmp.path().to_path_buf(),
             src_dir: src,
             entry_file: tmp.path().join("src/app.tsx"),
@@ -1675,7 +1683,11 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = Arc::new(DevServerState {
-            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            pipeline: CompilationPipeline::new(
+                tmp.path().to_path_buf(),
+                src.clone(),
+                test_plugin(),
+            ),
             root_dir: tmp.path().to_path_buf(),
             src_dir: src,
             entry_file: tmp.path().join("src/app.tsx"),
@@ -1753,7 +1765,11 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = DevServerState {
-            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            pipeline: CompilationPipeline::new(
+                tmp.path().to_path_buf(),
+                src.clone(),
+                test_plugin(),
+            ),
             root_dir: tmp.path().to_path_buf(),
             src_dir: src,
             entry_file: tmp.path().join("src/app.tsx"),
@@ -1799,7 +1815,11 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = DevServerState {
-            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            pipeline: CompilationPipeline::new(
+                tmp.path().to_path_buf(),
+                src.clone(),
+                test_plugin(),
+            ),
             root_dir: tmp.path().to_path_buf(),
             src_dir: src,
             entry_file: tmp.path().join("src/app.tsx"),
@@ -1880,7 +1900,11 @@ mod tests {
         std::fs::create_dir_all(&deps).unwrap();
 
         let state = Arc::new(DevServerState {
-            pipeline: CompilationPipeline::new(tmp.path().to_path_buf(), src.clone()),
+            pipeline: CompilationPipeline::new(
+                tmp.path().to_path_buf(),
+                src.clone(),
+                test_plugin(),
+            ),
             root_dir: tmp.path().to_path_buf(),
             src_dir: src,
             entry_file: tmp.path().join("src/app.tsx"),

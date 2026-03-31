@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use crate::compiler::cache::{CachedModule, CompilationCache};
 use crate::compiler::import_rewriter;
+use crate::plugin::{CompileContext, FrameworkPlugin};
 
 /// A structured compilation error with source location.
 #[derive(Debug, Clone)]
@@ -36,24 +37,25 @@ pub type CssStore = Arc<RwLock<HashMap<String, String>>>;
 
 /// The browser compilation pipeline.
 ///
-/// Compiles .ts/.tsx files using vertz-compiler-core with target "dom",
-/// rewrites import specifiers for browser consumption, caches results,
-/// and extracts CSS into a shared store.
+/// Compiles .ts/.tsx files via a [`FrameworkPlugin`], rewrites import specifiers
+/// for browser consumption, caches results, and extracts CSS into a shared store.
 #[derive(Clone)]
 pub struct CompilationPipeline {
     cache: CompilationCache,
     css_store: CssStore,
     root_dir: PathBuf,
     src_dir: PathBuf,
+    plugin: Arc<dyn FrameworkPlugin>,
 }
 
 impl CompilationPipeline {
-    pub fn new(root_dir: PathBuf, src_dir: PathBuf) -> Self {
+    pub fn new(root_dir: PathBuf, src_dir: PathBuf, plugin: Arc<dyn FrameworkPlugin>) -> Self {
         Self {
             cache: CompilationCache::new(),
             css_store: Arc::new(RwLock::new(HashMap::new())),
             root_dir,
             src_dir,
+            plugin,
         }
     }
 
@@ -70,8 +72,8 @@ impl CompilationPipeline {
     /// Compile a source file for browser consumption.
     ///
     /// - Checks the compilation cache first (by mtime)
-    /// - On cache miss: reads the file, compiles with vertz-compiler-core (target: dom),
-    ///   rewrites imports, stores CSS, caches the result
+    /// - On cache miss: reads the file, delegates to the plugin for compilation
+    ///   and post-processing, rewrites imports, stores CSS, caches the result
     /// - On compilation error: returns a JS module that logs the error to console
     pub fn compile_for_browser(&self, file_path: &Path) -> BrowserCompileResult {
         // Check cache
@@ -96,75 +98,33 @@ impl CompilationPipeline {
             }
         };
 
-        let filename = file_path.to_string_lossy().to_string();
+        // Delegate compilation to the plugin
+        let ctx = CompileContext {
+            file_path,
+            root_dir: &self.root_dir,
+            src_dir: &self.src_dir,
+            target: "dom",
+        };
+        let output = self.plugin.compile(&source, &ctx);
 
-        // Compile with vertz-compiler-core
-        let compile_result = vertz_compiler_core::compile(
-            &source,
-            vertz_compiler_core::CompileOptions {
-                filename: Some(filename.clone()),
-                target: Some("dom".to_string()),
-                fast_refresh: Some(true),
-                ..Default::default()
-            },
-        );
+        // Convert plugin diagnostics to compile errors (filtering warnings)
+        let compile_errors = crate::plugin::diagnostics_to_errors(&output.diagnostics);
 
-        // Check for compilation errors (diagnostics)
-        // Only promote actual errors (syntax, parse) — skip warnings (CSS diagnostics)
-        let mut compile_errors: Vec<CompileError> = Vec::new();
-        if let Some(ref diagnostics) = compile_result.diagnostics {
-            let log_errors: Vec<String> = diagnostics
-                .iter()
-                .map(|d| {
-                    let location = match (d.line, d.column) {
-                        (Some(line), Some(col)) => format!(" at {}:{}:{}", filename, line, col),
-                        _ => String::new(),
-                    };
-                    // CSS diagnostics are warnings, not errors — don't surface in overlay
-                    if !d.message.starts_with("[css-") {
-                        compile_errors.push(CompileError {
-                            message: d.message.clone(),
-                            line: d.line,
-                            column: d.column,
-                        });
-                    }
-                    format!("{}{}", d.message, location)
-                })
-                .collect();
-
-            if !log_errors.is_empty() {
-                // Log diagnostics but don't fail — they may be warnings
-                eprintln!(
-                    "[vertz-compiler] Diagnostics for {}:\n  {}",
-                    filename,
-                    log_errors.join("\n  ")
-                );
-            }
-        }
-
-        // Post-process: fix compiler artifacts that cause runtime errors.
-        // 1. Fix wrong API names: compiler emits `effect` but the API is `domEffect`
-        // 2. Move internal APIs (domEffect, lifecycleEffect) from @vertz/ui to @vertz/ui/internals
-        // 3. Strip leftover TypeScript syntax that the compiler didn't fully remove.
-        // 4. Deduplicate imports: the compiler may add imports (e.g., `import { signal }`)
-        //    that already exist in the original source, causing "already been declared" errors.
-        // 5. Strip import.meta.hot lines (Bun HMR API — not needed in native server)
-        // 6. Fix moduleId to use URL-relative path (for Fast Refresh registry matching)
-        let deduped = post_process_compiled(&compile_result.code);
-        let deduped = fix_module_id(&deduped, file_path, &self.root_dir);
+        // Plugin post-processing (framework-specific fixups)
+        let processed = self.plugin.post_process(&output.code, &ctx);
 
         // Rewrite import specifiers for browser consumption
         let code =
-            import_rewriter::rewrite_imports(&deduped, file_path, &self.src_dir, &self.root_dir);
+            import_rewriter::rewrite_imports(&processed, file_path, &self.src_dir, &self.root_dir);
 
         // Handle extracted CSS
-        let css = compile_result.css.clone();
+        let css = output.css;
         if let Some(ref css_content) = css {
             self.store_css(file_path, css_content);
         }
 
         // Add source map URL comment
-        let code = if compile_result.map.is_some() {
+        let code = if output.source_map.is_some() {
             let map_url = self.source_map_url(file_path);
             format!("{}\n//# sourceMappingURL={}", code, map_url)
         } else {
@@ -181,7 +141,7 @@ impl CompilationPipeline {
                 file_path.to_path_buf(),
                 CachedModule {
                     code: code.clone(),
-                    source_map: compile_result.map.clone(),
+                    source_map: output.source_map.clone(),
                     css: css.clone(),
                     mtime,
                 },
@@ -190,7 +150,7 @@ impl CompilationPipeline {
 
         BrowserCompileResult {
             code,
-            source_map: compile_result.map,
+            source_map: output.source_map,
             css,
             errors: compile_errors,
         }
@@ -1116,7 +1076,7 @@ fn strip_import_meta_hot(code: &str) -> String {
 /// But the HMR broadcast sends URL paths like `/src/app.tsx`.
 /// Fast Refresh registry lookups fail if these don't match.
 /// This replaces the absolute path with the URL-relative path.
-fn fix_module_id(code: &str, file_path: &Path, root_dir: &Path) -> String {
+pub fn fix_module_id(code: &str, file_path: &Path, root_dir: &Path) -> String {
     let abs_path = file_path.to_string_lossy();
     let url_path = if let Ok(rel) = file_path.strip_prefix(root_dir) {
         format!("/{}", rel.to_string_lossy().replace('\\', "/"))
@@ -1159,8 +1119,12 @@ fn simple_hash(s: &str) -> u64 {
 mod tests {
     use super::*;
 
+    fn test_plugin() -> Arc<dyn crate::plugin::FrameworkPlugin> {
+        Arc::new(crate::plugin::vertz::VertzPlugin)
+    }
+
     fn create_pipeline(root: &Path) -> CompilationPipeline {
-        CompilationPipeline::new(root.to_path_buf(), root.join("src"))
+        CompilationPipeline::new(root.to_path_buf(), root.join("src"), test_plugin())
     }
 
     #[test]
@@ -1327,16 +1291,22 @@ export function App() {
 
     #[test]
     fn test_css_key_generation() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let key = pipeline.css_key(Path::new("/project/src/components/Button.tsx"));
         assert_eq!(key, "src_components_Button.tsx.css");
     }
 
     #[test]
     fn test_error_module_escapes_special_chars() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let result = pipeline.error_module("Error with `backticks` and $dollar");
 
         assert!(result.code.contains("console.error"));
@@ -1852,8 +1822,11 @@ export function App() {
 
     #[test]
     fn test_css_key_outside_root() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let key = pipeline.css_key(Path::new("/other/file.tsx"));
         assert!(key.ends_with(".css"));
         // Should use hash fallback
@@ -1862,31 +1835,43 @@ export function App() {
 
     #[test]
     fn test_source_map_url_inside_root() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let url = pipeline.source_map_url(Path::new("/project/src/app.tsx"));
         assert_eq!(url, "/src/app.tsx.map");
     }
 
     #[test]
     fn test_source_map_url_outside_root() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let url = pipeline.source_map_url(Path::new("/other/app.tsx"));
         assert_eq!(url, "/other/app.tsx.map");
     }
 
     #[test]
     fn test_get_css_empty_store() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         assert_eq!(pipeline.get_css("nonexistent"), None);
     }
 
     #[test]
     fn test_store_and_get_css() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         pipeline.store_css(Path::new("/project/src/app.tsx"), ".foo { color: red; }");
         let key = pipeline.css_key(Path::new("/project/src/app.tsx"));
         assert_eq!(
@@ -1927,8 +1912,11 @@ export function App() {
 
     #[test]
     fn test_error_module_content() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let result = pipeline.error_module("Test error");
         assert!(result.code.contains("console.error"));
         assert!(result.code.contains("Test error"));
@@ -1941,8 +1929,11 @@ export function App() {
 
     #[test]
     fn test_error_module_escapes_backslash() {
-        let pipeline =
-            CompilationPipeline::new(PathBuf::from("/project"), PathBuf::from("/project/src"));
+        let pipeline = CompilationPipeline::new(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/src"),
+            test_plugin(),
+        );
         let result = pipeline.error_module("path\\to\\file");
         assert!(result.code.contains("path\\\\to\\\\file"));
     }

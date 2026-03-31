@@ -10,6 +10,10 @@
 /// - Source map resolution
 use std::path::PathBuf;
 
+fn test_plugin() -> std::sync::Arc<dyn vertz_runtime::plugin::FrameworkPlugin> {
+    std::sync::Arc::new(vertz_runtime::plugin::vertz::VertzPlugin)
+}
+
 fn minimal_app_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -461,7 +465,7 @@ mod http_integration {
             root,
         );
 
-        let (router, _state) = vertz_runtime::server::http::build_router(&config);
+        let (router, _state) = vertz_runtime::server::http::build_router(&config, test_plugin());
 
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 

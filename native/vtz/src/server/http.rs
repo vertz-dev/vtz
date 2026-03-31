@@ -91,8 +91,15 @@ pub async fn try_bind(config: &ServerConfig) -> io::Result<BindResult> {
 /// 6. `/src/**` → on-demand compilation + serving
 /// 7. Static files from public_dir
 /// 8. Fallback → HTML shell for SPA routing (page routes)
-pub fn build_router(config: &ServerConfig) -> (Router, Arc<DevServerState>) {
-    let pipeline = CompilationPipeline::new(config.root_dir.clone(), config.src_dir.clone());
+pub fn build_router(
+    config: &ServerConfig,
+    plugin: Arc<dyn crate::plugin::FrameworkPlugin>,
+) -> (Router, Arc<DevServerState>) {
+    let pipeline = CompilationPipeline::new(
+        config.root_dir.clone(),
+        config.src_dir.clone(),
+        plugin.clone(),
+    );
 
     // Load theme CSS from the project (if available)
     let theme_css = theme_css::load_theme_css(&config.root_dir);
@@ -831,7 +838,11 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
 
     print_banner_with_upstream(&actual_config, start.elapsed(), &upstream_package_names);
 
-    let (router, state) = build_router(&config);
+    // Default to VertzPlugin. Future: select based on config/CLI.
+    let plugin: Arc<dyn crate::plugin::FrameworkPlugin> =
+        Arc::new(crate::plugin::vertz::VertzPlugin);
+
+    let (router, state) = build_router(&config, plugin);
 
     // Start type checker (tsc/tsgo) if enabled.
     // Kept alive until server shutdown — Drop kills the child process.
@@ -1304,7 +1315,9 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         config.enable_ssr = false;
-        let (router, state) = build_router(&config);
+        let plugin: Arc<dyn crate::plugin::FrameworkPlugin> =
+            Arc::new(crate::plugin::vertz::VertzPlugin);
+        let (router, state) = build_router(&config, plugin);
         (router, state, tmp)
     }
 
@@ -1377,6 +1390,10 @@ mod tests {
 
     // ─── build_router ────────────────────────────────────────────────
 
+    fn test_plugin() -> Arc<dyn crate::plugin::FrameworkPlugin> {
+        Arc::new(crate::plugin::vertz::VertzPlugin)
+    }
+
     #[test]
     fn test_build_router_returns_router_and_state() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1386,7 +1403,7 @@ mod tests {
             PathBuf::from("public"),
             tmp.path().to_path_buf(),
         );
-        let (_router, state) = build_router(&config);
+        let (_router, state) = build_router(&config, test_plugin());
         assert_eq!(state.root_dir, tmp.path().to_path_buf());
     }
 
@@ -1400,7 +1417,7 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         config.enable_ssr = false;
-        let (_router, state) = build_router(&config);
+        let (_router, state) = build_router(&config, test_plugin());
         assert!(!state.enable_ssr);
     }
 
@@ -1413,7 +1430,7 @@ mod tests {
             PathBuf::from("public"),
             tmp.path().to_path_buf(),
         );
-        let (_router, state) = build_router(&config);
+        let (_router, state) = build_router(&config, test_plugin());
         assert_eq!(state.port, 4000);
         assert_eq!(state.root_dir, tmp.path().to_path_buf());
         assert_eq!(state.src_dir, tmp.path().join("src"));

@@ -38,12 +38,17 @@ fn linear_clone_path() -> PathBuf {
         .join("linear-clone-app")
 }
 
+fn test_plugin() -> std::sync::Arc<dyn vertz_runtime::plugin::FrameworkPlugin> {
+    std::sync::Arc::new(vertz_runtime::plugin::vertz::VertzPlugin)
+}
+
 fn create_pipeline(
     root: &std::path::Path,
 ) -> vertz_runtime::compiler::pipeline::CompilationPipeline {
     vertz_runtime::compiler::pipeline::CompilationPipeline::new(
         root.to_path_buf(),
         root.join("src"),
+        test_plugin(),
     )
 }
 
@@ -774,7 +779,7 @@ mod http_integration {
         // Disable SSR for client-only rendering tests
         config.enable_ssr = false;
 
-        let (router, _state) = vertz_runtime::server::http::build_router(&config);
+        let (router, _state) = vertz_runtime::server::http::build_router(&config, test_plugin());
 
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
