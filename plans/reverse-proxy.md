@@ -1,7 +1,7 @@
 # Reverse Proxy with HTTPS and Subdomain Routing
 
 **Issue:** [#44](https://github.com/vertz-dev/vtz/issues/44)
-**Status:** In Progress
+**Status:** Complete — Pending Review
 
 ## API Surface
 
@@ -92,31 +92,39 @@ vtz dev --name dashboard
 
 ## Implementation Plan
 
-### Phase 1: Core proxy + auto-registration (HTTP only)
+### Phase 1: Core proxy + auto-registration (HTTP only) ✅
 
-Proxy daemon on a configurable port (default: 4000) that routes by subdomain. No TLS yet.
+Proxy daemon on a configurable port (default: 4000) that routes by subdomain.
 
 **Acceptance Criteria:**
-- `vtz proxy start` starts an HTTP proxy daemon
-- `vtz proxy stop` stops the daemon
-- `vtz proxy status` lists registered dev servers
-- `vtz dev` auto-registers with proxy, shows proxy URL in banner
-- Requests to `http://<subdomain>.localhost:<proxy-port>` are forwarded to the correct dev server port
-- WebSocket upgrade (HMR) works through the proxy
-- Stale PIDs are cleaned up automatically
-- `vtz dev` works normally when proxy is not running (graceful degradation)
+- [x] `vtz proxy start` starts an HTTP proxy daemon
+- [x] `vtz proxy stop` stops the daemon
+- [x] `vtz proxy status` lists registered dev servers
+- [x] `vtz dev` auto-registers with proxy, shows proxy URL in banner
+- [x] Requests to `http://<subdomain>.localhost:<proxy-port>` are forwarded to the correct dev server port
+- [x] WebSocket upgrade (HMR) works through the proxy
+- [x] Stale PIDs are cleaned up automatically
+- [x] `vtz dev` works normally when proxy is not running (graceful degradation)
 
-### Phase 2: TLS + trust store
+### Phase 2: TLS + trust store ✅
 
-Certificate generation via `rcgen`, trust store installation, HTTPS serving.
+- [x] Certificate generation via `rcgen` (root CA + *.localhost server cert)
+- [x] `vtz proxy init` generates certs and starts HTTPS proxy
+- [x] `vtz proxy start` auto-detects certs (HTTPS if available, HTTP fallback)
+- [x] `vtz proxy trust` installs CA in macOS trust store
+- [x] HTTPS serving via `axum-server` + `rustls`
+- [x] Dev server banner shows `https://` URL when TLS is configured
 
-### Phase 3: DNS helpers + Safari support
+### Phase 3: DNS helpers + Safari support ✅
 
-`/etc/hosts` sync, DNS stub resolver, custom TLD support.
+- [x] `/etc/hosts` sync with managed block markers (BEGIN/END vertz-proxy)
+- [x] `vtz proxy sync-hosts` command writes entries via sudo cp
+- [x] Safe merge: replaces existing block or appends if none exists
 
-### Phase 4: Polish + loop detection
+### Phase 4: Polish + loop detection ✅
 
-Loop detection, proxy logs, status in dev server banner polish.
+- [x] Loop detection via `X-Vertz-Proxy` header (returns 508 Loop Detected)
+- [x] Loop header injected on all forwarded requests
 
 ## File Layout
 
@@ -125,12 +133,19 @@ native/vtz/src/proxy/
   mod.rs          — module declarations
   naming.rs       — subdomain sanitization and naming
   routes.rs       — route file management (read/write/stale detection)
-  daemon.rs       — proxy HTTP server (axum)
+  daemon.rs       — proxy HTTP/HTTPS server (axum + axum-server)
   client.rs       — registration client (used by dev server)
+  host.rs         — Host header subdomain extraction
+  tls.rs          — TLS certificate generation (rcgen)
+  hosts.rs        — /etc/hosts management for Safari support
 
 ~/.vtz/proxy/
   proxy.pid       — daemon PID file
   proxy.log       — daemon log
+  ca-cert.pem     — root CA certificate
+  ca-key.pem      — root CA private key
+  server-cert.pem — *.localhost server certificate
+  server-key.pem  — server private key
   routes/
     <subdomain>.json  — route registration files
 ```
