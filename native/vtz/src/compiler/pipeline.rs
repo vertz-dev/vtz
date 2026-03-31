@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use crate::compiler::cache::{CachedModule, CompilationCache};
 use crate::compiler::env_replacer;
 use crate::compiler::import_rewriter;
+use crate::compiler::postcss;
 use crate::plugin::{CompileContext, FrameworkPlugin};
 use crate::tsconfig::TsconfigPaths;
 
@@ -189,6 +190,76 @@ impl CompilationPipeline {
         }
     }
 
+    /// Compile an imported CSS file into a JavaScript style-injection module.
+    pub fn compile_css_for_browser(
+        &self,
+        file_path: &Path,
+        url_path: &str,
+    ) -> BrowserCompileResult {
+        if let Some(cached) = self.cache.get(file_path) {
+            return BrowserCompileResult {
+                code: cached.code,
+                source_map: cached.source_map,
+                css: cached.css,
+                errors: vec![],
+            };
+        }
+
+        // When PostCSS is configured the JS runner reads the file itself,
+        // so only read from Rust when falling back to raw CSS.
+        let processed_css = match postcss::find_postcss_config(&self.root_dir) {
+            Some(config_path) => {
+                match postcss::process_css(&self.root_dir, file_path, &config_path) {
+                    Ok(css) => css,
+                    Err(err) => {
+                        return BrowserCompileResult {
+                            code: self.css_error_module(&err.message),
+                            source_map: None,
+                            css: None,
+                            errors: vec![CompileError {
+                                message: err.message,
+                                line: err.line,
+                                column: err.column,
+                            }],
+                        };
+                    }
+                }
+            }
+            None => match std::fs::read_to_string(file_path) {
+                Ok(source) => source,
+                Err(err) => {
+                    return self.error_module(&format!(
+                        "Failed to read CSS file '{}': {}",
+                        file_path.display(),
+                        err
+                    ));
+                }
+            },
+        };
+
+        let code = crate::server::css_server::css_to_js_module(&processed_css, url_path);
+        let mtime = std::fs::metadata(file_path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        self.cache.insert(
+            file_path.to_path_buf(),
+            CachedModule {
+                code: code.clone(),
+                source_map: None,
+                css: None,
+                mtime,
+            },
+        );
+
+        BrowserCompileResult {
+            code,
+            source_map: None,
+            css: None,
+            errors: vec![],
+        }
+    }
+
     /// Get a source map for a file path, if cached.
     pub fn get_source_map(&self, file_path: &Path) -> Option<String> {
         self.cache.get(file_path).and_then(|c| c.source_map)
@@ -250,6 +321,18 @@ impl CompilationPipeline {
                 column: None,
             }],
         }
+    }
+
+    fn css_error_module(&self, message: &str) -> String {
+        let escaped = message
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
+
+        format!(
+            "console.error(`[vertz] CSS error: {}`);\nexport default \"\";\n",
+            escaped
+        )
     }
 }
 
@@ -1281,6 +1364,147 @@ export function App() {
 
         assert!(result.code.contains("console.error"));
         assert!(result.code.contains("Compilation error"));
+    }
+
+    #[test]
+    fn test_compile_css_without_postcss_config_returns_style_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let css_file = src_dir.join("app.css");
+        std::fs::write(&css_file, "body { color: red; }\n").unwrap();
+
+        let pipeline = create_pipeline(tmp.path());
+        let result = pipeline.compile_css_for_browser(&css_file, "/src/app.css");
+
+        assert!(result.errors.is_empty());
+        assert!(result.code.contains("body { color: red; }"));
+        assert!(result.code.contains("document.createElement('style')"));
+    }
+
+    #[test]
+    fn test_compile_css_with_postcss_config_processes_css() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let node_modules = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(node_modules.join("postcss")).unwrap();
+        std::fs::create_dir_all(node_modules.join("fake-prefixer")).unwrap();
+
+        std::fs::write(src_dir.join("app.css"), "a { display: flex; }\n").unwrap();
+        std::fs::write(
+            tmp.path().join("postcss.config.js"),
+            "module.exports = { plugins: { 'fake-prefixer': {} } };",
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/package.json"),
+            r#"{"name":"postcss","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/index.js"),
+            r#"module.exports = function postcss(plugins) {
+  return {
+    async process(css, options) {
+      let next = css;
+      for (const plugin of plugins) {
+        if (typeof plugin === "function") {
+          next = await plugin(next, options);
+        }
+      }
+      return { css: next };
+    },
+  };
+};"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("fake-prefixer/package.json"),
+            r#"{"name":"fake-prefixer","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("fake-prefixer/index.js"),
+            r#"module.exports = function fakePrefixer() {
+  return (css) => css.replace("display: flex", "display: -webkit-flex;\n  display: flex");
+};"#,
+        )
+        .unwrap();
+
+        let pipeline = create_pipeline(tmp.path());
+        let result = pipeline.compile_css_for_browser(&src_dir.join("app.css"), "/src/app.css");
+
+        assert!(
+            result.errors.is_empty(),
+            "unexpected errors: {:?}",
+            result.errors
+        );
+        assert!(result.code.contains("display: -webkit-flex;"));
+        assert!(result.code.contains("display: flex;"));
+    }
+
+    #[test]
+    fn test_compile_css_with_postcss_error_returns_error_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let node_modules = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(node_modules.join("postcss")).unwrap();
+        std::fs::create_dir_all(node_modules.join("broken-plugin")).unwrap();
+
+        std::fs::write(src_dir.join("app.css"), "@broken;\n").unwrap();
+        std::fs::write(
+            tmp.path().join("postcss.config.js"),
+            "module.exports = { plugins: { 'broken-plugin': {} } };",
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/package.json"),
+            r#"{"name":"postcss","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/index.js"),
+            r#"module.exports = function postcss(plugins) {
+  return {
+    async process(css, options) {
+      for (const plugin of plugins) {
+        await plugin(css, options);
+      }
+      return { css };
+    },
+  };
+};"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("broken-plugin/package.json"),
+            r#"{"name":"broken-plugin","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("broken-plugin/index.js"),
+            r#"module.exports = function brokenPlugin() {
+  return () => {
+    const error = new Error("Unknown at-rule @broken");
+    error.reason = "Unknown at-rule @broken";
+    error.line = 1;
+    error.column = 1;
+    throw error;
+  };
+};"#,
+        )
+        .unwrap();
+
+        let pipeline = create_pipeline(tmp.path());
+        let result = pipeline.compile_css_for_browser(&src_dir.join("app.css"), "/src/app.css");
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].line, Some(1));
+        assert_eq!(result.errors[0].column, Some(1));
+        assert!(result.code.contains("CSS error"));
+        assert!(pipeline.cache().is_empty());
     }
 
     #[test]

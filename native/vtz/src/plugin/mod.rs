@@ -85,7 +85,19 @@ pub trait FrameworkPlugin: Send + Sync {
 
     /// Files that trigger a full server restart when changed.
     fn restart_triggers(&self) -> Vec<String> {
-        vec!["package.json".into(), "tsconfig.json".into(), ".env".into()]
+        vec![
+            "package.json".into(),
+            "tsconfig.json".into(),
+            ".env".into(),
+            "postcss.config.js".into(),
+            "postcss.config.cjs".into(),
+            "postcss.config.mjs".into(),
+            "postcss.config.ts".into(),
+            "tailwind.config.js".into(),
+            "tailwind.config.cjs".into(),
+            "tailwind.config.mjs".into(),
+            "tailwind.config.ts".into(),
+        ]
     }
 
     /// Public env var prefixes exposed to client code via `import.meta.env`.
@@ -314,6 +326,8 @@ mod tests {
         let triggers = plugin.restart_triggers();
         assert!(triggers.contains(&"package.json".to_string()));
         assert!(triggers.contains(&".env".to_string()));
+        assert!(triggers.contains(&"postcss.config.js".to_string()));
+        assert!(triggers.contains(&"tailwind.config.ts".to_string()));
     }
 
     #[test]
