@@ -35,10 +35,11 @@ pub fn parse_env_file(content: &str) -> HashMap<String, String> {
 
         let raw_value = line[eq_pos + 1..].trim();
 
-        let value = if (raw_value.starts_with('"') && raw_value.ends_with('"'))
-            || (raw_value.starts_with('\'') && raw_value.ends_with('\''))
+        let value = if raw_value.len() >= 2
+            && ((raw_value.starts_with('"') && raw_value.ends_with('"'))
+                || (raw_value.starts_with('\'') && raw_value.ends_with('\'')))
         {
-            // Quoted value — strip quotes
+            // Quoted value — strip quotes (requires at least 2 chars for open+close)
             raw_value[1..raw_value.len() - 1].to_string()
         } else {
             // Unquoted — strip inline comments
@@ -98,7 +99,17 @@ pub fn build_public_env(
 ) -> HashMap<String, String> {
     let mut public = HashMap::new();
 
-    // Add built-in variables
+    // Filter user env vars by prefix FIRST
+    for (key, value) in all_env {
+        if prefixes
+            .iter()
+            .any(|prefix| !prefix.is_empty() && key.starts_with(prefix))
+        {
+            public.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Add built-in variables AFTER so they always take precedence
     public.insert("MODE".to_string(), mode.to_string());
     public.insert(
         "DEV".to_string(),
@@ -119,13 +130,6 @@ pub fn build_public_env(
         .to_string(),
     );
     public.insert("BASE_URL".to_string(), "/".to_string());
-
-    // Filter user env vars by prefix
-    for (key, value) in all_env {
-        if prefixes.iter().any(|prefix| key.starts_with(prefix)) {
-            public.insert(key.clone(), value.clone());
-        }
-    }
 
     public
 }
@@ -357,5 +361,53 @@ mod tests {
 
         // MODE comes from built-in, not from all_env (MODE doesn't have VITE_ prefix)
         assert_eq!(public.get("MODE").unwrap(), "development");
+    }
+
+    #[test]
+    fn test_build_public_env_builtins_win_even_with_matching_prefix() {
+        let mut all_env = HashMap::new();
+        // Even if a user var matches a prefix AND a builtin name,
+        // builtins still take precedence
+        all_env.insert("VITE_MODE".to_string(), "custom".to_string());
+        // This one shouldn't matter since "MODE" doesn't start with "VITE_"
+        // but builtins always win regardless
+        all_env.insert("MODE".to_string(), "custom".to_string());
+
+        let public = build_public_env(&all_env, &["VITE_"], "development");
+        assert_eq!(public.get("MODE").unwrap(), "development");
+        // But VITE_MODE (different key) is still exposed
+        assert_eq!(public.get("VITE_MODE").unwrap(), "custom");
+    }
+
+    #[test]
+    fn test_build_public_env_empty_prefix_ignored() {
+        let mut all_env = HashMap::new();
+        all_env.insert("SECRET_KEY".to_string(), "supersecret".to_string());
+        all_env.insert("VITE_A".to_string(), "1".to_string());
+
+        // Empty prefix should be ignored — don't expose all vars
+        let public = build_public_env(&all_env, &["", "VITE_"], "development");
+
+        assert!(public.contains_key("VITE_A"));
+        assert!(
+            !public.contains_key("SECRET_KEY"),
+            "Empty prefix must not expose all vars"
+        );
+    }
+
+    #[test]
+    fn test_parse_single_char_quoted_value_no_panic() {
+        // A lone quote character should not panic
+        let content = "KEY=\"";
+        let env = parse_env_file(content);
+        // Treated as unquoted value since len < 2 for proper quotes
+        assert_eq!(env.get("KEY").unwrap(), "\"");
+    }
+
+    #[test]
+    fn test_parse_empty_quoted_value() {
+        let content = "KEY=\"\"";
+        let env = parse_env_file(content);
+        assert_eq!(env.get("KEY").unwrap(), "");
     }
 }

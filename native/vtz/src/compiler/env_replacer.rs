@@ -8,9 +8,10 @@ const BOOLEAN_BUILTINS: &[&str] = &["DEV", "PROD"];
 /// - `import.meta.env.KEY` → literal value (string-quoted or boolean)
 /// - `import.meta.env` (whole object) → `Object.freeze({...})`
 ///
-/// Does not replace inside string literals or single-line comments.
+/// Does not replace inside string literals, comments, or template literal
+/// raw text (but does replace inside template literal `${...}` expressions).
 pub fn replace_import_meta_env(code: &str, env: &HashMap<String, String>) -> String {
-    let pattern = "import.meta.env";
+    let pattern: Vec<char> = "import.meta.env".chars().collect();
     let chars: Vec<char> = code.chars().collect();
     let len = chars.len();
     let mut result = String::with_capacity(code.len());
@@ -41,8 +42,8 @@ pub fn replace_import_meta_env(code: &str, env: &HashMap<String, String>) -> Str
             continue;
         }
 
-        // Skip string literals (single, double, template)
-        if chars[i] == '\'' || chars[i] == '"' || chars[i] == '`' {
+        // Skip single/double quoted string literals
+        if chars[i] == '\'' || chars[i] == '"' {
             let quote = chars[i];
             result.push(chars[i]);
             i += 1;
@@ -66,10 +67,29 @@ pub fn replace_import_meta_env(code: &str, env: &HashMap<String, String>) -> Str
             continue;
         }
 
+        // Handle template literals — skip raw text but process ${...} expressions
+        if chars[i] == '`' {
+            result.push(chars[i]);
+            i += 1;
+            i = scan_template_literal(&chars, i, len, env, &pattern, &mut result);
+            continue;
+        }
+
         // Check for `import.meta.env`
-        let pat_chars: Vec<char> = pattern.chars().collect();
-        if i + pat_chars.len() <= len && matches_at(&chars, i, &pat_chars) {
-            let after_pattern = i + pat_chars.len();
+        if i + pattern.len() <= len && matches_at(&chars, i, &pattern) {
+            let after_pattern = i + pattern.len();
+
+            // Guard: must NOT be followed by an identifier char (e.g. `import.meta.envFoo`)
+            // Only `.` (property access) or non-identifier chars are valid
+            if after_pattern < len
+                && chars[after_pattern] != '.'
+                && is_ident_char(chars[after_pattern])
+            {
+                // Not a real `import.meta.env` — it's `import.meta.envXXX`
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
 
             // Check if followed by `.KEY`
             if after_pattern < len && chars[after_pattern] == '.' {
@@ -98,6 +118,155 @@ pub fn replace_import_meta_env(code: &str, env: &HashMap<String, String>) -> Str
     result
 }
 
+/// Scan a template literal body (after the opening backtick).
+/// Copies raw text to result, and recursively processes `${...}` expressions
+/// so that `import.meta.env` inside expressions is replaced.
+/// Returns the position after the closing backtick.
+fn scan_template_literal(
+    chars: &[char],
+    mut i: usize,
+    len: usize,
+    env: &HashMap<String, String>,
+    pattern: &[char],
+    result: &mut String,
+) -> usize {
+    while i < len {
+        // End of template literal
+        if chars[i] == '`' {
+            result.push(chars[i]);
+            return i + 1;
+        }
+
+        // Escaped character
+        if chars[i] == '\\' {
+            result.push(chars[i]);
+            i += 1;
+            if i < len {
+                result.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Template expression: ${...}
+        if i + 1 < len && chars[i] == '$' && chars[i + 1] == '{' {
+            result.push('$');
+            result.push('{');
+            i += 2;
+            // Process the expression content (may contain import.meta.env)
+            i = scan_template_expression(chars, i, len, env, pattern, result);
+            continue;
+        }
+
+        // Regular template text
+        result.push(chars[i]);
+        i += 1;
+    }
+    i
+}
+
+/// Scan a template expression (after `${`). Processes content including
+/// `import.meta.env` replacement. Handles nested braces and string literals.
+/// Returns the position after the closing `}`.
+fn scan_template_expression(
+    chars: &[char],
+    mut i: usize,
+    len: usize,
+    env: &HashMap<String, String>,
+    pattern: &[char],
+    result: &mut String,
+) -> usize {
+    let mut brace_depth = 1;
+
+    while i < len && brace_depth > 0 {
+        if chars[i] == '{' {
+            brace_depth += 1;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '}' {
+            brace_depth -= 1;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Skip string literals inside expression
+        if chars[i] == '\'' || chars[i] == '"' {
+            let quote = chars[i];
+            result.push(chars[i]);
+            i += 1;
+            while i < len && chars[i] != quote {
+                if chars[i] == '\\' {
+                    result.push(chars[i]);
+                    i += 1;
+                    if i < len {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                result.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                result.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Nested template literal inside expression
+        if chars[i] == '`' {
+            result.push(chars[i]);
+            i += 1;
+            i = scan_template_literal(chars, i, len, env, pattern, result);
+            continue;
+        }
+
+        // Check for `import.meta.env` inside the expression
+        if i + pattern.len() <= len && matches_at(chars, i, pattern) {
+            let after_pattern = i + pattern.len();
+
+            // Guard against partial match (e.g. `import.meta.envFoo`)
+            if after_pattern < len
+                && chars[after_pattern] != '.'
+                && is_ident_char(chars[after_pattern])
+            {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+
+            // Check for `.KEY` access
+            if after_pattern < len && chars[after_pattern] == '.' {
+                let key_start = after_pattern + 1;
+                let key_end = scan_identifier(chars, key_start, len);
+                if key_end > key_start {
+                    let key: String = chars[key_start..key_end].iter().collect();
+                    if let Some(value) = env.get(&key) {
+                        result.push_str(&format_env_value(&key, value));
+                        i = key_end;
+                        continue;
+                    }
+                }
+            }
+
+            // Whole object
+            result.push_str(&format_env_object(env));
+            i = after_pattern;
+            continue;
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    i
+}
+
 /// Format a single env value as a JS literal.
 ///
 /// Boolean built-ins (DEV, PROD) are emitted as unquoted `true`/`false`.
@@ -116,7 +285,7 @@ fn format_env_object(env: &HashMap<String, String>) -> String {
         .iter()
         .map(|(k, v)| {
             let formatted_value = format_env_value(k, v);
-            format!("\"{}\":{}", k, formatted_value)
+            format!("\"{}\":{}", escape_js_string(k), formatted_value)
         })
         .collect();
     entries.sort(); // deterministic output
@@ -129,6 +298,8 @@ fn escape_js_string(s: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+        .replace('\0', "\\0")
+        .replace('\t', "\\t")
 }
 
 fn collect_chars(chars: &[char], start: usize, end: usize) -> String {
@@ -147,10 +318,14 @@ fn matches_at(chars: &[char], pos: usize, pattern: &[char]) -> bool {
     true
 }
 
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
 /// Scan an identifier starting at `pos`. Returns the end position.
 fn scan_identifier(chars: &[char], pos: usize, len: usize) -> usize {
     let mut end = pos;
-    while end < len && (chars[end].is_alphanumeric() || chars[end] == '_' || chars[end] == '$') {
+    while end < len && is_ident_char(chars[end]) {
         end += 1;
     }
     end
@@ -263,9 +438,38 @@ mod tests {
     }
 
     #[test]
-    fn test_no_replace_in_template_literal() {
+    fn test_no_replace_in_template_literal_text() {
         let env = test_env();
         let code = "const s = `import.meta.env.DEV`;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(result, code);
+    }
+
+    // ── Template literal expression replacement ────────────
+
+    #[test]
+    fn test_replace_in_template_literal_expression() {
+        let env = test_env();
+        let code = "const s = `Value: ${import.meta.env.DEV}`;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(result, "const s = `Value: ${true}`;");
+    }
+
+    #[test]
+    fn test_replace_string_var_in_template_expression() {
+        let env = test_env();
+        let code = "const s = `API: ${import.meta.env.VITE_API_URL}/endpoint`;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(
+            result,
+            r#"const s = `API: ${"https://api.example.com"}/endpoint`;"#
+        );
+    }
+
+    #[test]
+    fn test_no_replace_partial_match_in_template_expression() {
+        let env = test_env();
+        let code = "const s = `${import.meta.envFoo}`;";
         let result = replace_import_meta_env(code, &env);
         assert_eq!(result, code);
     }
@@ -307,6 +511,27 @@ mod tests {
         let code = "const x = 1;\nfunction foo() { return x + 2; }";
         let result = replace_import_meta_env(code, &env);
         assert_eq!(result, code);
+    }
+
+    // ── Partial identifier match guard ─────────────────────
+
+    #[test]
+    fn test_no_replace_import_meta_env_foo() {
+        let env = test_env();
+        let code = "const x = import.meta.envFoo;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(result, code, "import.meta.envFoo must not be replaced");
+    }
+
+    #[test]
+    fn test_no_replace_import_meta_env_dev_no_dot() {
+        let env = test_env();
+        let code = "const x = import.meta.envDEV;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(
+            result, code,
+            "import.meta.envDEV must not be replaced (no dot)"
+        );
     }
 
     // ── Edge cases ─────────────────────────────────────────
@@ -359,5 +584,25 @@ mod tests {
         let result = replace_import_meta_env(code, &env);
         assert!(result.contains("Object.freeze("));
         assert!(result.contains("\"DEV\":true"));
+    }
+
+    #[test]
+    fn test_value_with_null_byte_escaped() {
+        let mut env = HashMap::new();
+        env.insert("VITE_X".to_string(), "a\0b".to_string());
+
+        let code = "const x = import.meta.env.VITE_X;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(result, r#"const x = "a\0b";"#);
+    }
+
+    #[test]
+    fn test_value_with_tab_escaped() {
+        let mut env = HashMap::new();
+        env.insert("VITE_X".to_string(), "a\tb".to_string());
+
+        let code = "const x = import.meta.env.VITE_X;";
+        let result = replace_import_meta_env(code, &env);
+        assert_eq!(result, r#"const x = "a\tb";"#);
     }
 }
