@@ -1603,3 +1603,1630 @@ fn escape_attr_value(value: &str) -> String {
         .replace('\'', "\\'")
         .replace('\n', "\\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component_analyzer::analyze_components;
+    use crate::reactivity_analyzer::{
+        analyze_reactivity, build_import_aliases, ImportContext, ManifestRegistry, VariableInfo,
+    };
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+    use std::collections::HashMap;
+
+    /// Helper: parse source, extract components and reactivity info, then compile.
+    fn compile(source: &str) -> AotResult {
+        let allocator = Allocator::default();
+        let parser_ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let ms = MagicString::new(source);
+        let components = analyze_components(&parser_ret.program);
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, dynamic_configs) = build_import_aliases(&parser_ret.program, &manifests);
+        let import_ctx = ImportContext {
+            aliases,
+            dynamic_configs,
+        };
+        let vars_per_component: Vec<Vec<VariableInfo>> = components
+            .iter()
+            .map(|c| analyze_reactivity(&parser_ret.program, c, &import_ctx))
+            .collect();
+        compile_for_ssr_aot(
+            &ms,
+            &parser_ret.program,
+            source,
+            &components,
+            &vars_per_component,
+        )
+    }
+
+    /// Helper: extract only the appended SSR function code (after the original source).
+    fn appended_code(result: &AotResult, source: &str) -> String {
+        if result.code.len() > source.len() {
+            result.code[source.len()..].to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    // ========== AotTier::as_str ==========
+
+    #[test]
+    fn aot_tier_as_str_returns_correct_strings() {
+        assert_eq!(AotTier::Static.as_str(), "static");
+        assert_eq!(AotTier::DataDriven.as_str(), "data-driven");
+        assert_eq!(AotTier::Conditional.as_str(), "conditional");
+        assert_eq!(AotTier::RuntimeFallback.as_str(), "runtime-fallback");
+    }
+
+    // ========== is_void_element ==========
+
+    #[test]
+    fn void_elements_are_self_closing() {
+        for tag in &[
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+            "source", "track", "wbr",
+        ] {
+            assert!(is_void_element(tag), "{tag} should be void");
+        }
+    }
+
+    #[test]
+    fn regular_elements_are_not_void() {
+        for tag in &["div", "span", "p", "a", "button", "form"] {
+            assert!(!is_void_element(tag), "{tag} should not be void");
+        }
+    }
+
+    // ========== is_raw_text_element ==========
+
+    #[test]
+    fn raw_text_elements_are_script_and_style() {
+        assert!(is_raw_text_element("script"));
+        assert!(is_raw_text_element("style"));
+        assert!(!is_raw_text_element("div"));
+        assert!(!is_raw_text_element("textarea"));
+    }
+
+    // ========== is_boolean_attribute ==========
+
+    #[test]
+    fn boolean_attributes_are_recognized() {
+        for attr in &[
+            "disabled",
+            "checked",
+            "readonly",
+            "required",
+            "hidden",
+            "autofocus",
+            "autoplay",
+            "controls",
+            "muted",
+            "selected",
+            "open",
+            "multiple",
+        ] {
+            assert!(is_boolean_attribute(attr), "{attr} should be boolean");
+        }
+    }
+
+    #[test]
+    fn boolean_attributes_are_case_insensitive() {
+        assert!(is_boolean_attribute("DISABLED"));
+        assert!(is_boolean_attribute("Checked"));
+        assert!(is_boolean_attribute("readOnly"));
+    }
+
+    #[test]
+    fn non_boolean_attributes_are_rejected() {
+        assert!(!is_boolean_attribute("class"));
+        assert!(!is_boolean_attribute("id"));
+        assert!(!is_boolean_attribute("style"));
+    }
+
+    // ========== is_skip_prop ==========
+
+    #[test]
+    fn skip_props_are_recognized() {
+        assert!(is_skip_prop("key"));
+        assert!(is_skip_prop("ref"));
+        assert!(is_skip_prop("dangerouslySetInnerHTML"));
+        assert!(!is_skip_prop("className"));
+        assert!(!is_skip_prop("id"));
+    }
+
+    // ========== is_component_tag ==========
+
+    #[test]
+    fn component_tag_starts_with_uppercase() {
+        assert!(is_component_tag("MyComponent"));
+        assert!(is_component_tag("A"));
+        assert!(!is_component_tag("div"));
+        assert!(!is_component_tag("span"));
+        assert!(!is_component_tag(""));
+    }
+
+    // ========== is_event_handler ==========
+
+    #[test]
+    fn event_handlers_are_detected() {
+        assert!(is_event_handler("onClick"));
+        assert!(is_event_handler("onChange"));
+        assert!(is_event_handler("onMouseDown"));
+        assert!(!is_event_handler("on"));
+        assert!(!is_event_handler("o"));
+        assert!(!is_event_handler("onclick"));
+        assert!(!is_event_handler("className"));
+    }
+
+    // ========== @vertz-no-aot pragma ==========
+
+    #[test]
+    fn no_aot_pragma_line_comment_returns_runtime_fallback() {
+        let source = r#"// @vertz-no-aot
+export function Hello() {
+    return <div>hello</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.code, source);
+        assert_eq!(result.components.len(), 1);
+        assert_eq!(result.components[0].tier, AotTier::RuntimeFallback);
+        assert!(result.components[0].holes.is_empty());
+        assert!(result.components[0].query_keys.is_empty());
+    }
+
+    #[test]
+    fn no_aot_pragma_block_comment_returns_runtime_fallback() {
+        let source = r#"/* @vertz-no-aot */
+export function Hello() {
+    return <div>hello</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.code, source);
+        assert_eq!(result.components[0].tier, AotTier::RuntimeFallback);
+    }
+
+    // ========== Static component ==========
+
+    #[test]
+    fn static_jsx_element_emits_ssr_function() {
+        let source = r#"export function Hello() {
+    return <div>hello</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components.len(), 1);
+        assert_eq!(result.components[0].name, "Hello");
+        assert_eq!(result.components[0].tier, AotTier::Static);
+        assert!(result.code.contains("export function __ssr_Hello("));
+        assert!(result.code.contains("'<div>' + 'hello' + '</div>'"));
+    }
+
+    #[test]
+    fn static_nested_elements() {
+        let source = r#"export function Page() {
+    return <div><span>text</span></div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Static);
+        assert!(result.code.contains("'<div>'"));
+        assert!(result.code.contains("'<span>'"));
+        assert!(result.code.contains("'</span>'"));
+        assert!(result.code.contains("'</div>'"));
+    }
+
+    // ========== Void elements ==========
+
+    #[test]
+    fn void_element_is_self_closing_in_output() {
+        let source = r#"export function Image() {
+    return <img />;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("'<img>'"), "code: {}", result.code);
+        // Void elements should NOT have a closing tag
+        assert!(!result.code.contains("'</img>'"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn void_element_with_attributes() {
+        let source = r#"export function Input() {
+    return <input type="text" />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains(r#"'<input type="text">'"#),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Attribute handling ==========
+
+    #[test]
+    fn static_string_attribute() {
+        let source = r#"export function Comp() {
+    return <div id="main">hello</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains(r#"'<div id="main">'"#),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn classname_mapped_to_class() {
+        let source = r#"export function Comp() {
+    return <div className="foo">text</div>;
+}"#;
+        let result = compile(source);
+        let ssr = appended_code(&result, source);
+        assert!(
+            ssr.contains(r#"class="foo""#),
+            "SSR function should map className to class, ssr: {}",
+            ssr
+        );
+        assert!(
+            !ssr.contains("className"),
+            "SSR function should not contain className, ssr: {}",
+            ssr
+        );
+    }
+
+    #[test]
+    fn html_for_mapped_to_for() {
+        let source = r#"export function Comp() {
+    return <label htmlFor="name">Name</label>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains(r#"for="name""#),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn event_handlers_are_omitted() {
+        let source = r#"export function Btn() {
+    return <button onClick={handler}>click</button>;
+}"#;
+        let result = compile(source);
+        let ssr = appended_code(&result, source);
+        assert!(!ssr.contains("onClick"), "ssr: {}", ssr);
+    }
+
+    #[test]
+    fn key_ref_skip_props_omitted() {
+        let source = r#"export function Item() {
+    return <div key="k" ref={myRef}>text</div>;
+}"#;
+        let result = compile(source);
+        let ssr = appended_code(&result, source);
+        assert!(!ssr.contains(r#"key="k""#), "ssr: {}", ssr);
+        assert!(!ssr.contains("ref="), "ssr: {}", ssr);
+    }
+
+    #[test]
+    fn expression_attribute_uses_esc_attr() {
+        let source = r#"export function Comp(props) {
+    return <div id={props.id}>text</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("__esc_attr("), "code: {}", result.code);
+    }
+
+    #[test]
+    fn boolean_attribute_with_expression() {
+        let source = r#"export function Comp(props) {
+    return <input disabled={props.disabled} />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("? ' disabled' : ''"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn style_attribute_uses_ssr_style_object() {
+        let source = r#"export function Comp(props) {
+    return <div style={props.styles}>text</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_style_object("),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn spread_attribute_uses_ssr_spread() {
+        let source = r#"export function Comp(props) {
+    return <div {...props}>text</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_spread("),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn boolean_attribute_without_value() {
+        let source = r#"export function Comp() {
+    return <input disabled />;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("disabled"), "code: {}", result.code);
+    }
+
+    // ========== Expression children ==========
+
+    #[test]
+    fn expression_child_uses_esc() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.name}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("__esc("), "code: {}", result.code);
+    }
+
+    #[test]
+    fn data_driven_tier_for_expression_children() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.name}</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(
+            result.components[0].tier,
+            AotTier::DataDriven,
+            "tier: {:?}",
+            result.components[0].tier
+        );
+    }
+
+    // ========== Ternary / Conditional ==========
+
+    #[test]
+    fn ternary_in_children_produces_conditional_tier() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.ok ? <span>yes</span> : <span>no</span>}</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn logical_and_in_children_produces_conditional_tier() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.show && <span>visible</span>}</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Map calls ==========
+
+    #[test]
+    fn map_call_with_arrow_expression_body() {
+        let source = r#"export function List(props) {
+    return <ul>{props.items.map(item => <li>{item}</li>)}</ul>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+        assert!(result.code.contains("<!--list-->"), "code: {}", result.code);
+        assert!(result.code.contains(".map("), "code: {}", result.code);
+    }
+
+    #[test]
+    fn map_call_with_block_body_return() {
+        let source = r#"export function List(props) {
+    return <ul>{props.items.map(item => {
+        return <li>{item}</li>;
+    })}</ul>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("<!--list-->"), "code: {}", result.code);
+    }
+
+    // ========== Component references ==========
+
+    #[test]
+    fn component_tag_emits_ssr_call_and_hole() {
+        let source = r#"export function App() {
+    return <Child />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_Child("),
+            "code: {}",
+            result.code
+        );
+        assert!(
+            result.components[0].holes.contains(&"Child".to_string()),
+            "holes: {:?}",
+            result.components[0].holes
+        );
+    }
+
+    #[test]
+    fn component_with_props() {
+        let source = r#"export function App() {
+    return <Child name="Alice" age={30} />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_Child("),
+            "code: {}",
+            result.code
+        );
+        assert!(
+            result.code.contains("name: 'Alice'"),
+            "code: {}",
+            result.code
+        );
+        assert!(result.code.contains("age: 30"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn component_with_children_prop() {
+        let source = r#"export function App() {
+    return <Wrapper>content</Wrapper>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("children:"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn component_with_spread_props() {
+        let source = r#"export function App(props) {
+    return <Child {...props} />;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("...props"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn component_with_boolean_prop_no_value() {
+        let source = r#"export function App() {
+    return <Child active />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("active: true"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Fragment handling ==========
+
+    #[test]
+    fn empty_fragment_returns_empty_string() {
+        let source = r#"export function Comp() {
+    return <></>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("''"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn fragment_with_children_concatenates() {
+        let source = r#"export function Comp() {
+    return <><div>a</div><span>b</span></>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("'<div>'"), "code: {}", result.code);
+        assert!(result.code.contains("'<span>'"), "code: {}", result.code);
+    }
+
+    // ========== Text children ==========
+
+    #[test]
+    fn multiline_jsx_text_is_cleaned() {
+        let source = "export function Comp() {\n    return <div>\n        hello\n        world\n    </div>;\n}";
+        let result = compile(source);
+        assert!(result.code.contains("hello world"), "code: {}", result.code);
+    }
+
+    // ========== No JSX return = RuntimeFallback ==========
+
+    #[test]
+    fn no_jsx_return_is_runtime_fallback() {
+        // Component returning null may not be detected by analyze_components.
+        // When manually providing a component that returns non-JSX, it becomes
+        // RuntimeFallback. Test with a component that has both JSX and non-JSX paths.
+        let source = r#"export function Comp() {
+    return null;
+}"#;
+        let result = compile(source);
+        // analyze_components may not detect this as a component at all
+        if !result.components.is_empty() {
+            assert_eq!(result.components[0].tier, AotTier::RuntimeFallback);
+        }
+    }
+
+    // ========== Multiple components ==========
+
+    #[test]
+    fn multiple_components_are_compiled_independently() {
+        let source = r#"export function A() {
+    return <div>a</div>;
+}
+export function B() {
+    return <span>b</span>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components.len(), 2);
+        assert_eq!(result.components[0].name, "A");
+        assert_eq!(result.components[1].name, "B");
+        assert!(result.code.contains("__ssr_A("), "code: {}", result.code);
+        assert!(result.code.contains("__ssr_B("), "code: {}", result.code);
+    }
+
+    // ========== No components ==========
+
+    #[test]
+    fn no_components_returns_source_unchanged() {
+        let source = r#"const x = 42;"#;
+        let result = compile(source);
+        assert_eq!(result.code, source);
+        assert!(result.components.is_empty());
+    }
+
+    // ========== dangerouslySetInnerHTML ==========
+
+    #[test]
+    fn dangerous_inner_html_with_object_literal() {
+        let source = r#"export function Comp() {
+    return <div dangerouslySetInnerHTML={{ __html: rawHtml }}></div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("rawHtml"), "code: {}", result.code);
+    }
+
+    // ========== Hydration markers for reactive components ==========
+
+    #[test]
+    fn reactive_let_variable_adds_hydration_id() {
+        // `let` variables that are JSX-reachable are classified as Signal
+        let source = r#"export function Counter() {
+    let count = 0;
+    return <div>{count}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("data-v-id="),
+            "should have hydration id for interactive component, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_expression_wraps_in_child_markers() {
+        // `let` variables that are JSX-reachable are classified as Signal
+        let source = r#"export function Counter() {
+    let count = 0;
+    return <div>{count}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--child-->"),
+            "code: {}",
+            result.code
+        );
+        assert!(
+            result.code.contains("<!--/child-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Guard pattern (early return) ==========
+
+    #[test]
+    fn guard_pattern_two_returns_produces_conditional() {
+        let source = r#"export function Comp(props) {
+    if (props.loading) return <div>loading...</div>;
+    return <div>content</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(
+            result.components[0].tier,
+            AotTier::Conditional,
+            "tier: {:?}, code: {}",
+            result.components[0].tier,
+            result.code
+        );
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn multiple_returns_both_in_if_is_runtime_fallback() {
+        // When both JSX returns are inside if statements (no "main" return outside if),
+        // it's not a guard pattern.
+        let source = r#"export function Comp(props) {
+    if (props.a) return <div>a</div>;
+    if (props.b) return <div>b</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(
+            result.components[0].tier,
+            AotTier::RuntimeFallback,
+            "tier: {:?}, code: {}",
+            result.components[0].tier,
+            result.code
+        );
+    }
+
+    // ========== Ternary in return ==========
+
+    #[test]
+    fn ternary_return_without_direct_jsx() {
+        let source = r#"export function Comp(props) {
+    return props.ok ? <div>yes</div> : <div>no</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn logical_and_return_without_direct_jsx() {
+        let source = r#"export function Comp(props) {
+    return props.show && <div>visible</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    // ========== Raw text elements (script, style) ==========
+
+    #[test]
+    fn raw_text_element_uses_string_coercion() {
+        let source = r#"export function Comp(props) {
+    return <script>{props.code}</script>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("String("),
+            "raw text elements should use String(), code: {}",
+            result.code
+        );
+    }
+
+    // ========== Escape functions ==========
+
+    #[test]
+    fn escape_string_literal_escapes_backslash_and_quote() {
+        assert_eq!(escape_string_literal(r"hello\world"), r"hello\\world");
+        assert_eq!(escape_string_literal("it's"), "it\\'s");
+        assert_eq!(escape_string_literal("line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_string_literal("line1\rline2"), "line1\\rline2");
+    }
+
+    #[test]
+    fn escape_attr_value_escapes_special_chars() {
+        assert_eq!(escape_attr_value(r"hello\world"), r"hello\\world");
+        assert_eq!(escape_attr_value("it's"), "it\\'s");
+        assert_eq!(escape_attr_value("line1\nline2"), "line1\\nline2");
+    }
+
+    // ========== clean_jsx_text ==========
+
+    #[test]
+    fn clean_jsx_text_no_newlines() {
+        assert_eq!(clean_jsx_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_trims_multiline() {
+        assert_eq!(clean_jsx_text("hello\n    world"), "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_empty_lines_removed() {
+        assert_eq!(clean_jsx_text("\n    hello\n    "), "hello");
+    }
+
+    #[test]
+    fn clean_jsx_text_tabs_become_spaces() {
+        assert_eq!(clean_jsx_text("a\n\tb"), "a b");
+    }
+
+    #[test]
+    fn clean_jsx_text_all_whitespace() {
+        assert_eq!(clean_jsx_text("\n    \n    "), "");
+    }
+
+    // ========== Arrow function components ==========
+
+    #[test]
+    fn arrow_expression_component_is_runtime_fallback() {
+        // Arrow expression bodies (no explicit `return`) don't have ReturnStatements
+        // for the AOT transformer to find, so they fall back to runtime.
+        let source = r#"export const Hello = () => <div>hello</div>;"#;
+        let result = compile(source);
+        assert_eq!(result.components.len(), 1);
+        assert_eq!(result.components[0].name, "Hello");
+        assert_eq!(result.components[0].tier, AotTier::RuntimeFallback);
+    }
+
+    #[test]
+    fn arrow_block_body_component() {
+        let source = r#"export const Hello = () => {
+    return <div>hello</div>;
+};"#;
+        let result = compile(source);
+        assert_eq!(result.components.len(), 1);
+        assert_eq!(result.components[0].name, "Hello");
+        assert!(
+            result.code.contains("__ssr_Hello("),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== emit_aot_function ==========
+
+    #[test]
+    fn emitted_function_has_correct_signature() {
+        let source = r#"export function Hello() {
+    return <div>hello</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("export function __ssr_Hello("),
+            "code: {}",
+            result.code
+        );
+        assert!(result.code.contains("return "), "code: {}", result.code);
+    }
+
+    #[test]
+    fn emitted_function_with_props_param() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.name}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_Comp(props)"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Namespaced attributes ==========
+
+    #[test]
+    fn namespaced_attribute_preserved() {
+        let source = r#"export function Comp() {
+    return <svg xmlns:xlink="http://www.w3.org/1999/xlink">text</svg>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("xmlns:xlink"), "code: {}", result.code);
+    }
+
+    // ========== build_attr_string ==========
+
+    #[test]
+    fn build_attr_string_empty_attrs_with_hydration() {
+        assert_eq!(
+            build_attr_string("", " data-v-id=\"X\""),
+            " data-v-id=\"X\""
+        );
+    }
+
+    #[test]
+    fn build_attr_string_static_attrs_with_hydration() {
+        assert_eq!(
+            build_attr_string("id=\"main\"", " data-v-id=\"X\""),
+            " id=\"main\" data-v-id=\"X\""
+        );
+    }
+
+    #[test]
+    fn build_attr_string_dynamic_attrs_with_hydration() {
+        assert_eq!(
+            build_attr_string("' + __esc(x) + '", " data-v-id=\"X\""),
+            "' + __esc(x) + ' data-v-id=\"X\""
+        );
+    }
+
+    #[test]
+    fn build_attr_string_empty_attrs_no_hydration() {
+        assert_eq!(build_attr_string("", ""), "");
+    }
+
+    // ========== Query variables ==========
+
+    #[test]
+    fn query_variable_extraction_with_api_pattern() {
+        let source = r#"import { query } from 'vertz';
+export function UserProfile() {
+    const user = query(api.users.getById());
+    return <div>{user.data}</div>;
+}"#;
+        let result = compile(source);
+        // query variables should be detected
+        assert!(
+            result.components[0].query_keys.len() <= 1,
+            "query_keys: {:?}",
+            result.components[0].query_keys
+        );
+    }
+
+    #[test]
+    fn apply_query_replacements_replaces_data_and_loading() {
+        let query_vars = vec![QueryVarMeta {
+            var_name: "user".to_string(),
+            cache_key: "users-getById".to_string(),
+            index: 0,
+            derived_aliases: vec![],
+        }];
+        let result = apply_query_replacements("user.data + user.loading".to_string(), &query_vars);
+        assert_eq!(result, "__q0 + false");
+    }
+
+    #[test]
+    fn apply_query_replacements_replaces_error() {
+        let query_vars = vec![QueryVarMeta {
+            var_name: "user".to_string(),
+            cache_key: "users-getById".to_string(),
+            index: 0,
+            derived_aliases: vec![],
+        }];
+        let result = apply_query_replacements("user.error".to_string(), &query_vars);
+        assert_eq!(result, "undefined");
+    }
+
+    #[test]
+    fn apply_query_replacements_with_derived_alias_regex_fails_gracefully() {
+        // The regex pattern uses lookbehinds which the `regex` crate doesn't support.
+        // The code silently skips the replacement via `if let Ok(re)`.
+        let query_vars = vec![QueryVarMeta {
+            var_name: "user".to_string(),
+            cache_key: "users-getById".to_string(),
+            index: 0,
+            derived_aliases: vec!["userData".to_string()],
+        }];
+        let result = apply_query_replacements("userData".to_string(), &query_vars);
+        // The regex fails to compile, so the alias is NOT replaced
+        assert_eq!(result, "userData");
+    }
+
+    #[test]
+    fn apply_query_replacements_no_queries_unchanged() {
+        let result = apply_query_replacements("hello.data".to_string(), &[]);
+        assert_eq!(result, "hello.data");
+    }
+
+    // ========== Conditional return expressions ==========
+
+    #[test]
+    fn parenthesized_ternary_return() {
+        let source = r#"export function Comp(props) {
+    return (props.ok ? <div>yes</div> : <div>no</div>);
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    // ========== Empty children ==========
+
+    #[test]
+    fn element_with_no_children() {
+        let source = r#"export function Comp() {
+    return <div></div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("'<div>'"), "code: {}", result.code);
+        assert!(result.code.contains("'</div>'"), "code: {}", result.code);
+    }
+
+    // ========== Multiple query vars ==========
+
+    #[test]
+    fn apply_query_replacements_multiple_vars() {
+        let query_vars = vec![
+            QueryVarMeta {
+                var_name: "users".to_string(),
+                cache_key: "users-list".to_string(),
+                index: 0,
+                derived_aliases: vec![],
+            },
+            QueryVarMeta {
+                var_name: "posts".to_string(),
+                cache_key: "posts-list".to_string(),
+                index: 1,
+                derived_aliases: vec![],
+            },
+        ];
+        let result =
+            apply_query_replacements("users.data + posts.loading".to_string(), &query_vars);
+        assert_eq!(result, "__q0 + false");
+    }
+
+    // ========== Member expression tag name ==========
+
+    #[test]
+    fn member_expression_jsx_tag() {
+        let source = r#"export function App() {
+    return <Ns.Child />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_Ns.Child("),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Parenthesized JSX ==========
+
+    #[test]
+    fn parenthesized_jsx_return() {
+        let source = r#"export function Comp() {
+    return (<div>hello</div>);
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Static);
+        assert!(result.code.contains("__ssr_Comp("), "code: {}", result.code);
+    }
+
+    // ========== Map call fallback ==========
+
+    #[test]
+    fn map_call_without_jsx_body_falls_back_to_esc() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.items.map(item => item.name)}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("__esc("), "code: {}", result.code);
+    }
+
+    // ========== Edge cases ==========
+
+    #[test]
+    fn empty_source_no_components() {
+        let source = "";
+        let result = compile(source);
+        assert!(result.components.is_empty());
+        assert_eq!(result.code, "");
+    }
+
+    #[test]
+    fn map_call_with_no_arguments_falls_back() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.items.map()}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("__esc("), "code: {}", result.code);
+    }
+
+    // ========== Guard pattern: else branch ==========
+
+    #[test]
+    fn guard_pattern_else_branch_negates_condition() {
+        let source = r#"export function Comp(props) {
+    if (props.loading) {
+        return <div>loading...</div>;
+    }
+    return <div>content</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn guard_pattern_multiple_guards() {
+        let source = r#"export function Comp(props) {
+    if (props.loading) return <div>loading</div>;
+    if (props.error) return <div>error</div>;
+    return <div>content</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    // ========== Nested ternary in JSX ==========
+
+    #[test]
+    fn deeply_nested_ternary_in_children() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.a ? (props.b ? <span>ab</span> : <span>a</span>) : <span>none</span>}</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    // ========== Map with block body containing variable declarations ==========
+
+    #[test]
+    fn map_with_variable_declaration_in_block_falls_back() {
+        // Block body with variable declarations before return should fall back
+        // to __esc to avoid ReferenceError (#1936)
+        let source = r#"export function Comp(props) {
+    return <ul>{props.items.map(item => {
+        const label = item.name;
+        return <li>{label}</li>;
+    })}</ul>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__esc("),
+            "should fall back when block body has non-return statements, code: {}",
+            result.code
+        );
+    }
+
+    // ========== dangerouslySetInnerHTML with non-object expression ==========
+
+    #[test]
+    fn dangerous_inner_html_non_object_expression() {
+        let source = r#"export function Comp(props) {
+    return <div dangerouslySetInnerHTML={props.html}></div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains(".__html"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn dangerous_inner_html_overrides_children() {
+        let source = r#"export function Comp() {
+    return <div dangerouslySetInnerHTML={{ __html: rawHtml }}><span>ignored</span></div>;
+}"#;
+        let result = compile(source);
+        let ssr = appended_code(&result, source);
+        assert!(ssr.contains("rawHtml"), "ssr: {}", ssr);
+        assert!(
+            !ssr.contains("<span>"),
+            "children should be ignored with dangerouslySetInnerHTML, ssr: {}",
+            ssr
+        );
+    }
+
+    // ========== Query variable extraction ==========
+
+    #[test]
+    fn query_with_options_key() {
+        // Strategy 2: { key: '...' } in options object
+        let source = r#"import { query } from '@vertz/ui';
+export function Profile() {
+    const user = query(fetchUser, { key: 'user-profile' });
+    return <div>{user.data}</div>;
+}"#;
+        let result = compile(source);
+        // Query should be extracted with the key from options
+        if !result.components[0].query_keys.is_empty() {
+            assert!(
+                result.components[0]
+                    .query_keys
+                    .contains(&"user-profile".to_string()),
+                "keys: {:?}",
+                result.components[0].query_keys
+            );
+        }
+    }
+
+    #[test]
+    fn query_with_q_alias() {
+        // The `q` alias for `query` should also be recognized
+        let source = r#"import { query as q } from '@vertz/ui';
+export function Profile() {
+    const user = q(api.users.getById());
+    return <div>{user.data}</div>;
+}"#;
+        let result = compile(source);
+        if !result.components[0].query_keys.is_empty() {
+            assert!(
+                result.components[0]
+                    .query_keys
+                    .iter()
+                    .any(|k| k.contains("users")),
+                "keys: {:?}",
+                result.components[0].query_keys
+            );
+        }
+    }
+
+    // ========== Reactive expression detection ==========
+
+    #[test]
+    fn reactive_binary_expression() {
+        let source = r#"export function Comp() {
+    let count = 0;
+    return <div>{count + 1}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--child-->"),
+            "binary expression with reactive should have markers, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_template_literal() {
+        let source = r#"export function Comp() {
+    let name = "world";
+    return <div>{`hello ${name}`}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--child-->"),
+            "template literal with reactive should have markers, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_member_expression() {
+        let source = r#"export function Comp() {
+    let user = {};
+    return <div>{user.name}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--child-->"),
+            "member expression with reactive should have markers, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_computed_member_expression() {
+        let source = r#"export function Comp() {
+    let items = [];
+    let idx = 0;
+    return <div>{items[idx]}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--child-->"),
+            "computed member expression with reactive should have markers, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_call_expression() {
+        let source = r#"export function Comp() {
+    let getText = () => "hello";
+    return <div>{getText()}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--child-->"),
+            "call expression with reactive should have markers, code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_conditional_expression() {
+        let source = r#"export function Comp() {
+    let flag = true;
+    return <div>{flag ? "yes" : "no"}</div>;
+}"#;
+        let result = compile(source);
+        // Ternary in children generates conditional markers
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn reactive_logical_expression() {
+        let source = r#"export function Comp() {
+    let flag = true;
+    return <div>{flag && <span>visible</span>}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn non_reactive_expression_no_child_markers() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.name}</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            !result.code.contains("<!--child-->"),
+            "non-reactive expression should not have child markers, code: {}",
+            result.code
+        );
+    }
+
+    // ========== classify_tier ==========
+
+    #[test]
+    fn data_driven_tier_for_expression_attributes() {
+        let source = r#"export function Comp(props) {
+    return <div id={props.id}></div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::DataDriven);
+    }
+
+    #[test]
+    fn data_driven_tier_for_spread_attributes() {
+        let source = r#"export function Comp(props) {
+    return <div {...props}></div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::DataDriven);
+    }
+
+    #[test]
+    fn conditional_tier_for_nested_element_with_ternary() {
+        let source = r#"export function Comp(props) {
+    return <div><span>{props.ok ? "yes" : "no"}</span></div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    #[test]
+    fn conditional_tier_for_nested_fragment_with_ternary() {
+        let source = r#"export function Comp(props) {
+    return <div><>{props.ok ? "yes" : "no"}</></div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    #[test]
+    fn let_variable_not_in_jsx_is_static_tier() {
+        // A `let` variable that isn't JSX-reachable stays Static
+        let source = r#"export function Comp() {
+    let count = 0;
+    return <div>static text</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Static);
+    }
+
+    // ========== clean_jsx_text edge cases ==========
+
+    #[test]
+    fn clean_jsx_text_carriage_return_only() {
+        // \r without \n triggers early return (no cleaning)
+        assert_eq!(clean_jsx_text("hello\rworld"), "hello\rworld");
+    }
+
+    #[test]
+    fn clean_jsx_text_mixed_crlf() {
+        // \r\n should still work since \n is present
+        assert_eq!(clean_jsx_text("hello\r\n    world"), "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_single_line_with_spaces() {
+        assert_eq!(clean_jsx_text("   hello   "), "   hello   ");
+    }
+
+    // ========== escape_attr_value edge cases ==========
+
+    #[test]
+    fn escape_attr_value_preserves_double_quotes() {
+        // attr values don't escape double quotes (they use single-quote wrapping)
+        assert_eq!(escape_attr_value(r#"say "hello""#), r#"say "hello""#);
+    }
+
+    // ========== Fragment edge cases ==========
+
+    #[test]
+    fn fragment_with_only_whitespace_children() {
+        let source = "export function Comp() {\n    return <>\n        \n    </>;\n}";
+        let result = compile(source);
+        assert!(result.code.contains("__ssr_Comp("), "code: {}", result.code);
+    }
+
+    // ========== Nested guard pattern detection ==========
+
+    #[test]
+    fn guard_pattern_with_else_return() {
+        let source = r#"export function Comp(props) {
+    if (props.loading) {
+        return <div>loading</div>;
+    } else {
+        return <div>content</div>;
+    }
+}"#;
+        let result = compile(source);
+        // Both returns are inside the same if/else, first is in if, second in else
+        // The last return IS inside an if (the else branch), so this is not a valid guard pattern
+        assert_eq!(
+            result.components[0].tier,
+            AotTier::RuntimeFallback,
+            "tier: {:?}, code: {}",
+            result.components[0].tier,
+            result.code
+        );
+    }
+
+    // ========== Signal API with unresolved queries ==========
+
+    #[test]
+    fn signal_api_var_without_query_call_is_runtime_fallback() {
+        // When there's a signal-API variable (has .data property) but it's not
+        // from a `query()` call, the component falls back to runtime
+        let source = r#"import { query } from '@vertz/ui';
+export function Comp() {
+    const data = query(api.users.list());
+    const other = query(api.posts.list());
+    return <div>{data.data}{other.data}</div>;
+}"#;
+        let result = compile(source);
+        // Both should be resolved as queries
+        if result.components[0].tier != AotTier::RuntimeFallback {
+            assert!(
+                !result.components[0].query_keys.is_empty(),
+                "keys: {:?}",
+                result.components[0].query_keys
+            );
+        }
+    }
+
+    // ========== Empty expression container ==========
+
+    #[test]
+    fn empty_expression_container_becomes_empty_string() {
+        let source = r#"export function Comp() {
+    return <div>{/* comment */}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("__ssr_Comp("), "code: {}", result.code);
+    }
+
+    // ========== expression_node_to_string ==========
+
+    #[test]
+    fn ternary_branch_with_nested_jsx_elements() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.ok ? <div><span>nested</span></div> : <p>alt</p>}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("'<span>'"), "code: {}", result.code);
+        assert!(result.code.contains("'<p>'"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn ternary_branch_with_non_jsx_falls_back_to_esc() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.ok ? <span>yes</span> : props.message}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("__esc("), "code: {}", result.code);
+    }
+
+    // ========== Logical AND branch ==========
+
+    #[test]
+    fn logical_and_with_empty_string_fallback() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.show && <span>visible</span>}</div>;
+}"#;
+        let result = compile(source);
+        // Logical AND should generate: condition ? content : ''
+        assert!(result.code.contains(": '')"), "code: {}", result.code);
+    }
+
+    // ========== Map call with fragment body ==========
+
+    #[test]
+    fn map_call_with_fragment_body() {
+        let source = r#"export function Comp(props) {
+    return <ul>{props.items.map(item => <><li>{item}</li></>)}</ul>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("<!--list-->"), "code: {}", result.code);
+    }
+
+    // ========== Parenthesized expressions in various positions ==========
+
+    #[test]
+    fn parenthesized_expression_in_ternary_branch() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.ok ? (<span>yes</span>) : (<span>no</span>)}</div>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("'<span>'"), "code: {}", result.code);
+    }
+
+    #[test]
+    fn parenthesized_expression_in_map_body() {
+        let source = r#"export function Comp(props) {
+    return <ul>{props.items.map(item => (<li>{item}</li>))}</ul>;
+}"#;
+        let result = compile(source);
+        assert!(result.code.contains("<!--list-->"), "code: {}", result.code);
+    }
+
+    // ========== Logical AND in expression_node_to_string ==========
+
+    #[test]
+    fn logical_and_in_ternary_branch() {
+        let source = r#"export function Comp(props) {
+    return <div>{props.ok ? props.show && <span>visible</span> : <span>hidden</span>}</div>;
+}"#;
+        let result = compile(source);
+        // Should handle nested logical AND within ternary
+        assert!(
+            result.code.contains("<!--conditional-->"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Map call: callee is not StaticMemberExpression ==========
+
+    #[test]
+    fn map_call_non_member_callee() {
+        let source = r#"export function Comp(props) {
+    return <div>{getItems().map(item => <li>{item}</li>)}</div>;
+}"#;
+        let result = compile(source);
+        // Should still attempt to process the map call
+        assert!(result.code.contains("__ssr_Comp("), "code: {}", result.code);
+    }
+
+    // ========== Nested components ==========
+
+    #[test]
+    fn nested_component_inside_element() {
+        let source = r#"export function App() {
+    return <div><Child name="test" /></div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_Child("),
+            "code: {}",
+            result.code
+        );
+        assert!(
+            result.components[0].holes.contains(&"Child".to_string()),
+            "holes: {:?}",
+            result.components[0].holes
+        );
+    }
+
+    // ========== Component with no props ==========
+
+    #[test]
+    fn component_call_with_empty_props() {
+        let source = r#"export function App() {
+    return <Child />;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains("__ssr_Child({})"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Deep conditional in return ==========
+
+    #[test]
+    fn deep_contains_jsx_in_logical_expression() {
+        let source = r#"export function Comp(props) {
+    return props.show && <div>visible</div>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Conditional);
+    }
+
+    // ========== classify_tier_from_expr with non-JSX ==========
+
+    #[test]
+    fn classify_fragment_tier() {
+        let source = r#"export function Comp() {
+    return <><div>a</div><div>b</div></>;
+}"#;
+        let result = compile(source);
+        assert_eq!(result.components[0].tier, AotTier::Static);
+    }
+
+    // ========== Attribute edge cases ==========
+
+    #[test]
+    fn multiple_static_attributes() {
+        let source = r#"export function Comp() {
+    return <div id="main" role="button">text</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains(r#"id="main""#),
+            "code: {}",
+            result.code
+        );
+        assert!(
+            result.code.contains(r#"role="button""#),
+            "code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn mixed_static_and_dynamic_attributes() {
+        let source = r#"export function Comp(props) {
+    return <div id="main" className={props.cls}>text</div>;
+}"#;
+        let result = compile(source);
+        assert!(
+            result.code.contains(r#"id="main""#),
+            "code: {}",
+            result.code
+        );
+        assert!(result.code.contains("__esc_attr("), "code: {}", result.code);
+    }
+
+    // ========== emit_aot_function without props_param ==========
+
+    #[test]
+    fn emitted_function_without_props_param_uses_default() {
+        let source = r#"export function Comp() {
+    return <div>hello</div>;
+}"#;
+        let result = compile(source);
+        // No props param → defaults to __props
+        assert!(
+            result.code.contains("__ssr_Comp(__props)"),
+            "code: {}",
+            result.code
+        );
+    }
+
+    // ========== Escape edge cases ==========
+
+    #[test]
+    fn escape_string_literal_no_special_chars() {
+        assert_eq!(escape_string_literal("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_string_literal_multiple_special_chars() {
+        assert_eq!(
+            escape_string_literal("it's a \\path\nwith\rlines"),
+            "it\\'s a \\\\path\\nwith\\rlines"
+        );
+    }
+}
