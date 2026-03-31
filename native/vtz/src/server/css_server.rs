@@ -62,8 +62,11 @@ pub fn css_modules_to_js_module(
     // Build the JS class name mapping object
     let mappings = build_class_mappings(&exports);
 
-    // Escape the scoped CSS for use in a JS template literal
-    let escaped_css = scoped_css
+    // Resolve relative @import paths in the scoped CSS (same as regular CSS handler)
+    let css_with_resolved_imports = resolve_css_imports(scoped_css, file_url);
+
+    // Escape the resolved CSS for use in a JS template literal
+    let escaped_css = css_with_resolved_imports
         .replace('\\', "\\\\")
         .replace('`', "\\`")
         .replace("${", "\\${");
@@ -133,7 +136,9 @@ fn build_class_mappings(exports: &HashMap<String, CssModuleExport>) -> String {
         }
 
         let value = names.join(" ");
-        entries.push(format!(" \"{key}\": \"{value}\""));
+        let escaped_key = key.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        entries.push(format!(" \"{escaped_key}\": \"{escaped_value}\""));
     }
 
     entries.join(",\n")
@@ -615,6 +620,52 @@ body { font-family: Inter; }"#;
         assert!(
             result.js.contains("existing.textContent = __vtz_css"),
             "Should update existing style content on HMR"
+        );
+    }
+
+    #[test]
+    fn test_css_modules_resolves_at_import_paths() {
+        let css = "@import './reset.css';\n.primary { color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/components/Button.module.css").unwrap();
+
+        // Relative @import paths should be resolved to absolute URL paths
+        assert!(
+            result.js.contains("/src/components/reset.css"),
+            "Relative @import should be resolved. JS:\n{}",
+            result.js
+        );
+    }
+
+    #[test]
+    fn test_css_modules_handles_malformed_css() {
+        // Malformed CSS should not panic — error_recovery is enabled
+        let css = ".primary { color: ; }\n.valid { margin: 10px; }";
+        let result = css_modules_to_js_module(css, "/src/Bad.module.css");
+
+        assert!(
+            result.is_ok(),
+            "Malformed CSS should not error with recovery enabled"
+        );
+        let js = result.unwrap().js;
+        assert!(
+            js.contains("\"valid\""),
+            "Valid rules should still be exported. JS:\n{}",
+            js
+        );
+    }
+
+    #[test]
+    fn test_css_modules_composes_cross_file_includes_name() {
+        // Cross-file composes: the dependent name is included as-is
+        // (full resolution requires loading the other file, which is a known limitation)
+        let css = ".primary { composes: base from './base.module.css'; color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        // Should still export the primary class
+        assert!(
+            result.js.contains("\"primary\""),
+            "Should export primary class. JS:\n{}",
+            result.js
         );
     }
 }
