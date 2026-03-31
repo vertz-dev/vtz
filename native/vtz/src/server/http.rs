@@ -36,6 +36,7 @@ use tokio::net::TcpListener;
 const MAX_PORT_ATTEMPTS: u16 = 10;
 
 /// Bind result containing the listener and the actual port used.
+#[derive(Debug)]
 pub struct BindResult {
     pub listener: TcpListener,
     pub port: u16,
@@ -1286,7 +1287,42 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::categories::DevError;
+    use crate::server::console_log::LogLevel;
     use std::path::PathBuf;
+    use tower::ServiceExt;
+
+    /// Create a test router with SSR disabled and a temp directory.
+    fn make_test_router() -> (Router, Arc<DevServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("public")).unwrap();
+        let mut config = ServerConfig::with_root(
+            3000,
+            "localhost".to_string(),
+            PathBuf::from("public"),
+            tmp.path().to_path_buf(),
+        );
+        config.enable_ssr = false;
+        let (router, state) = build_router(&config);
+        (router, state, tmp)
+    }
+
+    /// Read an axum response body into bytes.
+    async fn body_bytes(resp: axum::response::Response<Body>) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Read an axum response body as a JSON Value.
+    async fn body_json(resp: axum::response::Response<Body>) -> serde_json::Value {
+        let bytes = body_bytes(resp).await;
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ─── try_bind ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_try_bind_succeeds_on_free_port() {
@@ -1297,7 +1333,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_bind_auto_increments_on_busy_port() {
-        // Bind a port to make it busy
         let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let blocked_port = blocker.local_addr().unwrap().port();
 
@@ -1308,13 +1343,39 @@ mod tests {
         );
         let result = try_bind(&config).await.unwrap();
 
-        // Should have incremented to the next port
         assert!(result.port > blocked_port);
         assert!(result.port <= blocked_port + MAX_PORT_ATTEMPTS);
-
-        // Clean up
         drop(blocker);
     }
+
+    #[tokio::test]
+    async fn test_try_bind_fails_when_all_ports_exhausted() {
+        // Find a free starting port
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let start_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // Block all MAX_PORT_ATTEMPTS ports
+        let mut blockers = Vec::new();
+        for offset in 0..MAX_PORT_ATTEMPTS {
+            let port = start_port + offset;
+            if let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+                blockers.push(listener);
+            }
+        }
+
+        // Only run the test if we managed to block all ports
+        if blockers.len() == MAX_PORT_ATTEMPTS as usize {
+            let config =
+                ServerConfig::new(start_port, "127.0.0.1".to_string(), PathBuf::from("public"));
+            let result = try_bind(&config).await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        }
+    }
+
+    // ─── build_router ────────────────────────────────────────────────
 
     #[test]
     fn test_build_router_returns_router_and_state() {
@@ -1326,9 +1387,40 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         let (_router, state) = build_router(&config);
-        // If this compiles and runs, the router was created successfully
         assert_eq!(state.root_dir, tmp.path().to_path_buf());
     }
+
+    #[test]
+    fn test_build_router_with_ssr_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::with_root(
+            3000,
+            "localhost".to_string(),
+            PathBuf::from("public"),
+            tmp.path().to_path_buf(),
+        );
+        config.enable_ssr = false;
+        let (_router, state) = build_router(&config);
+        assert!(!state.enable_ssr);
+    }
+
+    #[test]
+    fn test_build_router_state_fields_populated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = ServerConfig::with_root(
+            4000,
+            "localhost".to_string(),
+            PathBuf::from("public"),
+            tmp.path().to_path_buf(),
+        );
+        let (_router, state) = build_router(&config);
+        assert_eq!(state.port, 4000);
+        assert_eq!(state.root_dir, tmp.path().to_path_buf());
+        assert_eq!(state.src_dir, tmp.path().join("src"));
+        assert!(state.console_log.is_empty());
+    }
+
+    // ─── mime_type_for_path ──────────────────────────────────────────
 
     #[test]
     fn test_mime_type_for_path() {
@@ -1352,5 +1444,525 @@ mod tests {
             mime_type_for_path("/unknown.xyz"),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn test_mime_type_mjs() {
+        assert_eq!(
+            mime_type_for_path("/module.mjs"),
+            "application/javascript; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_mime_type_jpeg() {
+        assert_eq!(mime_type_for_path("/photo.jpeg"), "image/jpeg");
+    }
+
+    #[test]
+    fn test_mime_type_ico() {
+        assert_eq!(mime_type_for_path("/favicon.ico"), "image/x-icon");
+    }
+
+    #[test]
+    fn test_mime_type_fonts() {
+        assert_eq!(mime_type_for_path("/font.woff2"), "font/woff2");
+        assert_eq!(mime_type_for_path("/font.woff"), "font/woff");
+    }
+
+    // ─── format_ssr_css ──────────────────────────────────────────────
+
+    #[test]
+    fn test_format_ssr_css_empty_entries() {
+        assert_eq!(format_ssr_css(&[]), "");
+    }
+
+    #[test]
+    fn test_format_ssr_css_single_entry_no_id() {
+        let entries = vec![("body { margin: 0 }".to_string(), None)];
+        let result = format_ssr_css(&entries);
+        assert!(result.contains("body { margin: 0 }"));
+        assert!(result.contains("<style data-vertz-ssr>"));
+    }
+
+    #[test]
+    fn test_format_ssr_css_dedup_by_id() {
+        let entries = vec![
+            (".a { color: red }".to_string(), Some("comp-a".to_string())),
+            (".a { color: red }".to_string(), Some("comp-a".to_string())),
+        ];
+        let result = format_ssr_css(&entries);
+        // Should only appear once due to dedup
+        assert_eq!(result.matches(".a { color: red }").count(), 1);
+    }
+
+    #[test]
+    fn test_format_ssr_css_skips_empty_css() {
+        let entries = vec![
+            ("".to_string(), None),
+            ("".to_string(), Some("empty".to_string())),
+        ];
+        let result = format_ssr_css(&entries);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_format_ssr_css_mixed_entries() {
+        let entries = vec![
+            (".a { color: red }".to_string(), Some("comp-a".to_string())),
+            ("".to_string(), Some("empty".to_string())),
+            (".b { color: blue }".to_string(), Some("comp-b".to_string())),
+            (".a { color: red }".to_string(), Some("comp-a".to_string())), // duplicate
+            (".c { margin: 0 }".to_string(), None),                        // no id
+        ];
+        let result = format_ssr_css(&entries);
+        assert_eq!(result.matches(".a { color: red }").count(), 1);
+        assert!(result.contains(".b { color: blue }"));
+        assert!(result.contains(".c { margin: 0 }"));
+    }
+
+    // ─── ai_errors_handler ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ai_errors_returns_empty() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_ai/errors")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+
+        let json = body_json(resp).await;
+        assert_eq!(json["count"], 0);
+        assert!(json["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ai_errors_returns_reported_errors() {
+        let (router, state, _tmp) = make_test_router();
+
+        // Report an error before querying
+        state
+            .error_broadcaster
+            .report_error(DevError::build("test compilation error"))
+            .await;
+
+        let req = Request::builder()
+            .uri("/__vertz_ai/errors")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["count"], 1);
+        let errors = json["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+    }
+
+    // ─── ai_console_handler ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ai_console_returns_empty() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_ai/console")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["count"], 0);
+        assert_eq!(json["total"], 0);
+        assert!(json["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ai_console_returns_pushed_entries() {
+        let (router, state, _tmp) = make_test_router();
+
+        state
+            .console_log
+            .push(LogLevel::Info, "hello world", Some("test"));
+
+        let req = Request::builder()
+            .uri("/__vertz_ai/console")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        let json = body_json(resp).await;
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["total"], 1);
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["message"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_ai_console_respects_last_param() {
+        let (router, state, _tmp) = make_test_router();
+
+        for i in 0..5 {
+            state
+                .console_log
+                .push(LogLevel::Info, format!("msg-{}", i), None);
+        }
+
+        let req = Request::builder()
+            .uri("/__vertz_ai/console?last=2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        let json = body_json(resp).await;
+        assert_eq!(json["count"], 2);
+        assert_eq!(json["total"], 5);
+    }
+
+    // ─── ai_navigate_handler ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ai_navigate_success() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/__vertz_ai/navigate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"to": "/tasks/123"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["navigated_to"], "/tasks/123");
+    }
+
+    #[tokio::test]
+    async fn test_ai_navigate_invalid_json() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/__vertz_ai/navigate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("Invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn test_ai_navigate_logs_to_console() {
+        let (router, state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/__vertz_ai/navigate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"to": "/settings"}"#))
+            .unwrap();
+        let _resp = router.oneshot(req).await.unwrap();
+
+        // Navigation should have been logged
+        let entries = state.console_log.last_n(10);
+        assert!(entries.iter().any(|e| e.message.contains("/settings")));
+    }
+
+    // ─── ai_render_handler ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ai_render_ssr_disabled() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_ai/render?url=/test")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "SSR is not enabled");
+        assert!(json["html"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_ai_render_ssr_disabled_default_url() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_ai/render")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "SSR is not enabled");
+    }
+
+    // ─── diagnostics_handler ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_diagnostics_returns_json() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_diagnostics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+        let json = body_json(resp).await;
+        // Diagnostics should have standard fields
+        assert!(json.get("uptime_secs").is_some());
+    }
+
+    // ─── dev_server_handler: 404 ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_unknown_path_returns_404_for_non_html_accept() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/some/random/path.xyz")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert_eq!(text, "Not Found");
+    }
+
+    // ─── dev_server_handler: static files ────────────────────────────
+
+    #[tokio::test]
+    async fn test_static_file_served_from_public_dir() {
+        let (router, _state, tmp) = make_test_router();
+
+        // Create a static file in public/
+        let public_dir = tmp.path().join("public");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::write(public_dir.join("hello.txt"), "hello world").unwrap();
+
+        let req = Request::builder()
+            .uri("/hello.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert_eq!(text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_static_file_correct_mime_type() {
+        let (router, _state, tmp) = make_test_router();
+
+        let public_dir = tmp.path().join("public");
+        std::fs::write(public_dir.join("style.css"), "body {}").unwrap();
+
+        let req = Request::builder()
+            .uri("/style.css")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
+    }
+
+    // ─── dev_server_handler: SPA fallback ────────────────────────────
+
+    #[tokio::test]
+    async fn test_spa_fallback_returns_html_shell() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/tasks/123")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(text.contains("<!DOCTYPE html>") || text.contains("<html"));
+    }
+
+    #[tokio::test]
+    async fn test_spa_fallback_skipped_for_non_html_accept() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/tasks/123")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_root_path_returns_html_shell() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    // ─── dev_server_handler: @deps, @css, /src dispatch ──────────────
+
+    #[tokio::test]
+    async fn test_deps_request_dispatched() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/@deps/nonexistent.js")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        // Should dispatch to handle_deps_request, which returns 404 for missing deps
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_css_request_dispatched() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/@css/nonexistent.css")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        // CSS handler returns 404 for missing CSS
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_src_request_dispatched() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/src/nonexistent.tsx")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        // Source handler returns 404 for missing source files
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── handle_api_request ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_api_request_no_isolate_returns_404() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/api/users")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("No server entry configured"));
+    }
+
+    #[tokio::test]
+    async fn test_api_root_no_isolate_returns_404() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder().uri("/api").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert!(json["error"].as_str().unwrap().contains("No server entry"));
+    }
+
+    #[tokio::test]
+    async fn test_api_post_no_isolate_returns_404() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/users")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name": "test"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── WebSocket handlers (non-upgrade rejection) ──────────────────
+
+    #[tokio::test]
+    async fn test_hmr_ws_rejects_non_upgrade() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_hmr")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        // axum returns non-200 for non-WebSocket requests to WS endpoints
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_error_ws_rejects_non_upgrade() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_errors")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_events_ws_rejects_non_upgrade() {
+        let (router, _state, _tmp) = make_test_router();
+        let req = Request::builder()
+            .uri("/__vertz_mcp/events")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_ne!(resp.status(), StatusCode::OK);
     }
 }
