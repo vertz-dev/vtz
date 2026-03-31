@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::compiler::import_rewriter::is_asset_extension;
 use crate::compiler::pipeline::CompilationPipeline;
 use crate::deps::prebundle;
 use crate::deps::resolve;
@@ -102,6 +103,15 @@ pub async fn handle_source_file(
     // CSS files: serve as a JS module that injects a <style> tag
     if clean_path.ends_with(".css") {
         return handle_css_source_file(&file_path, clean_path);
+    }
+
+    // Asset files (images, fonts): serve raw file or synthetic JS module
+    if is_asset_path(clean_path) {
+        let query = req.uri().query().unwrap_or("");
+        let is_import = query
+            .split('&')
+            .any(|p| p == "import" || p.starts_with("import="));
+        return handle_asset_source_file(&file_path, clean_path, is_import);
     }
 
     // Compile the file for browser consumption
@@ -202,6 +212,62 @@ fn handle_css_source_file(file_path: &Path, url_path: &str) -> Response<Body> {
             .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from(format!("Failed to read CSS file: {}", e)))
             .unwrap(),
+    }
+}
+
+/// Check if a URL path points to a static asset file (image, font, etc.).
+fn is_asset_path(path: &str) -> bool {
+    if let Some(dot_pos) = path.rfind('.') {
+        let ext = &path[dot_pos + 1..];
+        is_asset_extension(ext)
+    } else {
+        false
+    }
+}
+
+/// Handle asset source file requests.
+///
+/// When `is_import` is true (URL has `?import` query), returns a synthetic JS module
+/// that exports the asset's URL path as a default string:
+/// ```js
+/// export default "/src/logo.svg"
+/// ```
+///
+/// When `is_import` is false, serves the raw file with the correct MIME type.
+fn handle_asset_source_file(file_path: &Path, url_path: &str, is_import: bool) -> Response<Body> {
+    if is_import {
+        // Synthetic JS module: export default '<url_path>'
+        // Use serde_json to properly escape the string for JS embedding (handles \, ", newlines, etc.)
+        let escaped =
+            serde_json::to_string(url_path).unwrap_or_else(|_| format!("\"{}\"", url_path));
+        let js_module = format!("export default {};\n", escaped);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(js_module))
+            .unwrap()
+    } else {
+        // Serve raw asset file with correct MIME type
+        match std::fs::read(file_path) {
+            Ok(content) => {
+                let content_type = crate::server::http::mime_type_for_path(url_path);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from(content))
+                    .unwrap()
+            }
+            Err(_) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("Failed to read asset file"))
+                .unwrap(),
+        }
     }
 }
 
@@ -2084,5 +2150,106 @@ mod tests {
             .unwrap();
         let code = String::from_utf8(body.to_vec()).unwrap();
         assert!(code.contains(".app { display: flex; }"));
+    }
+
+    // ── Asset import tests ──
+
+    #[tokio::test]
+    async fn test_handle_asset_import_returns_synthetic_js_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(tmp.path().join("src/logo.svg"), "<svg></svg>").unwrap();
+
+        let req = Request::builder()
+            .uri("/src/logo.svg?import")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(
+            ct.to_str().unwrap().contains("application/javascript"),
+            "Asset import should return JS content type"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            code.contains("export default \"/src/logo.svg\""),
+            "Synthetic module should export URL string. Got: {}",
+            code
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_asset_raw_request_returns_file_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(tmp.path().join("src/logo.svg"), "<svg>test</svg>").unwrap();
+
+        let req = Request::builder()
+            .uri("/src/logo.svg")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(
+            ct.to_str().unwrap().contains("image/svg+xml"),
+            "Raw SVG should have image/svg+xml content type. Got: {}",
+            ct.to_str().unwrap()
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let content = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(content, "<svg>test</svg>");
+    }
+
+    #[tokio::test]
+    async fn test_handle_asset_import_png_returns_synthetic_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src/assets")).unwrap();
+        std::fs::write(tmp.path().join("src/assets/hero.png"), "PNG_DATA").unwrap();
+
+        let req = Request::builder()
+            .uri("/src/assets/hero.png?import")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            code.contains("export default \"/src/assets/hero.png\""),
+            "Synthetic module should export URL path. Got: {}",
+            code
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_asset_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        let req = Request::builder()
+            .uri("/src/nonexistent.svg?import")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

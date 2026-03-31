@@ -276,6 +276,28 @@ pub fn rewrite_specifier(
     root_dir: &Path,
     tsconfig_paths: Option<&TsconfigPaths>,
 ) -> String {
+    let url = rewrite_specifier_inner(specifier, file_path, src_dir, root_dir, tsconfig_paths);
+
+    // Append ?import for asset URLs so the module server generates a synthetic
+    // JS module (`export default '<url>'`) instead of trying to compile the file.
+    if let Some(dot_pos) = url.rfind('.') {
+        let ext = &url[dot_pos + 1..];
+        if is_asset_extension(ext) {
+            return format!("{}?import", url);
+        }
+    }
+
+    url
+}
+
+/// Inner implementation of specifier rewriting (without the asset `?import` post-processing).
+fn rewrite_specifier_inner(
+    specifier: &str,
+    file_path: &Path,
+    src_dir: &Path,
+    root_dir: &Path,
+    tsconfig_paths: Option<&TsconfigPaths>,
+) -> String {
     // Already-absolute URLs — don't touch
     if specifier.starts_with("http://")
         || specifier.starts_with("https://")
@@ -353,7 +375,7 @@ fn resolve_relative_specifier(
 fn resolve_extension(path: &Path, _root_dir: &Path) -> PathBuf {
     // If the path already has a known extension, return as-is
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs" | "css") {
+        if matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs" | "css") || is_asset_extension(ext) {
             return path.to_path_buf();
         }
     }
@@ -382,6 +404,18 @@ fn resolve_extension(path: &Path, _root_dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.tsx", path.display()))
 }
 
+/// Check if a file extension is a static asset (image, font, etc.).
+///
+/// Asset imports are handled differently from code imports: the import rewriter
+/// appends `?import` so the module server generates a synthetic JS module
+/// that exports the asset's URL string.
+pub fn is_asset_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "woff" | "woff2" | "ttf" | "eot"
+    )
+}
+
 /// Normalize a path by resolving `.` and `..` components.
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
@@ -404,6 +438,36 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Asset extension detection tests ──
+
+    #[test]
+    fn test_is_asset_extension_returns_true_for_images() {
+        assert!(is_asset_extension("svg"));
+        assert!(is_asset_extension("png"));
+        assert!(is_asset_extension("jpg"));
+        assert!(is_asset_extension("jpeg"));
+        assert!(is_asset_extension("gif"));
+        assert!(is_asset_extension("webp"));
+        assert!(is_asset_extension("ico"));
+    }
+
+    #[test]
+    fn test_is_asset_extension_returns_true_for_fonts() {
+        assert!(is_asset_extension("woff"));
+        assert!(is_asset_extension("woff2"));
+        assert!(is_asset_extension("ttf"));
+        assert!(is_asset_extension("eot"));
+    }
+
+    #[test]
+    fn test_is_asset_extension_returns_false_for_code() {
+        assert!(!is_asset_extension("ts"));
+        assert!(!is_asset_extension("tsx"));
+        assert!(!is_asset_extension("js"));
+        assert!(!is_asset_extension("jsx"));
+        assert!(!is_asset_extension("css"));
+    }
 
     #[test]
     fn test_rewrite_bare_specifier_to_deps() {
@@ -746,5 +810,197 @@ const x = 1;"#;
         );
         // When alias matches but file not found, falls through to /@deps/
         assert_eq!(result, "/@deps/@/nonexistent");
+    }
+
+    // ── Asset import tests ──
+
+    #[test]
+    fn test_rewrite_relative_svg_import_appends_import_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let result = rewrite_specifier(
+            "./logo.svg",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            tmp.path(),
+            None,
+        );
+        assert_eq!(result, "/src/logo.svg?import");
+    }
+
+    #[test]
+    fn test_rewrite_relative_png_import_appends_import_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(src_dir.join("assets")).unwrap();
+        std::fs::write(src_dir.join("assets/hero.png"), "").unwrap();
+
+        let result = rewrite_specifier(
+            "./assets/hero.png",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            tmp.path(),
+            None,
+        );
+        assert_eq!(result, "/src/assets/hero.png?import");
+    }
+
+    #[test]
+    fn test_rewrite_relative_font_import_appends_import_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(src_dir.join("fonts")).unwrap();
+        std::fs::write(src_dir.join("fonts/inter.woff2"), "").unwrap();
+
+        let result = rewrite_specifier(
+            "./fonts/inter.woff2",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            tmp.path(),
+            None,
+        );
+        assert_eq!(result, "/src/fonts/inter.woff2?import");
+    }
+
+    #[test]
+    fn test_rewrite_asset_import_in_full_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"import logo from './logo.svg';
+import { signal } from '@vertz/ui';
+const x = 1;"#;
+
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("from '/src/logo.svg?import'"),
+            "Asset import should have ?import query. Result: {}",
+            result
+        );
+        assert!(
+            result.contains("from '/@deps/@vertz/ui'"),
+            "Other imports should still work. Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_dynamic_import_of_asset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"const logo = import('./logo.svg');"#;
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("import('/src/logo.svg?import')"),
+            "Dynamic asset import should have ?import. Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_side_effect_asset_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"import './logo.svg';"#;
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("import '/src/logo.svg?import'"),
+            "Side-effect asset import should have ?import. Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_export_from_asset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let code = r#"export { default as logo } from './logo.svg';"#;
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path(), None);
+
+        assert!(
+            result.contains("from '/src/logo.svg?import'"),
+            "Re-export of asset should have ?import. Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_path_alias_svg_import_appends_import_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(src_dir.join("assets")).unwrap();
+        std::fs::write(src_dir.join("assets/logo.svg"), "<svg></svg>").unwrap();
+
+        let paths = TsconfigPaths {
+            base_url: None,
+            paths: vec![("@/*".to_string(), vec!["./src/*".to_string()])],
+        };
+
+        let result = rewrite_specifier(
+            "@/assets/logo.svg",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            root,
+            Some(&paths),
+        );
+        assert_eq!(result, "/src/assets/logo.svg?import");
+    }
+
+    #[test]
+    fn test_rewrite_css_import_not_appended_import_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("styles.css"), "body{}").unwrap();
+
+        let result = rewrite_specifier(
+            "./styles.css",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            tmp.path(),
+            None,
+        );
+        // CSS imports should NOT have ?import — they're handled differently
+        assert_eq!(result, "/src/styles.css");
+    }
+
+    #[test]
+    fn test_resolve_extension_keeps_svg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let result = resolve_extension(&src_dir.join("logo.svg"), tmp.path());
+        assert_eq!(result, src_dir.join("logo.svg"));
+    }
+
+    #[test]
+    fn test_resolve_extension_keeps_png() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("icon.png"), "").unwrap();
+
+        let result = resolve_extension(&src_dir.join("icon.png"), tmp.path());
+        assert_eq!(result, src_dir.join("icon.png"));
     }
 }

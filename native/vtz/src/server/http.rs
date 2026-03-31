@@ -825,7 +825,7 @@ async fn handle_api_request(
 }
 
 /// Guess a MIME type from a file path extension.
-fn mime_type_for_path(path: &str) -> &'static str {
+pub fn mime_type_for_path(path: &str) -> &'static str {
     if path.ends_with(".html") {
         "text/html; charset=utf-8"
     } else if path.ends_with(".css") {
@@ -846,6 +846,14 @@ fn mime_type_for_path(path: &str) -> &'static str {
         "font/woff2"
     } else if path.ends_with(".woff") {
         "font/woff"
+    } else if path.ends_with(".ttf") {
+        "font/ttf"
+    } else if path.ends_with(".eot") {
+        "application/vnd.ms-fontobject"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else if path.ends_with(".webp") {
+        "image/webp"
     } else {
         "application/octet-stream"
     }
@@ -2051,5 +2059,30 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
 
         assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    // ── MIME type tests ──
+
+    #[test]
+    fn test_mime_type_for_gif() {
+        assert_eq!(mime_type_for_path("/img/anim.gif"), "image/gif");
+    }
+
+    #[test]
+    fn test_mime_type_for_webp() {
+        assert_eq!(mime_type_for_path("/img/photo.webp"), "image/webp");
+    }
+
+    #[test]
+    fn test_mime_type_for_ttf() {
+        assert_eq!(mime_type_for_path("/fonts/inter.ttf"), "font/ttf");
+    }
+
+    #[test]
+    fn test_mime_type_for_eot() {
+        assert_eq!(
+            mime_type_for_path("/fonts/legacy.eot"),
+            "application/vnd.ms-fontobject"
+        );
     }
 }
