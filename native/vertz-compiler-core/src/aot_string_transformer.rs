@@ -3229,4 +3229,226 @@ export function Comp() {
             "it\\'s a \\\\path\\nwith\\rlines"
         );
     }
+
+    // ========== Additional coverage (unique behaviors) ==========
+
+    /// Helper: compile through the full public API (includes TS strip, props transform, etc.).
+    fn aot(source: &str) -> crate::AotCompileResult {
+        crate::compile_for_ssr_aot(
+            source,
+            crate::AotCompileOptions {
+                filename: Some("input.tsx".into()),
+            },
+        )
+    }
+
+    /// Extract only the appended SSR functions (everything after original source).
+    fn ssr_part(result: &crate::AotCompileResult, source: &str) -> String {
+        result.code[source.len()..].to_string()
+    }
+
+    #[test]
+    fn all_void_elements_exhaustive() {
+        for tag in &[
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+            "source", "track", "wbr",
+        ] {
+            let src = format!("function App() {{ return <{tag} />; }}");
+            let r = compile(&src);
+            let expected = format!("'<{tag}>'");
+            assert!(
+                r.code.contains(&expected),
+                "void element {tag}: expected {expected}, got: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn parser_error_returns_no_components() {
+        let r = aot("function App() { return <<; }");
+        assert!(r.components.is_empty());
+    }
+
+    #[test]
+    fn original_source_preserved_before_ssr_functions() {
+        let src = "function App() { return <div>Hello</div>; }";
+        let r = compile(src);
+        assert!(r.code.starts_with(src), "got: {}", r.code);
+    }
+
+    #[test]
+    fn query_variable_generates_ctx_param_and_get_data() {
+        let src = r#"import { query } from "@vertz/ui";
+function App() {
+  const tasks = query(api.tasks.list());
+  return <div>{tasks.data}</div>;
+}"#;
+        let r = aot(src);
+        let ssr = ssr_part(&r, src);
+        assert!(
+            ssr.contains("data, ctx"),
+            "expected ctx param, got: {}",
+            ssr
+        );
+        assert!(
+            ssr.contains("ctx.getData("),
+            "expected getData call, got: {}",
+            ssr
+        );
+    }
+
+    #[test]
+    fn query_variable_replaces_loading_and_error_in_output() {
+        let r = aot(r#"import { query } from "@vertz/ui";
+function App() {
+  const tasks = query(api.tasks.list());
+  return <div>{tasks.data}{tasks.loading}{tasks.error}</div>;
+}"#);
+        let comp = &r.components[0];
+        assert!(!comp.query_keys.is_empty(), "should have query keys");
+        assert!(
+            r.code.contains("false"),
+            "tasks.loading -> false, got: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("undefined"),
+            "tasks.error -> undefined, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn query_api_chain_extracts_entity_operation_key() {
+        let r = aot(r#"import { query } from "@vertz/ui";
+function App() {
+  const users = query(api.users.getAll());
+  return <div>{users.data}</div>;
+}"#);
+        let comp = &r.components[0];
+        assert!(
+            comp.query_keys.contains(&"users-getAll".to_string()),
+            "keys: {:?}",
+            comp.query_keys
+        );
+    }
+
+    #[test]
+    fn query_with_key_option_extracts_cache_key() {
+        let r = aot(r#"import { query } from "@vertz/ui";
+function App() {
+  const tasks = query(fetchTasks, { key: 'my-tasks' });
+  return <div>{tasks.data}</div>;
+}"#);
+        let comp = &r.components[0];
+        assert!(
+            comp.query_keys.contains(&"my-tasks".to_string()),
+            "keys: {:?}",
+            comp.query_keys
+        );
+    }
+
+    #[test]
+    fn derived_alias_replaced_in_output() {
+        let r = aot(r#"import { query } from "@vertz/ui";
+function App() {
+  const tasks = query(api.tasks.list());
+  const data = tasks.data;
+  return <div>{data}</div>;
+}"#);
+        assert!(r.code.contains("__q0"), "got: {}", r.code);
+    }
+
+    #[test]
+    fn apply_query_replacements_does_not_replace_partial_match() {
+        let qvs = vec![QueryVarMeta {
+            var_name: "tasks".into(),
+            cache_key: "tasks-list".into(),
+            index: 0,
+            derived_aliases: vec!["data".into()],
+        }];
+        let expr = "__esc(metadata)".to_string();
+        let result = apply_query_replacements(expr, &qvs);
+        assert_eq!(result, "__esc(metadata)");
+    }
+
+    #[test]
+    fn string_attribute_value_escaped_in_output() {
+        let r = compile(r#"function App() { return <div title="it's">Hi</div>; }"#);
+        assert!(r.code.contains(r"it\'s"), "got: {}", r.code);
+    }
+
+    #[test]
+    fn q_direct_import_not_recognized_by_reactivity() {
+        let r = aot(r#"import { q } from "@vertz/ui";
+function App() {
+  const tasks = q(api.tasks.list());
+  return <div>{tasks.data}</div>;
+}"#);
+        let comp = &r.components[0];
+        assert!(
+            comp.query_keys.is_empty(),
+            "direct q import not recognized, keys: {:?}",
+            comp.query_keys
+        );
+    }
+
+    #[test]
+    fn unresolved_query_arg_produces_runtime_fallback() {
+        let r = aot(r#"import { query } from "@vertz/ui";
+function App() {
+  const tasks = query(somethingWithoutChain);
+  return <div>{tasks.data}</div>;
+}"#);
+        let comp = &r.components[0];
+        assert_eq!(comp.tier, "runtime-fallback");
+    }
+
+    #[test]
+    fn signal_import_component_still_generates_ssr() {
+        let r = aot(r#"import { signal } from "@vertz/ui";
+function App() {
+  const count = signal(0);
+  return <div>{count}</div>;
+}"#);
+        assert!(r.code.contains("__ssr_App("), "got: {}", r.code);
+    }
+
+    #[test]
+    fn build_attr_string_dynamic_no_hydration() {
+        let result = build_attr_string("' + expr + '", "");
+        assert_eq!(result, "' + expr + '");
+    }
+
+    #[test]
+    fn build_attr_string_static_no_hydration() {
+        let result = build_attr_string(r#"id="main""#, "");
+        assert_eq!(result, r#" id="main""#);
+    }
+
+    #[test]
+    fn style_tag_uses_string_coercion() {
+        let r = compile("function App() { return <style>{css}</style>; }");
+        assert!(r.code.contains("String(css)"), "got: {}", r.code);
+        assert!(!r.code.contains("__esc(css)"), "got: {}", r.code);
+    }
+
+    #[test]
+    fn empty_children_produces_empty_string_concat() {
+        let r = compile("function App() { return <div></div>; }");
+        assert!(
+            r.code.contains("'<div>' + '' + '</div>'"),
+            "got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn map_expression_body_generates_closing_list_marker() {
+        let r = compile(
+            "function App(props) { return <ul>{props.items.map(item => <li>{item}</li>)}</ul>; }",
+        );
+        assert!(r.code.contains("'<!--/list-->'"), "got: {}", r.code);
+    }
 }
