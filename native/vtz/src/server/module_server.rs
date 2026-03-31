@@ -99,7 +99,12 @@ pub async fn handle_source_file(
             .unwrap();
     }
 
-    // CSS files: serve as a JS module that injects a <style> tag
+    // CSS Modules (.module.css): serve as JS module with scoped class name mappings
+    if clean_path.ends_with(".module.css") {
+        return handle_css_module_source_file(&file_path, clean_path);
+    }
+
+    // Regular CSS files: serve as a JS module that injects a <style> tag
     if clean_path.ends_with(".css") {
         return handle_css_source_file(&file_path, clean_path);
     }
@@ -197,6 +202,39 @@ fn handle_css_source_file(file_path: &Path, url_path: &str) -> Response<Body> {
                 .body(Body::from(js_module))
                 .unwrap()
         }
+        Err(e) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(format!("Failed to read CSS file: {}", e)))
+            .unwrap(),
+    }
+}
+
+/// Handle CSS Module source file requests: `GET /src/**/*.module.css` → JS module with class mappings.
+///
+/// Parses the CSS with lightningcss CSS Modules support to:
+/// 1. Scope class names with hashes to prevent collisions
+/// 2. Handle `composes` directives
+/// 3. Export a default JS object mapping original → scoped class names
+/// 4. Inject the scoped CSS via a `<style>` tag for HMR
+fn handle_css_module_source_file(file_path: &Path, url_path: &str) -> Response<Body> {
+    match std::fs::read_to_string(file_path) {
+        Ok(css_content) => match css_server::css_modules_to_js_module(&css_content, url_path) {
+            Ok(result) => Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                )
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(result.js))
+                .unwrap(),
+            Err(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(format!("CSS Modules error: {}", e)))
+                .unwrap(),
+        },
         Err(e) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .header(header::CONTENT_TYPE, "text/plain")
@@ -2084,5 +2122,79 @@ mod tests {
             .unwrap();
         let code = String::from_utf8(body.to_vec()).unwrap();
         assert!(code.contains(".app { display: flex; }"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_css_module_returns_class_mappings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(
+            tmp.path().join("src/Button.module.css"),
+            ".primary { color: blue; }\n",
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/Button.module.css")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(ct.to_str().unwrap().contains("application/javascript"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should export a class name mapping object (not raw CSS)
+        assert!(
+            code.contains("export default __vtz_css_modules"),
+            "Should export CSS modules object. Code:\n{}",
+            code
+        );
+        assert!(
+            code.contains("\"primary\""),
+            "Should contain class name mapping. Code:\n{}",
+            code
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_regular_css_unaffected_by_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(
+            tmp.path().join("src/globals.css"),
+            ".primary { color: blue; }\n",
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/globals.css")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+
+        // Regular CSS should export raw CSS string, not a modules object
+        assert!(
+            code.contains("export default __vtz_css"),
+            "Regular CSS should export raw CSS string"
+        );
+        assert!(
+            !code.contains("__vtz_css_modules"),
+            "Regular CSS should NOT have modules object. Code:\n{}",
+            code
+        );
     }
 }

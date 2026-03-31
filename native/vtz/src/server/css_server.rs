@@ -1,4 +1,143 @@
 use crate::compiler::pipeline::CssStore;
+use lightningcss::css_modules::{CssModuleExport, CssModuleReference};
+use lightningcss::printer::PrinterOptions;
+use lightningcss::stylesheet::{ParserOptions, StyleSheet};
+use std::collections::HashMap;
+
+/// Result of converting a CSS module file into a JS module.
+pub struct CssModuleResult {
+    /// The generated JavaScript module code.
+    pub js: String,
+}
+
+/// Convert a `.module.css` file into a JavaScript module that:
+/// 1. Injects the scoped CSS via a `<style>` tag
+/// 2. Exports a default object mapping original class names to scoped names
+///
+/// Uses lightningcss for CSS Modules parsing, which handles:
+/// - Class name scoping with hashes
+/// - `composes` directive
+/// - Animation name scoping
+pub fn css_modules_to_js_module(
+    css_content: &str,
+    file_url: &str,
+) -> Result<CssModuleResult, String> {
+    let filename = file_url.to_string();
+
+    // Configure CSS Modules with a [name]_[local]_[hash] pattern
+    let pattern = lightningcss::css_modules::Pattern::parse("[name]_[local]_[hash]")
+        .map_err(|e| format!("Invalid CSS modules pattern: {e}"))?;
+
+    let config = lightningcss::css_modules::Config {
+        pattern,
+        dashed_idents: false,
+        animation: true,
+        grid: false,
+        custom_idents: false,
+        container: false,
+        pure: false,
+    };
+
+    let stylesheet = StyleSheet::parse(
+        css_content,
+        ParserOptions {
+            filename: filename.clone(),
+            css_modules: Some(config),
+            error_recovery: true,
+            ..ParserOptions::default()
+        },
+    )
+    .map_err(|e| format!("CSS parse error: {e}"))?;
+
+    let result = stylesheet
+        .to_css(PrinterOptions {
+            project_root: None,
+            ..PrinterOptions::default()
+        })
+        .map_err(|e| format!("CSS print error: {e}"))?;
+
+    let scoped_css = &result.code;
+    let exports = result.exports.unwrap_or_default();
+
+    // Build the JS class name mapping object
+    let mappings = build_class_mappings(&exports);
+
+    // Escape the scoped CSS for use in a JS template literal
+    let escaped_css = scoped_css
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace("${", "\\${");
+
+    // Sanitize file URL for DOM id
+    let safe_id = file_url.replace('"', "%22").replace('\\', "/");
+
+    let js = format!(
+        r#"const __vtz_css_id = "__vtz_css_{id}";
+const __vtz_css = `{css}`;
+(function() {{
+  var existing = document.getElementById(__vtz_css_id);
+  if (existing) {{
+    existing.textContent = __vtz_css;
+  }} else {{
+    var style = document.createElement('style');
+    style.id = __vtz_css_id;
+    style.setAttribute('data-vtz-css', '');
+    style.textContent = __vtz_css;
+    document.head.appendChild(style);
+  }}
+}})();
+const __vtz_css_modules = {{{mappings}}};
+export default __vtz_css_modules;
+"#,
+        id = safe_id,
+        css = escaped_css,
+        mappings = mappings,
+    );
+
+    Ok(CssModuleResult { js })
+}
+
+/// Build the JS object literal body for class name mappings.
+///
+/// Handles `composes` by merging all composed class names into a
+/// space-separated string value.
+fn build_class_mappings(exports: &HashMap<String, CssModuleExport>) -> String {
+    if exports.is_empty() {
+        return String::new();
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+
+    // Sort keys for deterministic output
+    let mut keys: Vec<&String> = exports.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        let export = &exports[key];
+        let mut names: Vec<String> = vec![export.name.clone()];
+
+        // Append composed class names
+        for reference in &export.composes {
+            match reference {
+                CssModuleReference::Local { name } => {
+                    names.push(name.clone());
+                }
+                CssModuleReference::Global { name } => {
+                    names.push(name.clone());
+                }
+                CssModuleReference::Dependency { name, .. } => {
+                    // Cross-file composes: include the name as-is for now
+                    names.push(name.clone());
+                }
+            }
+        }
+
+        let value = names.join(" ");
+        entries.push(format!(" \"{key}\": \"{value}\""));
+    }
+
+    entries.join(",\n")
+}
 
 /// Extract the CSS key from a `/@css/` URL path.
 ///
@@ -314,6 +453,168 @@ body { font-family: Inter; }"#;
         assert!(
             js.contains("existing.textContent = __vtz_css"),
             "Should update existing style"
+        );
+    }
+
+    // --- CSS Modules tests ---
+
+    #[test]
+    fn test_css_modules_exports_class_name_mapping() {
+        let css = ".primary { color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        // Should export a default object with class name mappings
+        assert!(
+            result.js.contains("export default"),
+            "Should have a default export"
+        );
+        // The mapping should contain the original class name "primary"
+        assert!(
+            result.js.contains("\"primary\""),
+            "Should contain the original class name as a key. JS:\n{}",
+            result.js
+        );
+    }
+
+    #[test]
+    fn test_css_modules_scoped_class_names_in_css() {
+        let css = ".primary { color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        // The injected CSS should use scoped class names, not the original
+        assert!(
+            !result.js.contains(".primary {"),
+            "Scoped CSS should NOT contain the original .primary selector. JS:\n{}",
+            result.js
+        );
+        // Scoped name should follow the [name]_[local]_[hash] pattern
+        assert!(
+            result.js.contains("Button-module_primary_"),
+            "Scoped CSS should contain the scoped class name. JS:\n{}",
+            result.js
+        );
+    }
+
+    #[test]
+    fn test_css_modules_multiple_classes() {
+        let css = ".primary { color: blue; }\n.secondary { color: red; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        assert!(
+            result.js.contains("\"primary\""),
+            "Should export 'primary' key"
+        );
+        assert!(
+            result.js.contains("\"secondary\""),
+            "Should export 'secondary' key"
+        );
+    }
+
+    #[test]
+    fn test_css_modules_injects_style_tag() {
+        let css = ".primary { color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        assert!(
+            result.js.contains("document.createElement('style')"),
+            "Should inject a style tag"
+        );
+        assert!(
+            result.js.contains("document.head.appendChild"),
+            "Should append style to head"
+        );
+        assert!(
+            result.js.contains("__vtz_css_/src/Button.module.css"),
+            "Style tag ID should include the file path"
+        );
+    }
+
+    #[test]
+    fn test_css_modules_exports_object_as_default() {
+        let css = ".primary { color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        assert!(
+            result.js.contains("export default __vtz_css_modules"),
+            "Should export the modules object, not raw CSS. JS:\n{}",
+            result.js
+        );
+    }
+
+    #[test]
+    fn test_css_modules_composes_local() {
+        let css = ".base { font-size: 16px; }\n.primary { composes: base; color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        // The "primary" export should include both the scoped primary and composed base class
+        // Get the mapping value for "primary" — it should be a space-separated string
+        let js = &result.js;
+        // Find the "primary" mapping line
+        let primary_line = js
+            .lines()
+            .find(|l| l.contains("\"primary\""))
+            .expect("Should have a primary mapping");
+        // The value should contain a space (meaning multiple class names composed)
+        assert!(
+            primary_line.contains(' '),
+            "Composed class should have space-separated values. Line: {}",
+            primary_line
+        );
+    }
+
+    #[test]
+    fn test_css_modules_handles_empty_css() {
+        let result = css_modules_to_js_module("", "/src/Empty.module.css").unwrap();
+
+        assert!(
+            result.js.contains("export default __vtz_css_modules"),
+            "Empty CSS module should still produce valid JS"
+        );
+    }
+
+    #[test]
+    fn test_css_modules_handles_element_selectors() {
+        // Element selectors should pass through unchanged (not scoped)
+        let css = "body { margin: 0; }\n.container { width: 100%; }";
+        let result = css_modules_to_js_module(css, "/src/Layout.module.css").unwrap();
+
+        assert!(
+            result.js.contains("\"container\""),
+            "Should export container class"
+        );
+        // body selector should remain as-is
+        assert!(
+            result.js.contains("body {") || result.js.contains("body{"),
+            "Element selectors should not be scoped. JS:\n{}",
+            result.js
+        );
+    }
+
+    #[test]
+    fn test_css_modules_escapes_backticks_in_css() {
+        let css = ".tooltip::after { content: \"`code`\"; }";
+        let result = css_modules_to_js_module(css, "/src/Tooltip.module.css").unwrap();
+
+        // Backticks in the CSS should be escaped for the template literal
+        assert!(
+            !result.js.contains("content: \"`code`\""),
+            "Backticks should be escaped"
+        );
+    }
+
+    #[test]
+    fn test_css_modules_hmr_updates_existing_style() {
+        let css = ".primary { color: blue; }";
+        let result = css_modules_to_js_module(css, "/src/Button.module.css").unwrap();
+
+        // Should check for existing style element for HMR updates
+        assert!(
+            result.js.contains("document.getElementById(__vtz_css_id)"),
+            "Should look up existing style for HMR"
+        );
+        assert!(
+            result.js.contains("existing.textContent = __vtz_css"),
+            "Should update existing style content on HMR"
         );
     }
 }
