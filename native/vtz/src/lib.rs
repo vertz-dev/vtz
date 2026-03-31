@@ -2,6 +2,7 @@ pub mod banner;
 pub mod compiler;
 pub mod config;
 pub mod deps;
+pub mod env;
 pub mod errors;
 pub mod hmr;
 pub mod native_handler;

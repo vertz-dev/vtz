@@ -115,6 +115,10 @@ impl FrameworkPlugin for VertzPlugin {
         ]
     }
 
+    fn env_public_prefixes(&self) -> Vec<String> {
+        vec!["VERTZ_".into(), "VITE_".into()]
+    }
+
     fn mcp_tool_definitions(&self) -> Vec<PluginMcpTool> {
         vec![PluginMcpTool {
             name: "api_spec".into(),
@@ -323,5 +327,13 @@ mod tests {
         };
         let result = plugin.execute_mcp_tool("unknown_tool", &serde_json::json!({}), &ctx);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_env_public_prefixes_includes_vertz_and_vite() {
+        let plugin = make_plugin();
+        let prefixes = plugin.env_public_prefixes();
+        assert!(prefixes.contains(&"VERTZ_".to_string()));
+        assert!(prefixes.contains(&"VITE_".to_string()));
     }
 }

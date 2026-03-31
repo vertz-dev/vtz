@@ -88,6 +88,16 @@ pub trait FrameworkPlugin: Send + Sync {
         vec!["package.json".into(), "tsconfig.json".into(), ".env".into()]
     }
 
+    /// Public env var prefixes exposed to client code via `import.meta.env`.
+    ///
+    /// Only env vars starting with one of these prefixes are available in
+    /// browser code. This prevents leaking secrets to the client bundle.
+    ///
+    /// Default: `["VITE_"]` for Vite compatibility.
+    fn env_public_prefixes(&self) -> Vec<String> {
+        vec!["VITE_".into()]
+    }
+
     // ── Compilation Metadata ────────────────────────────────
 
     /// Whether this plugin wraps modules for Fast Refresh / HMR accept.
@@ -304,6 +314,13 @@ mod tests {
         let triggers = plugin.restart_triggers();
         assert!(triggers.contains(&"package.json".to_string()));
         assert!(triggers.contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn test_default_env_public_prefixes() {
+        let plugin = TestPlugin;
+        let prefixes = plugin.env_public_prefixes();
+        assert_eq!(prefixes, vec!["VITE_".to_string()]);
     }
 
     #[test]

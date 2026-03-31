@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use crate::compiler::cache::{CachedModule, CompilationCache};
+use crate::compiler::env_replacer;
 use crate::compiler::import_rewriter;
 use crate::plugin::{CompileContext, FrameworkPlugin};
 use crate::tsconfig::TsconfigPaths;
@@ -48,6 +49,8 @@ pub struct CompilationPipeline {
     src_dir: PathBuf,
     plugin: Arc<dyn FrameworkPlugin>,
     tsconfig_paths: Option<TsconfigPaths>,
+    /// Public env vars for `import.meta.env` compile-time replacement.
+    env: HashMap<String, String>,
 }
 
 impl CompilationPipeline {
@@ -59,6 +62,7 @@ impl CompilationPipeline {
             src_dir,
             plugin,
             tsconfig_paths: None,
+            env: HashMap::new(),
         }
     }
 
@@ -67,6 +71,12 @@ impl CompilationPipeline {
         if !paths.is_empty() {
             self.tsconfig_paths = Some(paths);
         }
+        self
+    }
+
+    /// Set the public env vars for `import.meta.env` compile-time replacement.
+    pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
+        self.env = env;
         self
     }
 
@@ -123,6 +133,13 @@ impl CompilationPipeline {
 
         // Plugin post-processing (framework-specific fixups)
         let processed = self.plugin.post_process(&output.code, &ctx);
+
+        // Replace import.meta.env references with literal values
+        let processed = if self.env.is_empty() {
+            processed
+        } else {
+            env_replacer::replace_import_meta_env(&processed, &self.env)
+        };
 
         // Rewrite import specifiers for browser consumption
         let code = import_rewriter::rewrite_imports(
@@ -1952,5 +1969,83 @@ export function App() {
         );
         let result = pipeline.error_module("path\\to\\file");
         assert!(result.code.contains("path\\\\to\\\\file"));
+    }
+
+    // ── import.meta.env replacement in pipeline ───────────────────
+
+    #[test]
+    fn test_compile_replaces_import_meta_env_dev() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("app.ts"),
+            "export const isDev = import.meta.env.DEV;\n",
+        )
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("DEV".to_string(), "true".to_string());
+        env.insert("PROD".to_string(), "false".to_string());
+        env.insert("MODE".to_string(), "development".to_string());
+
+        let pipeline =
+            CompilationPipeline::new(tmp.path().to_path_buf(), src_dir.clone(), test_plugin())
+                .with_env(env);
+
+        let result = pipeline.compile_for_browser(&src_dir.join("app.ts"));
+        assert!(
+            result.code.contains("= true"),
+            "import.meta.env.DEV should be replaced with true. Code: {}",
+            result.code
+        );
+        assert!(
+            !result.code.contains("import.meta.env"),
+            "import.meta.env should be fully replaced. Code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_compile_replaces_import_meta_env_string_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("config.ts"),
+            "export const apiUrl = import.meta.env.VITE_API_URL;\n",
+        )
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "VITE_API_URL".to_string(),
+            "https://api.example.com".to_string(),
+        );
+        env.insert("DEV".to_string(), "true".to_string());
+
+        let pipeline =
+            CompilationPipeline::new(tmp.path().to_path_buf(), src_dir.clone(), test_plugin())
+                .with_env(env);
+
+        let result = pipeline.compile_for_browser(&src_dir.join("config.ts"));
+        assert!(
+            result.code.contains("\"https://api.example.com\""),
+            "import.meta.env.VITE_API_URL should be replaced. Code: {}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_compile_no_env_leaves_code_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("app.ts"), "export const x = 1;\n").unwrap();
+
+        // Empty env — no replacement
+        let pipeline = create_pipeline(tmp.path());
+        let result = pipeline.compile_for_browser(&src_dir.join("app.ts"));
+        assert!(result.code.contains("compiled by vertz-native"));
     }
 }

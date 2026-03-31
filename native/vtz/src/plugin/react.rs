@@ -91,6 +91,8 @@ impl FrameworkPlugin for ReactPlugin {
             "bun.lockb".into(),
             ".env".into(),
             ".env.local".into(),
+            ".env.development".into(),
+            ".env.development.local".into(),
         ]
     }
 

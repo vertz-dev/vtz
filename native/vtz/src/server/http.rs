@@ -110,12 +110,31 @@ pub fn build_router(
         );
     }
 
+    // Load .env files and build public env vars for compile-time replacement
+    let prefixes = plugin.env_public_prefixes();
+    let prefix_refs: Vec<&str> = prefixes.iter().map(|s| s.as_str()).collect();
+    let all_env = crate::env::load_env_files(&config.root_dir, "development");
+    let public_env = crate::env::build_public_env(&all_env, &prefix_refs, "development");
+    if !public_env.is_empty() {
+        let user_vars: Vec<&String> = public_env
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "MODE" | "DEV" | "PROD" | "BASE_URL"))
+            .collect();
+        if !user_vars.is_empty() {
+            eprintln!(
+                "[env] Loaded {} public env var(s) from .env files",
+                user_vars.len()
+            );
+        }
+    }
+
     let pipeline = CompilationPipeline::new(
         config.root_dir.clone(),
         config.src_dir.clone(),
         plugin.clone(),
     )
-    .with_tsconfig_paths(tsconfig_paths);
+    .with_tsconfig_paths(tsconfig_paths)
+    .with_env(public_env);
 
     // Load theme CSS from the project (if available)
     let theme_css = theme_css::load_theme_css(&config.root_dir);
