@@ -720,4 +720,107 @@ mod tests {
         let names = param_names("const f = (x = 5) => {};");
         assert_eq!(names, HashSet::from(["x".to_string()]));
     }
+
+    // ── Phase 1: let signal without init ──────────────────────────────
+
+    #[test]
+    fn let_signal_without_init_stays_let() {
+        let out = transform("function C() { let count; count = 0; return <div>{count}</div>; }");
+        // No init → DeclTransformer skips wrapping (no signal())
+        assert!(
+            out.contains("let count;"),
+            "let without init should stay as let, got: {out}"
+        );
+        // But assignment still gets .value
+        assert!(
+            out.contains("count.value = 0"),
+            "assignment should get .value, got: {out}"
+        );
+    }
+
+    // ── Phase 2: update expression decrement ──────────────────────────
+
+    #[test]
+    fn postfix_decrement_gets_dot_value() {
+        let out = transform(
+            "function C() { let x = 5; const dec = () => { x--; }; return <div>{x}</div>; }",
+        );
+        assert!(out.contains("x.value--"), "expected x.value--, got: {out}");
+    }
+
+    // ── Phase 2: non-shorthand object property walks children ─────────
+
+    #[test]
+    fn non_shorthand_property_value_gets_dot_value() {
+        let out =
+            transform("function C() { let x = 0; const obj = { val: x }; return <div>{x}</div>; }");
+        assert!(
+            out.contains("val: x.value"),
+            "non-shorthand property value should get .value, got: {out}"
+        );
+    }
+
+    // ── Phase 3: signal prop on form.submitting does NOT use field signal path ─
+
+    #[test]
+    fn form_signal_prop_value_not_treated_as_field_chain() {
+        // taskForm.submitting is a signal prop (2-level), NOT a field signal chain (3-level)
+        // taskForm.title.error IS a field signal chain
+        let out = transform(
+            "import { form } from '@vertz/ui';\nfunction C() { const taskForm = form({}); return <div>{taskForm.submitting}{taskForm.title.error}</div>; }",
+        );
+        assert!(
+            out.contains("taskForm.submitting.value"),
+            "signal prop should get .value, got: {out}"
+        );
+        assert!(
+            out.contains("taskForm.title.error.value"),
+            "field signal should get .value, got: {out}"
+        );
+    }
+
+    // ── collect_param_names: object rest ───────────────────────────────
+
+    #[test]
+    fn collect_params_object_with_rest() {
+        let names = param_names("const f = ({ a, ...rest }) => {};");
+        assert!(names.contains("a"));
+        assert!(names.contains("rest"));
+    }
+
+    // ── collect_param_names: array rest ────────────────────────────────
+
+    #[test]
+    fn collect_params_array_with_rest() {
+        let names = param_names("const f = ([first, ...others]) => {};");
+        assert!(names.contains("first"));
+        assert!(names.contains("others"));
+    }
+
+    // ── Phase 2: member expression walk-through ───────────────────────
+
+    #[test]
+    fn signal_ref_through_member_expression() {
+        let out = transform(
+            "function C() { let items = []; const len = items.length; return <div>{len}</div>; }",
+        );
+        assert!(
+            out.contains("items.value.length"),
+            "member expression on signal should get .value on object, got: {out}"
+        );
+    }
+
+    // ── Phase 2: assignment to shadowed signal not transformed ────────
+
+    #[test]
+    fn assignment_to_shadowed_signal_not_transformed() {
+        let out = transform(
+            "function C() { let x = 0; const fn2 = (x) => { x = 5; }; return <div>{x}</div>; }",
+        );
+        // Inner `x = 5` where x is shadowed by param should NOT get .value
+        assert!(
+            out.contains("x = 5"),
+            "shadowed assignment should not get .value, got: {out}"
+        );
+    }
 }
