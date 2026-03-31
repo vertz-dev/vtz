@@ -541,6 +541,10 @@ pub enum ProxyCommand {
     Stop,
     /// Show registered dev servers and their URLs
     Status,
+    /// Install the CA certificate in the system trust store
+    Trust,
+    /// Sync /etc/hosts entries for registered dev servers (Safari support)
+    SyncHosts,
 }
 
 #[derive(Parser, Debug)]
@@ -1731,5 +1735,17 @@ mod tests {
     fn test_proxy_status() {
         let cmd = parse_proxy(&["vtz", "proxy", "status"]);
         assert!(matches!(cmd, ProxyCommand::Status));
+    }
+
+    #[test]
+    fn test_proxy_trust() {
+        let cmd = parse_proxy(&["vtz", "proxy", "trust"]);
+        assert!(matches!(cmd, ProxyCommand::Trust));
+    }
+
+    #[test]
+    fn test_proxy_sync_hosts() {
+        let cmd = parse_proxy(&["vtz", "proxy", "sync-hosts"]);
+        assert!(matches!(cmd, ProxyCommand::SyncHosts));
     }
 }

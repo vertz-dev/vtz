@@ -892,11 +892,18 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
 
     if let Some(ref sub) = proxy_subdomain {
         use owo_colors::OwoColorize;
-        eprintln!(
-            "  {}  {}",
-            "Proxy:".dimmed(),
-            format!("http://{sub}.localhost").cyan().underline()
-        );
+        let proxy_dir = crate::proxy::routes::proxy_dir();
+        let scheme = if crate::proxy::tls::has_server_cert(&proxy_dir) {
+            "https"
+        } else {
+            "http"
+        };
+        let proxy_url = if let Some(port) = crate::proxy::daemon::read_port_file(&proxy_dir) {
+            format!("{scheme}://{sub}.localhost:{port}")
+        } else {
+            format!("{scheme}://{sub}.localhost")
+        };
+        eprintln!("  {}  {}", "Proxy:".dimmed(), proxy_url.cyan().underline());
         eprintln!();
     }
 

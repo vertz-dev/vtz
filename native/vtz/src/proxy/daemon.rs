@@ -1,16 +1,22 @@
 use crate::proxy::host::extract_subdomain;
 use crate::proxy::routes::{self, RouteEntry};
 use axum::body::Body;
+use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite;
+
+/// Header used to detect proxy loops.
+const LOOP_DETECT_HEADER: &str = "x-vertz-proxy";
 
 /// Maximum request body size the proxy will buffer (100 MB).
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
@@ -78,7 +84,20 @@ pub fn build_router(state: ProxyState) -> Router {
 }
 
 /// Main proxy handler: extract subdomain, look up route, forward request.
-async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> Response<Body> {
+async fn proxy_handler(
+    ws: Option<WebSocketUpgrade>,
+    State(state): State<ProxyState>,
+    req: Request<Body>,
+) -> Response<Body> {
+    // Loop detection: reject requests that already passed through this proxy
+    if req.headers().contains_key(LOOP_DETECT_HEADER) {
+        return Response::builder()
+            .status(StatusCode::LOOP_DETECTED)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("Proxy loop detected"))
+            .unwrap();
+    }
+
     let host = req
         .headers()
         .get(header::HOST)
@@ -106,7 +125,98 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> R
         }
     };
 
+    // WebSocket upgrade: bridge client ↔ upstream
+    if let Some(ws) = ws {
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let target_url = format!("ws://127.0.0.1:{}{}", route.port, path_and_query);
+        return ws.on_upgrade(move |socket| ws_proxy(socket, target_url));
+    }
+
     forward_request(req, route.port, &state.client).await
+}
+
+/// Bridge a client WebSocket to an upstream WebSocket bidirectionally.
+async fn ws_proxy(client_ws: WebSocket, target_url: String) {
+    let (upstream_ws, _) = match tokio_tungstenite::connect_async(&target_url).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("WebSocket upstream connection failed: {e}");
+            return;
+        }
+    };
+
+    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
+
+    let client_to_upstream = async {
+        while let Some(Ok(msg)) = client_rx.next().await {
+            if let Some(tung_msg) = axum_msg_to_tungstenite(msg) {
+                if upstream_tx.send(tung_msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+
+    let upstream_to_client = async {
+        while let Some(Ok(msg)) = upstream_rx.next().await {
+            if let Some(axum_msg) = tungstenite_msg_to_axum(msg) {
+                if client_tx.send(axum_msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+
+    // When one direction ends, send Close to the other side so it shuts down
+    // cleanly instead of leaving a half-open connection.
+    tokio::select! {
+        _ = client_to_upstream => {
+            let _ = upstream_tx.send(tungstenite::Message::Close(None)).await;
+            let _ = client_tx.send(ws::Message::Close(None)).await;
+        },
+        _ = upstream_to_client => {
+            let _ = client_tx.send(ws::Message::Close(None)).await;
+            let _ = upstream_tx.send(tungstenite::Message::Close(None)).await;
+        },
+    }
+}
+
+/// Convert an axum WebSocket message to a tungstenite message.
+fn axum_msg_to_tungstenite(msg: ws::Message) -> Option<tungstenite::Message> {
+    match msg {
+        ws::Message::Text(t) => Some(tungstenite::Message::Text(t)),
+        ws::Message::Binary(b) => Some(tungstenite::Message::Binary(b)),
+        ws::Message::Ping(b) => Some(tungstenite::Message::Ping(b)),
+        ws::Message::Pong(b) => Some(tungstenite::Message::Pong(b)),
+        ws::Message::Close(frame) => Some(tungstenite::Message::Close(frame.map(|f| {
+            tungstenite::protocol::CloseFrame {
+                code: tungstenite::protocol::frame::coding::CloseCode::from(f.code),
+                reason: f.reason,
+            }
+        }))),
+    }
+}
+
+/// Convert a tungstenite WebSocket message to an axum message.
+fn tungstenite_msg_to_axum(msg: tungstenite::Message) -> Option<ws::Message> {
+    match msg {
+        tungstenite::Message::Text(s) => Some(ws::Message::Text(s)),
+        tungstenite::Message::Binary(b) => Some(ws::Message::Binary(b)),
+        tungstenite::Message::Ping(b) => Some(ws::Message::Ping(b)),
+        tungstenite::Message::Pong(b) => Some(ws::Message::Pong(b)),
+        tungstenite::Message::Close(frame) => {
+            Some(ws::Message::Close(frame.map(|f| ws::CloseFrame {
+                code: f.code.into(),
+                reason: f.reason,
+            })))
+        }
+        tungstenite::Message::Frame(_) => None,
+    }
 }
 
 /// Forward an HTTP request to the target port on localhost.
@@ -156,6 +266,9 @@ async fn forward_request(
             forwarded = forwarded.header(name.as_str(), v);
         }
     }
+
+    // Inject loop-detection header so re-entry is caught
+    forwarded = forwarded.header(LOOP_DETECT_HEADER, "1");
 
     match forwarded.send().await {
         Ok(resp) => convert_response(resp).await,
@@ -265,6 +378,40 @@ pub async fn start_proxy(
     Ok((actual_port, handle))
 }
 
+/// Start the proxy daemon with TLS (HTTPS), returning the actual bound port.
+pub async fn start_proxy_tls(
+    port: u16,
+    routes_dir: PathBuf,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> std::io::Result<(u16, tokio::task::JoinHandle<()>)> {
+    // Ensure rustls has a crypto provider installed
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let state = ProxyState::new(routes_dir);
+    state.reload_routes().await;
+    let router = build_router(state);
+
+    let std_listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}"))?;
+    let actual_port = std_listener.local_addr()?.port();
+    std_listener.set_nonblocking(true)?;
+
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    let server =
+        axum_server::from_tcp_rustls(std_listener, config).map_err(std::io::Error::other)?;
+
+    let handle = tokio::spawn(async move {
+        server.serve(router.into_make_service()).await.ok();
+    });
+
+    Ok((actual_port, handle))
+}
+
 /// Write the proxy PID file.
 pub fn write_pid_file(proxy_dir: &Path, pid: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(proxy_dir)?;
@@ -281,6 +428,29 @@ pub fn read_pid_file(proxy_dir: &Path) -> Option<u32> {
 /// Remove the proxy PID file.
 pub fn remove_pid_file(proxy_dir: &Path) -> std::io::Result<()> {
     let path = proxy_dir.join("proxy.pid");
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the proxy port file so other tools (e.g. dev server banner) can discover it.
+pub fn write_port_file(proxy_dir: &Path, port: u16) -> std::io::Result<()> {
+    std::fs::create_dir_all(proxy_dir)?;
+    std::fs::write(proxy_dir.join("proxy.port"), port.to_string())
+}
+
+/// Read the proxy port file.
+pub fn read_port_file(proxy_dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(proxy_dir.join("proxy.port"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Remove the proxy port file.
+pub fn remove_port_file(proxy_dir: &Path) -> std::io::Result<()> {
+    let path = proxy_dir.join("proxy.port");
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -337,6 +507,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_detects_loop_and_returns_508() {
+        let dir = test_routes_dir();
+        let routes = dir.path().join("routes");
+        let entry = test_route_entry("loop-app", 3000);
+        routes::register_in(&routes, &entry).unwrap();
+
+        let state = ProxyState::new(routes);
+
+        // Simulate a request that already went through the proxy (has loop header)
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::HOST, "loop-app.localhost:4000")
+            .header(LOOP_DETECT_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = proxy_handler(None, State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
+    }
+
+    #[tokio::test]
+    async fn proxy_injects_loop_header_on_forwarded_requests() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Backend that checks for the loop header
+        let header_found = Arc::new(AtomicBool::new(false));
+        let header_found_clone = header_found.clone();
+        let backend = axum::Router::new().route(
+            "/check",
+            axum::routing::get(move |req: Request<Body>| {
+                let found = req.headers().contains_key(LOOP_DETECT_HEADER);
+                header_found_clone.store(found, Ordering::SeqCst);
+                async { "ok" }
+            }),
+        );
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.ok();
+        });
+
+        let dir = test_routes_dir();
+        let routes = dir.path().join("routes");
+        let entry = test_route_entry("header-app", backend_port);
+        routes::register_in(&routes, &entry).unwrap();
+
+        let (proxy_port, _handle) = start_proxy(0, routes).await.unwrap();
+
+        let client = reqwest::Client::new();
+        client
+            .get(format!("http://127.0.0.1:{proxy_port}/check"))
+            .header("Host", "header-app.localhost")
+            .send()
+            .await
+            .unwrap();
+
+        assert!(
+            header_found.load(Ordering::SeqCst),
+            "Loop detection header should be injected on forwarded requests"
+        );
+    }
+
+    #[tokio::test]
     async fn dashboard_shows_no_servers_when_empty() {
         let dir = test_routes_dir();
         let routes = dir.path().join("routes");
@@ -381,7 +615,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let resp = proxy_handler(State(state), req).await;
+        let resp = proxy_handler(None, State(state), req).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -398,7 +632,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let resp = proxy_handler(State(state), req).await;
+        let resp = proxy_handler(None, State(state), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -436,7 +670,70 @@ mod tests {
         assert!(remove_pid_file(dir.path()).is_ok());
     }
 
-    // --- Integration test: proxy forwards to a real backend ---
+    #[test]
+    fn write_and_read_port_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_port_file(dir.path(), 4000).unwrap();
+        assert_eq!(read_port_file(dir.path()), Some(4000));
+    }
+
+    #[test]
+    fn read_port_file_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_port_file(dir.path()), None);
+    }
+
+    // --- Integration tests: proxy forwards to real backends ---
+
+    #[tokio::test]
+    async fn proxy_forwards_request_over_tls() {
+        use crate::proxy::tls;
+
+        // Generate CA + server certs
+        let tls_dir = tempfile::tempdir().unwrap();
+        tls::generate_ca(tls_dir.path()).unwrap();
+        tls::generate_server_cert(tls_dir.path()).unwrap();
+
+        // Backend HTTP server
+        let backend =
+            axum::Router::new().route("/hello", axum::routing::get(|| async { "Hello over TLS!" }));
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.ok();
+        });
+
+        // Register route
+        let dir = test_routes_dir();
+        let routes_dir = dir.path().join("routes");
+        let entry = test_route_entry("tls-app", backend_port);
+        routes::register_in(&routes_dir, &entry).unwrap();
+
+        // Start TLS proxy
+        let cert_path = tls_dir.path().join("server-cert.pem");
+        let key_path = tls_dir.path().join("server-key.pem");
+        let (proxy_port, _handle) = start_proxy_tls(0, routes_dir, cert_path, key_path)
+            .await
+            .unwrap();
+
+        // Build HTTPS client that trusts our CA
+        let ca_pem = std::fs::read(tls_dir.path().join("ca-cert.pem")).unwrap();
+        let ca_cert = reqwest::Certificate::from_pem(&ca_pem).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(ca_cert)
+            .build()
+            .unwrap();
+
+        let resp = client
+            .get(format!("https://localhost:{proxy_port}/hello"))
+            .header("Host", "tls-app.localhost")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "Hello over TLS!");
+    }
 
     #[tokio::test]
     async fn proxy_forwards_request_to_backend() {
@@ -487,6 +784,118 @@ mod tests {
     fn html_escape_passes_through_safe_strings() {
         assert_eq!(html_escape("feat-auth.my-app"), "feat-auth.my-app");
         assert_eq!(html_escape("fix/bug-123"), "fix/bug-123");
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_websocket_to_backend() {
+        use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+        use futures_util::{SinkExt, StreamExt};
+
+        // Backend WebSocket echo server
+        let backend = Router::new().route(
+            "/ws-echo",
+            axum::routing::get(|ws: WebSocketUpgrade| async {
+                ws.on_upgrade(|mut socket: WebSocket| async move {
+                    while let Some(Ok(msg)) = socket.recv().await {
+                        if matches!(msg, axum::extract::ws::Message::Text(_)) {
+                            let _ = socket.send(msg).await;
+                        }
+                    }
+                })
+            }),
+        );
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.ok();
+        });
+
+        // Register route
+        let dir = test_routes_dir();
+        let routes_dir = dir.path().join("routes");
+        let entry = test_route_entry("ws-app", backend_port);
+        routes::register_in(&routes_dir, &entry).unwrap();
+
+        // Start proxy
+        let (proxy_port, _handle) = start_proxy(0, routes_dir).await.unwrap();
+
+        // Connect WebSocket through proxy with custom Host header
+        let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(format!("ws://127.0.0.1:{proxy_port}/ws-echo"))
+            .header("Host", "ws-app.localhost")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", key)
+            .body(())
+            .unwrap();
+
+        let (mut ws_stream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .expect("WebSocket connection timed out")
+        .expect("WebSocket handshake through proxy failed");
+
+        // Send a message
+        ws_stream
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "hello proxy".into(),
+            ))
+            .await
+            .unwrap();
+
+        // Verify echo
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            StreamExt::next(&mut ws_stream),
+        )
+        .await
+        .expect("Timed out waiting for echo")
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.into_text().unwrap(), "hello proxy");
+
+        ws_stream.close(None).await.ok();
+    }
+
+    // --- WebSocket message conversion tests ---
+
+    #[test]
+    fn axum_text_converts_to_tungstenite() {
+        let msg = ws::Message::Text("hello".into());
+        let result = axum_msg_to_tungstenite(msg).unwrap();
+        assert_eq!(result, tungstenite::Message::Text("hello".into()));
+    }
+
+    #[test]
+    fn axum_binary_converts_to_tungstenite() {
+        let msg = ws::Message::Binary(vec![1, 2, 3]);
+        let result = axum_msg_to_tungstenite(msg).unwrap();
+        assert_eq!(result, tungstenite::Message::Binary(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn tungstenite_text_converts_to_axum() {
+        let msg = tungstenite::Message::Text("world".into());
+        let result = tungstenite_msg_to_axum(msg).unwrap();
+        assert!(matches!(result, ws::Message::Text(_)));
+    }
+
+    #[test]
+    fn tungstenite_binary_converts_to_axum() {
+        let msg = tungstenite::Message::Binary(vec![4, 5, 6]);
+        let result = tungstenite_msg_to_axum(msg).unwrap();
+        assert!(matches!(result, ws::Message::Binary(_)));
+    }
+
+    #[test]
+    fn tungstenite_frame_returns_none() {
+        let msg = tungstenite::Message::Frame(tungstenite::protocol::frame::Frame::ping(vec![]));
+        assert!(tungstenite_msg_to_axum(msg).is_none());
     }
 
     #[tokio::test]
