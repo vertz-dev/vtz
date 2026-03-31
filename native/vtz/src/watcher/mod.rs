@@ -44,11 +44,21 @@ pub fn process_file_change(
     graph: &SharedModuleGraph,
     entry_file: &Path,
 ) -> InvalidationResult {
-    let is_css_only = change
+    // A CSS file is "CSS-only" if it has no JS dependents in the module graph.
+    // When a CSS file is imported by JS (`import './styles.css'`), it's served
+    // as a JS module — so changes should trigger a module update, not a CSS update.
+    let is_css_only = if change
         .path
         .extension()
         .map(|ext| ext == "css")
-        .unwrap_or(false);
+        .unwrap_or(false)
+    {
+        let g = graph.read().unwrap();
+        let dependents = g.get_dependents(&change.path);
+        dependents.is_empty()
+    } else {
+        false
+    };
 
     let is_entry_file = change.path == entry_file;
 
@@ -195,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_file_change_css_only() {
+    fn test_process_file_change_css_only_standalone() {
         let cache = CompilationCache::new();
         let graph = new_shared_module_graph();
         let entry = PathBuf::from("/src/app.tsx");
@@ -206,7 +216,44 @@ mod tests {
         };
 
         let result = process_file_change(&change, &cache, &graph, &entry);
+        // A CSS file with no JS dependents is CSS-only
         assert!(result.is_css_only);
+    }
+
+    #[test]
+    fn test_process_file_change_css_imported_by_js_is_module_update() {
+        let cache = CompilationCache::new();
+        let graph = new_shared_module_graph();
+        let entry = PathBuf::from("/src/app.tsx");
+
+        // app.tsx imports styles.css
+        {
+            let mut g = graph.write().unwrap();
+            g.update_module(
+                Path::new("/src/app.tsx"),
+                vec![PathBuf::from("/src/styles.css")],
+            );
+        }
+
+        let change = FileChange {
+            kind: FileChangeKind::Modify,
+            path: PathBuf::from("/src/styles.css"),
+        };
+
+        let result = process_file_change(&change, &cache, &graph, &entry);
+        // CSS file imported by JS should NOT be css_only — it should trigger
+        // a module update so the JS wrapper is re-imported
+        assert!(
+            !result.is_css_only,
+            "CSS imported by JS should be a module update, not CSS-only"
+        );
+        // The invalidated files should include the CSS file and its JS dependents
+        assert!(result
+            .invalidated_files
+            .contains(&PathBuf::from("/src/styles.css")));
+        assert!(result
+            .invalidated_files
+            .contains(&PathBuf::from("/src/app.tsx")));
     }
 
     #[test]

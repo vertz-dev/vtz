@@ -567,6 +567,47 @@ export default foo;"#;
     }
 
     #[test]
+    fn test_rewrite_relative_css_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("styles.css"), "body { margin: 0; }").unwrap();
+
+        let result = rewrite_specifier(
+            "./styles.css",
+            &src_dir.join("app.tsx"),
+            &src_dir,
+            tmp.path(),
+        );
+        assert_eq!(result, "/src/styles.css");
+    }
+
+    #[test]
+    fn test_rewrite_css_import_in_full_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("App.css"), ".app { display: flex; }").unwrap();
+
+        let code = r#"import './App.css';
+import { signal } from '@vertz/ui';
+const x = 1;"#;
+
+        let result = rewrite_imports(code, &src_dir.join("app.tsx"), &src_dir, tmp.path());
+
+        assert!(
+            result.contains("import '/src/App.css'"),
+            "CSS import should be rewritten to absolute path. Result: {}",
+            result
+        );
+        assert!(
+            result.contains("from '/@deps/@vertz/ui'"),
+            "Other imports should still work. Result: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_normalize_path_with_dot() {
         let p = normalize_path(Path::new("/project/src/./utils/format"));
         assert_eq!(p, PathBuf::from("/project/src/utils/format"));

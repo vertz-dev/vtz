@@ -99,6 +99,11 @@ pub async fn handle_source_file(
             .unwrap();
     }
 
+    // CSS files: serve as a JS module that injects a <style> tag
+    if clean_path.ends_with(".css") {
+        return handle_css_source_file(&file_path, clean_path);
+    }
+
     // Compile the file for browser consumption
     let result = state.pipeline.compile_for_browser(&file_path);
 
@@ -170,6 +175,34 @@ pub async fn handle_source_file(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(result.code))
         .unwrap()
+}
+
+/// Handle CSS source file requests: `GET /src/**/*.css` → JS module with style injection.
+///
+/// Reads the raw CSS from disk and wraps it in a JavaScript module that
+/// creates/updates a `<style>` tag in `<head>`. This enables:
+/// - `import './styles.css'` to work as a side-effect import
+/// - HMR via module re-import (the style tag is updated in place)
+fn handle_css_source_file(file_path: &Path, url_path: &str) -> Response<Body> {
+    match std::fs::read_to_string(file_path) {
+        Ok(css_content) => {
+            let js_module = css_server::css_to_js_module(&css_content, url_path);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                )
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(js_module))
+                .unwrap()
+        }
+        Err(e) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(format!("Failed to read CSS file: {}", e)))
+            .unwrap(),
+    }
 }
 
 /// Handle source map requests: `GET /src/**/*.tsx.map`.
@@ -1971,5 +2004,84 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("--color: red"));
+    }
+
+    // ── handle_source_file: CSS file served as JS module ─────────────
+
+    #[tokio::test]
+    async fn test_handle_source_file_css_returns_js_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(
+            tmp.path().join("src/styles.css"),
+            "body { margin: 0; color: red; }\n",
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/styles.css")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(
+            ct.to_str().unwrap().contains("application/javascript"),
+            "CSS files should be served as JavaScript modules"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            code.contains("body { margin: 0; color: red; }"),
+            "JS module should contain the CSS content"
+        );
+        assert!(
+            code.contains("document.createElement('style')"),
+            "JS module should inject a style element"
+        );
+        assert!(
+            code.contains("export default"),
+            "JS module should export the CSS string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_css_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        let req = Request::builder()
+            .uri("/src/nonexistent.css")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_css_cache_bust_query_stripped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        std::fs::write(tmp.path().join("src/app.css"), ".app { display: flex; }\n").unwrap();
+
+        let req = Request::builder()
+            .uri("/src/app.css?t=1234567890")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+        assert!(code.contains(".app { display: flex; }"));
     }
 }
