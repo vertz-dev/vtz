@@ -571,3 +571,781 @@ fn parse_entity_operation(chain: &str) -> (Option<String>, Option<String>) {
         (None, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn analyze(source: &str) -> PrefetchAnalysis {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        analyze_prefetch(&parsed.program, source)
+    }
+
+    // ========== parse_entity_operation ==========
+
+    #[test]
+    fn parse_entity_operation_full_chain() {
+        let (entity, op) = parse_entity_operation("api.projects.list");
+        assert_eq!(entity.as_deref(), Some("projects"));
+        assert_eq!(op.as_deref(), Some("list"));
+    }
+
+    #[test]
+    fn parse_entity_operation_long_chain() {
+        let (entity, op) = parse_entity_operation("api.projects.list.extra");
+        assert_eq!(entity.as_deref(), Some("projects"));
+        assert_eq!(op.as_deref(), Some("list"));
+    }
+
+    #[test]
+    fn parse_entity_operation_short_chain() {
+        let (entity, op) = parse_entity_operation("api.projects");
+        assert!(entity.is_none());
+        assert!(op.is_none());
+    }
+
+    #[test]
+    fn parse_entity_operation_single() {
+        let (entity, op) = parse_entity_operation("api");
+        assert!(entity.is_none());
+        assert!(op.is_none());
+    }
+
+    // ========== join_patterns ==========
+
+    #[test]
+    fn join_patterns_empty_parent() {
+        assert_eq!(join_patterns("", "/projects"), "/projects");
+    }
+
+    #[test]
+    fn join_patterns_child_is_root() {
+        assert_eq!(join_patterns("/app", "/"), "/app");
+    }
+
+    #[test]
+    fn join_patterns_normal() {
+        assert_eq!(join_patterns("/app", "/projects"), "/app/projects");
+    }
+
+    #[test]
+    fn join_patterns_parent_trailing_slash() {
+        assert_eq!(join_patterns("/app/", "/projects"), "/app/projects");
+    }
+
+    // ========== extract_property_access_chain ==========
+
+    #[test]
+    fn extract_chain_from_identifier() {
+        let source = "api";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        if let Some(Statement::ExpressionStatement(expr_stmt)) = parsed.program.body.first() {
+            let chain = extract_property_access_chain(&expr_stmt.expression);
+            assert_eq!(chain.as_deref(), Some("api"));
+        }
+    }
+
+    #[test]
+    fn extract_chain_from_member_expression() {
+        let source = "api.projects.list";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        if let Some(Statement::ExpressionStatement(expr_stmt)) = parsed.program.body.first() {
+            let chain = extract_property_access_chain(&expr_stmt.expression);
+            assert_eq!(chain.as_deref(), Some("api.projects.list"));
+        }
+    }
+
+    // ========== get_identifier_key ==========
+
+    #[test]
+    fn get_identifier_key_returns_none_for_computed() {
+        let source = "const x = { [dynamic]: 1 }";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        if let Some(Statement::VariableDeclaration(var_decl)) = parsed.program.body.first() {
+            if let Some(Expression::ObjectExpression(obj)) = var_decl.declarations[0].init.as_ref()
+            {
+                if let ObjectPropertyKind::ObjectProperty(prop) = &obj.properties[0] {
+                    assert!(get_identifier_key(prop).is_none());
+                }
+            }
+        }
+    }
+
+    // ========== No defineRoutes ==========
+
+    #[test]
+    fn no_define_routes_returns_empty() {
+        let result = analyze("const x = 42;");
+        assert!(result.routes.is_empty());
+        assert!(result.queries.is_empty());
+        assert!(result.route_params.is_empty());
+    }
+
+    #[test]
+    fn empty_source() {
+        let result = analyze("");
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== Simple route extraction ==========
+
+    #[test]
+    fn simple_route_extraction() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: () => HomePage(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 1);
+        assert_eq!(result.routes[0].pattern, "/");
+        assert_eq!(result.routes[0].component_name, "HomePage");
+        assert_eq!(result.routes[0].route_type, "page");
+    }
+
+    #[test]
+    fn multiple_routes() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: () => HomePage(),
+    },
+    "/about": {
+        component: () => AboutPage(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 2);
+        assert_eq!(result.routes[0].pattern, "/");
+        assert_eq!(result.routes[1].pattern, "/about");
+    }
+
+    // ========== Nested routes ==========
+
+    #[test]
+    fn nested_routes_flatten_patterns() {
+        let source = r#"const routes = defineRoutes({
+    "/app": {
+        component: () => AppLayout(),
+        children: {
+            "/projects": {
+                component: () => ProjectsPage(),
+            },
+        },
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 2);
+        assert_eq!(result.routes[0].pattern, "/app");
+        assert_eq!(result.routes[0].route_type, "layout");
+        assert_eq!(result.routes[1].pattern, "/app/projects");
+        assert_eq!(result.routes[1].route_type, "page");
+    }
+
+    // ========== Route with params ==========
+
+    #[test]
+    fn route_params_extracted_from_pattern() {
+        let source = r#"const routes = defineRoutes({
+    "/projects/:projectId": {
+        component: () => ProjectPage(),
+    },
+});"#;
+        let result = analyze(source);
+        assert!(result.route_params.contains(&"projectId".to_string()));
+    }
+
+    #[test]
+    fn route_params_not_duplicated() {
+        let source = r#"function Page() {
+    const { projectId } = useParams();
+    return null;
+}
+const routes = defineRoutes({
+    "/projects/:projectId": {
+        component: () => ProjectPage(),
+    },
+});"#;
+        let result = analyze(source);
+        let count = result
+            .route_params
+            .iter()
+            .filter(|p| *p == "projectId")
+            .count();
+        assert_eq!(count, 1, "params: {:?}", result.route_params);
+    }
+
+    // ========== useParams extraction ==========
+
+    #[test]
+    fn use_params_extraction() {
+        let source = r#"function Page() {
+    const { projectId, taskId } = useParams();
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.contains(&"projectId".to_string()));
+        assert!(result.route_params.contains(&"taskId".to_string()));
+    }
+
+    #[test]
+    fn use_params_in_export_default_function() {
+        let source = r#"export default function Page() {
+    const { id } = useParams();
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.contains(&"id".to_string()));
+    }
+
+    #[test]
+    fn use_params_in_export_named_function() {
+        let source = r#"export function Page() {
+    const { id } = useParams();
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.contains(&"id".to_string()));
+    }
+
+    #[test]
+    fn use_params_in_export_named_variable() {
+        let source = r#"export const params = useParams();"#;
+        let result = analyze(source);
+        // Non-destructured useParams — no params extracted
+        assert!(result.route_params.is_empty());
+    }
+
+    #[test]
+    fn no_use_params_no_route_params() {
+        let source = r#"function Page() {
+    const x = 42;
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.is_empty());
+    }
+
+    #[test]
+    fn use_params_not_destructured_no_params() {
+        let source = r#"function Page() {
+    const params = useParams();
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.is_empty());
+    }
+
+    // ========== Query extraction ==========
+
+    #[test]
+    fn simple_query_extraction() {
+        let source = r#"function Page() {
+    const projects = query(api.projects.list());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        assert_eq!(result.queries[0].descriptor_chain, "api.projects.list");
+        assert_eq!(result.queries[0].entity.as_deref(), Some("projects"));
+        assert_eq!(result.queries[0].operation.as_deref(), Some("list"));
+        assert!(result.queries[0].id_param.is_none());
+    }
+
+    #[test]
+    fn query_with_get_and_route_param() {
+        let source = r#"function Page() {
+    const { projectId } = useParams();
+    const project = query(api.projects.get(projectId));
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        assert_eq!(result.queries[0].operation.as_deref(), Some("get"));
+        assert_eq!(result.queries[0].id_param.as_deref(), Some("projectId"));
+    }
+
+    #[test]
+    fn query_with_get_non_param_arg() {
+        let source = r#"function Page() {
+    const project = query(api.projects.get(someVar));
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        // someVar is not a route param, so id_param is None
+        assert!(result.queries[0].id_param.is_none());
+    }
+
+    #[test]
+    fn query_with_variable_reference() {
+        let source = r#"function Page() {
+    const data = query(myDescriptor);
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        assert_eq!(result.queries[0].descriptor_chain, "myDescriptor");
+        assert!(result.queries[0].entity.is_none());
+        assert!(result.queries[0].operation.is_none());
+    }
+
+    #[test]
+    fn multiple_queries() {
+        let source = r#"function Page() {
+    const projects = query(api.projects.list());
+    const tasks = query(api.tasks.list());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 2);
+    }
+
+    #[test]
+    fn query_in_expression_statement() {
+        let source = r#"function Page() {
+    query(api.projects.list());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+    }
+
+    #[test]
+    fn query_in_export_default_function() {
+        let source = r#"export default function Page() {
+    const data = query(api.projects.list());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+    }
+
+    #[test]
+    fn query_in_export_named_function() {
+        let source = r#"export function Page() {
+    const data = query(api.projects.list());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+    }
+
+    #[test]
+    fn query_in_export_named_variable() {
+        let source = r#"export const data = query(api.projects.list());"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+    }
+
+    #[test]
+    fn no_query_calls() {
+        let source = r#"function Page() {
+    const x = fetch("/api/projects");
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.queries.is_empty());
+    }
+
+    #[test]
+    fn query_with_no_arguments_ignored() {
+        let source = r#"function Page() {
+    const data = query();
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.queries.is_empty());
+    }
+
+    // ========== defineRoutes in different statement positions ==========
+
+    #[test]
+    fn define_routes_in_expression_statement() {
+        let source = r#"defineRoutes({
+    "/": {
+        component: () => Home(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 1);
+    }
+
+    #[test]
+    fn define_routes_in_export_named() {
+        let source = r#"export const routes = defineRoutes({
+    "/": {
+        component: () => Home(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 1);
+    }
+
+    #[test]
+    fn define_routes_in_export_default() {
+        let source = r#"export default defineRoutes({
+    "/": {
+        component: () => Home(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 1);
+    }
+
+    // ========== Component name extraction ==========
+
+    #[test]
+    fn component_name_from_arrow_function_call() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: () => HomePage(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes[0].component_name, "HomePage");
+    }
+
+    #[test]
+    fn component_name_from_arrow_jsx() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: () => <HomePage />,
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes[0].component_name, "HomePage");
+    }
+
+    #[test]
+    fn component_name_from_bare_identifier() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: HomePage,
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes[0].component_name, "HomePage");
+    }
+
+    #[test]
+    fn component_name_from_parenthesized_expression() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: () => (HomePage()),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes[0].component_name, "HomePage");
+    }
+
+    // ========== Route without component is skipped ==========
+
+    #[test]
+    fn route_without_component_is_skipped() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        layout: true,
+    },
+});"#;
+        let result = analyze(source);
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== Query in if statement ==========
+
+    #[test]
+    fn query_in_if_statement() {
+        let source = r#"function Page() {
+    if (condition) {
+        const data = query(api.projects.list());
+    }
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+    }
+
+    #[test]
+    fn query_in_if_else() {
+        let source = r#"function Page() {
+    if (condition) {
+        const a = query(api.projects.list());
+    } else {
+        const b = query(api.tasks.list());
+    }
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 2);
+    }
+
+    // ========== Query in return statement ==========
+
+    #[test]
+    fn query_in_return_statement() {
+        let source = r#"function Page() {
+    return query(api.projects.list());
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+    }
+
+    // ========== get_property_key_string ==========
+
+    #[test]
+    fn property_key_from_string_literal() {
+        let source = r#"const routes = defineRoutes({
+    "/projects": {
+        component: () => Projects(),
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes[0].pattern, "/projects");
+    }
+
+    // ========== Deeply nested routes ==========
+
+    #[test]
+    fn deeply_nested_routes() {
+        let source = r#"const routes = defineRoutes({
+    "/app": {
+        component: () => AppLayout(),
+        children: {
+            "/projects": {
+                component: () => ProjectsLayout(),
+                children: {
+                    "/:projectId": {
+                        component: () => ProjectPage(),
+                    },
+                },
+            },
+        },
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 3);
+        assert_eq!(result.routes[0].pattern, "/app");
+        assert_eq!(result.routes[0].route_type, "layout");
+        assert_eq!(result.routes[1].pattern, "/app/projects");
+        assert_eq!(result.routes[1].route_type, "layout");
+        assert_eq!(result.routes[2].pattern, "/app/projects/:projectId");
+        assert_eq!(result.routes[2].route_type, "page");
+    }
+
+    // ========== Route child "/" pattern ==========
+
+    #[test]
+    fn child_route_with_root_pattern() {
+        let source = r#"const routes = defineRoutes({
+    "/app": {
+        component: () => AppLayout(),
+        children: {
+            "/": {
+                component: () => Dashboard(),
+            },
+        },
+    },
+});"#;
+        let result = analyze(source);
+        assert_eq!(result.routes.len(), 2);
+        assert_eq!(result.routes[1].pattern, "/app");
+    }
+
+    // ========== Non-function callee for query ==========
+
+    #[test]
+    fn query_like_call_with_non_identifier_callee_ignored() {
+        let source = r#"function Page() {
+    const data = obj.query(api.projects.list());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.queries.is_empty());
+    }
+
+    // ========== extract_query_info with non-call, non-identifier arg ==========
+
+    #[test]
+    fn query_with_non_extractable_arg() {
+        let source = r#"function Page() {
+    const data = query(42);
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.queries.is_empty());
+    }
+
+    // ========== extract_property_access_chain with computed member ==========
+
+    #[test]
+    fn computed_member_expression_returns_none() {
+        let source = "api['projects']";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        if let Some(Statement::ExpressionStatement(expr_stmt)) = parsed.program.body.first() {
+            let chain = extract_property_access_chain(&expr_stmt.expression);
+            assert!(chain.is_none(), "chain: {:?}", chain);
+        }
+    }
+
+    // ========== query with get but no args ==========
+
+    #[test]
+    fn query_get_with_no_args() {
+        let source = r#"function Page() {
+    const project = query(api.projects.get());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        assert_eq!(result.queries[0].operation.as_deref(), Some("get"));
+        assert!(result.queries[0].id_param.is_none());
+    }
+
+    // ========== query with get and non-identifier arg ==========
+
+    #[test]
+    fn query_get_with_literal_arg() {
+        let source = r#"function Page() {
+    const project = query(api.projects.get("static-id"));
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        assert!(result.queries[0].id_param.is_none());
+    }
+
+    // ========== Full integration ==========
+
+    #[test]
+    fn full_integration_routes_params_and_queries() {
+        let source = r#"
+function ProjectPage() {
+    const { projectId } = useParams();
+    const project = query(api.projects.get(projectId));
+    const tasks = query(api.tasks.list());
+    return null;
+}
+
+const routes = defineRoutes({
+    "/projects/:projectId": {
+        component: () => ProjectPage(),
+    },
+});"#;
+        let result = analyze(source);
+
+        assert_eq!(result.routes.len(), 1);
+        assert_eq!(result.routes[0].pattern, "/projects/:projectId");
+
+        assert!(result.route_params.contains(&"projectId".to_string()));
+
+        assert_eq!(result.queries.len(), 2);
+        assert_eq!(result.queries[0].entity.as_deref(), Some("projects"));
+        assert_eq!(result.queries[0].operation.as_deref(), Some("get"));
+        assert_eq!(result.queries[0].id_param.as_deref(), Some("projectId"));
+        assert_eq!(result.queries[1].entity.as_deref(), Some("tasks"));
+        assert_eq!(result.queries[1].operation.as_deref(), Some("list"));
+    }
+
+    // ========== Arrow body that is not an expression body ==========
+
+    #[test]
+    fn arrow_block_body_component_not_extracted() {
+        let source = r#"const routes = defineRoutes({
+    "/": {
+        component: () => { return HomePage(); },
+    },
+});"#;
+        let result = analyze(source);
+        // Block-body arrow: get_arrow_body_expr returns None (expression=false)
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== Non-standard callee for defineRoutes ==========
+
+    #[test]
+    fn non_define_routes_call_ignored() {
+        let source = r#"const routes = createRoutes({
+    "/": { component: () => Home() },
+});"#;
+        let result = analyze(source);
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== defineRoutes with non-object arg ==========
+
+    #[test]
+    fn define_routes_with_non_object_arg() {
+        let source = r#"const routes = defineRoutes(routeConfig);"#;
+        let result = analyze(source);
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== Route with non-object value ==========
+
+    #[test]
+    fn route_with_non_object_value_skipped() {
+        let source = r#"const routes = defineRoutes({
+    "/": "invalid",
+});"#;
+        let result = analyze(source);
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== check_use_params_declarator without init ==========
+
+    #[test]
+    fn variable_without_init_no_params() {
+        let source = r#"function Page() {
+    let params;
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.is_empty());
+    }
+
+    // ========== is_define_routes_call with non-identifier callee ==========
+
+    #[test]
+    fn method_call_not_define_routes() {
+        let source = r#"const routes = router.defineRoutes({
+    "/": { component: () => Home() },
+});"#;
+        let result = analyze(source);
+        assert!(result.routes.is_empty());
+    }
+
+    // ========== useParams called as method ==========
+
+    #[test]
+    fn use_params_as_method_not_extracted() {
+        let source = r#"function Page() {
+    const { id } = router.useParams();
+    return null;
+}"#;
+        let result = analyze(source);
+        assert!(result.route_params.is_empty());
+    }
+
+    // ========== Query with short chain (no entity/operation) ==========
+
+    #[test]
+    fn query_with_short_chain() {
+        let source = r#"function Page() {
+    const data = query(fetch());
+    return null;
+}"#;
+        let result = analyze(source);
+        assert_eq!(result.queries.len(), 1);
+        assert_eq!(result.queries[0].descriptor_chain, "fetch");
+        assert!(result.queries[0].entity.is_none());
+        assert!(result.queries[0].operation.is_none());
+    }
+}
