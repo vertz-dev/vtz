@@ -146,12 +146,12 @@ jobs:
           NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
 
-      - name: Create GitHub Release
-        if: steps.changesets.outputs.published == 'true'
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=$(cat version.txt)
+          TAG="v${VERSION}"
           ASSETS=()
           for dir in npm/runtime-*/; do
             if [ -f "${dir}vtz" ]; then
@@ -162,7 +162,19 @@ jobs:
             fi
           done
 
-          gh release create "v${VERSION}" \
-            --title "v${VERSION}" \
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "No binaries found, skipping release"
+            exit 0
+          fi
+
+          # Delete existing release for this version so we can recreate with fresh binaries
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Release $TAG exists, updating with new binaries..."
+            gh release delete "$TAG" --yes
+            git push origin --delete "$TAG" 2>/dev/null || true
+          fi
+
+          gh release create "$TAG" \
+            --title "$TAG" \
             --generate-notes \
-            "${ASSETS[@]}" || true
+            "${ASSETS[@]}"
