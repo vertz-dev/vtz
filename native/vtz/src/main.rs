@@ -969,7 +969,7 @@ async fn main() {
             }
         }
         Command::Proxy(proxy_args) => {
-            use vertz_runtime::proxy::{daemon, routes};
+            use vertz_runtime::proxy::{daemon, routes, tls};
 
             let proxy_dir = routes::proxy_dir();
             let routes_dir = routes::routes_dir();
@@ -982,9 +982,34 @@ async fn main() {
                         eprintln!("Cleaned stale route: {}", name);
                     }
 
-                    // Start the proxy daemon in the foreground
-                    eprintln!("Starting proxy on port {}...", args.port);
-                    match daemon::start_proxy(args.port, routes_dir).await {
+                    // Generate CA + server certs if not already present
+                    if !tls::has_server_cert(&proxy_dir) {
+                        eprintln!("Generating TLS certificates...");
+                        if let Err(e) = tls::generate_ca(&proxy_dir) {
+                            eprintln!("Failed to generate CA: {}", e);
+                            std::process::exit(1);
+                        }
+                        if let Err(e) = tls::generate_server_cert(&proxy_dir) {
+                            eprintln!("Failed to generate server cert: {}", e);
+                            std::process::exit(1);
+                        }
+                        eprintln!("TLS certificates generated.");
+                        eprintln!("  CA cert: {}/ca-cert.pem", proxy_dir.display());
+                        eprintln!();
+                        eprintln!(
+                            "To trust the CA (macOS), run:\n  sudo security add-trusted-cert -d -r trustRoot \
+                             -k /Library/Keychains/System.keychain {}/ca-cert.pem",
+                            proxy_dir.display()
+                        );
+                        eprintln!();
+                    }
+
+                    // Start the proxy daemon with TLS
+                    let cert_path = proxy_dir.join("server-cert.pem");
+                    let key_path = proxy_dir.join("server-key.pem");
+                    eprintln!("Starting HTTPS proxy on port {}...", args.port);
+                    match daemon::start_proxy_tls(args.port, routes_dir, cert_path, key_path).await
+                    {
                         Ok((actual_port, handle)) => {
                             daemon::write_pid_file(&proxy_dir, std::process::id()).unwrap_or_else(
                                 |e| {
@@ -992,13 +1017,13 @@ async fn main() {
                                 },
                             );
                             eprintln!(
-                                "\n\u{25b2} Vertz Proxy running on http://localhost:{}\n",
+                                "\n\u{25b2} Vertz Proxy running on https://localhost:{}\n",
                                 actual_port
                             );
                             eprintln!(
                                 "  Dev servers will auto-register when started with `vtz dev`."
                             );
-                            eprintln!("  Dashboard: http://localhost:{}\n", actual_port);
+                            eprintln!("  Dashboard: https://localhost:{}\n", actual_port);
 
                             // Block until the server exits
                             handle.await.ok();
@@ -1024,17 +1049,30 @@ async fn main() {
                     // Clean stale routes
                     routes::clean_stale_routes();
 
-                    eprintln!("Starting proxy on port {}...", args.port);
-                    match daemon::start_proxy(args.port, routes_dir).await {
+                    // Start with TLS if certs are available, otherwise HTTP
+                    let use_tls = tls::has_server_cert(&proxy_dir);
+                    let result = if use_tls {
+                        let cert_path = proxy_dir.join("server-cert.pem");
+                        let key_path = proxy_dir.join("server-key.pem");
+                        eprintln!("Starting HTTPS proxy on port {}...", args.port);
+                        daemon::start_proxy_tls(args.port, routes_dir, cert_path, key_path).await
+                    } else {
+                        eprintln!("Starting HTTP proxy on port {}...", args.port);
+                        eprintln!("  (Run `vtz proxy init` first for HTTPS support)");
+                        daemon::start_proxy(args.port, routes_dir).await
+                    };
+
+                    match result {
                         Ok((actual_port, handle)) => {
                             daemon::write_pid_file(&proxy_dir, std::process::id()).unwrap_or_else(
                                 |e| {
                                     eprintln!("Warning: failed to write PID file: {}", e);
                                 },
                             );
+                            let scheme = if use_tls { "https" } else { "http" };
                             eprintln!(
-                                "\u{25b2} Vertz Proxy running on http://localhost:{}",
-                                actual_port
+                                "\u{25b2} Vertz Proxy running on {}://localhost:{}",
+                                scheme, actual_port
                             );
                             handle.await.ok();
                             daemon::remove_pid_file(&proxy_dir).ok();
@@ -1118,6 +1156,33 @@ async fn main() {
                         }
                     }
                     eprintln!();
+                }
+                cli::ProxyCommand::Trust => {
+                    let ca_path = tls::ca_cert_path(&proxy_dir);
+                    if !ca_path.exists() {
+                        eprintln!("No CA certificate found. Run `vtz proxy init` first.");
+                        std::process::exit(1);
+                    }
+                    let (cmd, args) = tls::trust_store_command(&proxy_dir);
+                    eprintln!("Installing CA certificate in system trust store...");
+                    eprintln!("  Running: sudo {} {}", cmd, args.join(" "));
+                    let status = std::process::Command::new("sudo")
+                        .arg(&cmd)
+                        .args(&args)
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => {
+                            eprintln!("CA certificate trusted successfully.");
+                        }
+                        Ok(s) => {
+                            eprintln!("Trust installation failed (exit code: {:?})", s.code());
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to run security command: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
