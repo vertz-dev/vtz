@@ -969,7 +969,7 @@ async fn main() {
             }
         }
         Command::Proxy(proxy_args) => {
-            use vertz_runtime::proxy::{daemon, routes, tls};
+            use vertz_runtime::proxy::{daemon, hosts, routes, tls};
 
             let proxy_dir = routes::proxy_dir();
             let routes_dir = routes::routes_dir();
@@ -1180,6 +1180,39 @@ async fn main() {
                         }
                         Err(e) => {
                             eprintln!("Failed to run security command: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                cli::ProxyCommand::SyncHosts => {
+                    routes::clean_stale_routes();
+                    let block = hosts::generate_hosts_block();
+                    if block.is_empty() {
+                        eprintln!("No dev servers registered. Nothing to sync.");
+                        std::process::exit(0);
+                    }
+                    let hosts_content = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+                    let merged = hosts::merge_into_hosts(&hosts_content, &block);
+                    let tmp_path = proxy_dir.join("hosts.tmp");
+                    if let Err(e) = std::fs::write(&tmp_path, &merged) {
+                        eprintln!("Failed to write temp hosts file: {}", e);
+                        std::process::exit(1);
+                    }
+                    eprintln!("Syncing /etc/hosts with registered dev servers...");
+                    let status = std::process::Command::new("sudo")
+                        .args(["cp", &tmp_path.display().to_string(), "/etc/hosts"])
+                        .status();
+                    std::fs::remove_file(&tmp_path).ok();
+                    match status {
+                        Ok(s) if s.success() => {
+                            eprintln!("Hosts file updated successfully.");
+                        }
+                        Ok(s) => {
+                            eprintln!("Failed to update /etc/hosts (exit code: {:?})", s.code());
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to run sudo cp: {}", e);
                             std::process::exit(1);
                         }
                     }

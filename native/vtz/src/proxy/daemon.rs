@@ -15,6 +15,9 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite;
 
+/// Header used to detect proxy loops.
+const LOOP_DETECT_HEADER: &str = "x-vertz-proxy";
+
 /// Maximum request body size the proxy will buffer (100 MB).
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
 
@@ -86,6 +89,15 @@ async fn proxy_handler(
     State(state): State<ProxyState>,
     req: Request<Body>,
 ) -> Response<Body> {
+    // Loop detection: reject requests that already passed through this proxy
+    if req.headers().contains_key(LOOP_DETECT_HEADER) {
+        return Response::builder()
+            .status(StatusCode::LOOP_DETECTED)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("Proxy loop detected"))
+            .unwrap();
+    }
+
     let host = req
         .headers()
         .get(header::HOST)
@@ -243,6 +255,9 @@ async fn forward_request(
             forwarded = forwarded.header(name.as_str(), v);
         }
     }
+
+    // Inject loop-detection header so re-entry is caught
+    forwarded = forwarded.header(LOOP_DETECT_HEADER, "1");
 
     match forwarded.send().await {
         Ok(resp) => convert_response(resp).await,
@@ -455,6 +470,70 @@ mod tests {
         state.reload_routes().await;
 
         assert!(state.lookup("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_detects_loop_and_returns_508() {
+        let dir = test_routes_dir();
+        let routes = dir.path().join("routes");
+        let entry = test_route_entry("loop-app", 3000);
+        routes::register_in(&routes, &entry).unwrap();
+
+        let state = ProxyState::new(routes);
+
+        // Simulate a request that already went through the proxy (has loop header)
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::HOST, "loop-app.localhost:4000")
+            .header(LOOP_DETECT_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = proxy_handler(None, State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
+    }
+
+    #[tokio::test]
+    async fn proxy_injects_loop_header_on_forwarded_requests() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Backend that checks for the loop header
+        let header_found = Arc::new(AtomicBool::new(false));
+        let header_found_clone = header_found.clone();
+        let backend = axum::Router::new().route(
+            "/check",
+            axum::routing::get(move |req: Request<Body>| {
+                let found = req.headers().contains_key(LOOP_DETECT_HEADER);
+                header_found_clone.store(found, Ordering::SeqCst);
+                async { "ok" }
+            }),
+        );
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.ok();
+        });
+
+        let dir = test_routes_dir();
+        let routes = dir.path().join("routes");
+        let entry = test_route_entry("header-app", backend_port);
+        routes::register_in(&routes, &entry).unwrap();
+
+        let (proxy_port, _handle) = start_proxy(0, routes).await.unwrap();
+
+        let client = reqwest::Client::new();
+        client
+            .get(format!("http://127.0.0.1:{proxy_port}/check"))
+            .header("Host", "header-app.localhost")
+            .send()
+            .await
+            .unwrap();
+
+        assert!(
+            header_found.load(Ordering::SeqCst),
+            "Loop detection header should be injected on forwarded requests"
+        );
     }
 
     #[tokio::test]
