@@ -1,11 +1,30 @@
 use rcgen::{CertificateParams, Issuer, KeyPair};
 use std::path::{Path, PathBuf};
 
+/// Write a file with restrictive permissions (owner-only read/write: 0o600).
+#[cfg(unix)]
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true).mode(0o600);
+    std::io::Write::write_all(&mut opts.open(path)?, contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 /// Generate a root CA certificate and private key, writing PEM files to `dir`.
 ///
 /// Creates `ca-cert.pem` and `ca-key.pem` in the given directory.
 pub fn generate_ca(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+
+    // Don't overwrite an existing CA — regenerating would invalidate all server certs
+    if has_ca(dir) {
+        return Ok(());
+    }
 
     let mut params = CertificateParams::new(Vec::<String>::new()).map_err(std::io::Error::other)?;
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -22,9 +41,14 @@ pub fn generate_ca(dir: &Path) -> std::io::Result<()> {
         .map_err(std::io::Error::other)?;
 
     std::fs::write(dir.join("ca-cert.pem"), cert.pem())?;
-    std::fs::write(dir.join("ca-key.pem"), key_pair.serialize_pem())?;
+    write_private(&dir.join("ca-key.pem"), &key_pair.serialize_pem())?;
 
     Ok(())
+}
+
+/// Check if CA certificate files exist in `dir`.
+pub fn has_ca(dir: &Path) -> bool {
+    dir.join("ca-cert.pem").exists() && dir.join("ca-key.pem").exists()
 }
 
 /// Check if server certificate files exist in `dir`.
@@ -60,7 +84,7 @@ pub fn generate_server_cert(dir: &Path) -> std::io::Result<()> {
         .map_err(std::io::Error::other)?;
 
     std::fs::write(dir.join("server-cert.pem"), server_cert.pem())?;
-    std::fs::write(dir.join("server-key.pem"), server_key.serialize_pem())?;
+    write_private(&dir.join("server-key.pem"), &server_key.serialize_pem())?;
 
     Ok(())
 }
@@ -148,6 +172,71 @@ mod tests {
         assert_eq!(
             ca_cert_path(dir),
             std::path::PathBuf::from("/home/user/.vtz/proxy/ca-cert.pem")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_ca_key_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        generate_ca(dir.path()).unwrap();
+
+        let key_perms = std::fs::metadata(dir.path().join("ca-key.pem"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            key_perms, 0o600,
+            "CA key should be owner-only (0o600), got {key_perms:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_server_cert_key_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        generate_ca(dir.path()).unwrap();
+        generate_server_cert(dir.path()).unwrap();
+
+        let key_perms = std::fs::metadata(dir.path().join("server-key.pem"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            key_perms, 0o600,
+            "Server key should be owner-only (0o600), got {key_perms:o}"
+        );
+    }
+
+    #[test]
+    fn has_ca_returns_false_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_ca(dir.path()));
+    }
+
+    #[test]
+    fn has_ca_returns_true_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        generate_ca(dir.path()).unwrap();
+        assert!(has_ca(dir.path()));
+    }
+
+    #[test]
+    fn generate_ca_does_not_overwrite_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        generate_ca(dir.path()).unwrap();
+        let original_key = std::fs::read_to_string(dir.path().join("ca-key.pem")).unwrap();
+
+        // Second call should not overwrite
+        generate_ca(dir.path()).unwrap();
+        let second_key = std::fs::read_to_string(dir.path().join("ca-key.pem")).unwrap();
+        assert_eq!(
+            original_key, second_key,
+            "generate_ca should not overwrite existing CA"
         );
     }
 

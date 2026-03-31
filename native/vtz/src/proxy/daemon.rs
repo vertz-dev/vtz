@@ -143,7 +143,10 @@ async fn proxy_handler(
 async fn ws_proxy(client_ws: WebSocket, target_url: String) {
     let (upstream_ws, _) = match tokio_tungstenite::connect_async(&target_url).await {
         Ok(conn) => conn,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("WebSocket upstream connection failed: {e}");
+            return;
+        }
     };
 
     let (mut client_tx, mut client_rx) = client_ws.split();
@@ -169,9 +172,17 @@ async fn ws_proxy(client_ws: WebSocket, target_url: String) {
         }
     };
 
+    // When one direction ends, send Close to the other side so it shuts down
+    // cleanly instead of leaving a half-open connection.
     tokio::select! {
-        _ = client_to_upstream => {},
-        _ = upstream_to_client => {},
+        _ = client_to_upstream => {
+            let _ = upstream_tx.send(tungstenite::Message::Close(None)).await;
+            let _ = client_tx.send(ws::Message::Close(None)).await;
+        },
+        _ = upstream_to_client => {
+            let _ = client_tx.send(ws::Message::Close(None)).await;
+            let _ = upstream_tx.send(tungstenite::Message::Close(None)).await;
+        },
     }
 }
 
@@ -424,6 +435,29 @@ pub fn remove_pid_file(proxy_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Write the proxy port file so other tools (e.g. dev server banner) can discover it.
+pub fn write_port_file(proxy_dir: &Path, port: u16) -> std::io::Result<()> {
+    std::fs::create_dir_all(proxy_dir)?;
+    std::fs::write(proxy_dir.join("proxy.port"), port.to_string())
+}
+
+/// Read the proxy port file.
+pub fn read_port_file(proxy_dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(proxy_dir.join("proxy.port"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Remove the proxy port file.
+pub fn remove_port_file(proxy_dir: &Path) -> std::io::Result<()> {
+    let path = proxy_dir.join("proxy.port");
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +668,19 @@ mod tests {
     fn remove_pid_file_nonexistent_is_ok() {
         let dir = tempfile::tempdir().unwrap();
         assert!(remove_pid_file(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn write_and_read_port_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_port_file(dir.path(), 4000).unwrap();
+        assert_eq!(read_port_file(dir.path()), Some(4000));
+    }
+
+    #[test]
+    fn read_port_file_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_port_file(dir.path()), None);
     }
 
     // --- Integration tests: proxy forwards to real backends ---

@@ -898,11 +898,12 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
         } else {
             "http"
         };
-        eprintln!(
-            "  {}  {}",
-            "Proxy:".dimmed(),
-            format!("{scheme}://{sub}.localhost").cyan().underline()
-        );
+        let proxy_url = if let Some(port) = crate::proxy::daemon::read_port_file(&proxy_dir) {
+            format!("{scheme}://{sub}.localhost:{port}")
+        } else {
+            format!("{scheme}://{sub}.localhost")
+        };
+        eprintln!("  {}  {}", "Proxy:".dimmed(), proxy_url.cyan().underline());
         eprintln!();
     }
 

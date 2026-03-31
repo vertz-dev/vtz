@@ -1016,6 +1016,9 @@ async fn main() {
                                     eprintln!("Warning: failed to write PID file: {}", e);
                                 },
                             );
+                            daemon::write_port_file(&proxy_dir, actual_port).unwrap_or_else(|e| {
+                                eprintln!("Warning: failed to write port file: {}", e);
+                            });
                             eprintln!(
                                 "\n\u{25b2} Vertz Proxy running on https://localhost:{}\n",
                                 actual_port
@@ -1028,6 +1031,7 @@ async fn main() {
                             // Block until the server exits
                             handle.await.ok();
                             daemon::remove_pid_file(&proxy_dir).ok();
+                            daemon::remove_port_file(&proxy_dir).ok();
                         }
                         Err(e) => {
                             eprintln!("Failed to start proxy: {}", e);
@@ -1069,6 +1073,9 @@ async fn main() {
                                     eprintln!("Warning: failed to write PID file: {}", e);
                                 },
                             );
+                            daemon::write_port_file(&proxy_dir, actual_port).unwrap_or_else(|e| {
+                                eprintln!("Warning: failed to write port file: {}", e);
+                            });
                             let scheme = if use_tls { "https" } else { "http" };
                             eprintln!(
                                 "\u{25b2} Vertz Proxy running on {}://localhost:{}",
@@ -1076,6 +1083,7 @@ async fn main() {
                             );
                             handle.await.ok();
                             daemon::remove_pid_file(&proxy_dir).ok();
+                            daemon::remove_port_file(&proxy_dir).ok();
                         }
                         Err(e) => {
                             eprintln!("Failed to start proxy: {}", e);
@@ -1158,6 +1166,13 @@ async fn main() {
                     eprintln!();
                 }
                 cli::ProxyCommand::Trust => {
+                    if !cfg!(target_os = "macos") {
+                        eprintln!("Trust store installation is only supported on macOS.");
+                        eprintln!(
+                            "On Linux, manually add the CA cert to your system's trust store."
+                        );
+                        std::process::exit(1);
+                    }
                     let ca_path = tls::ca_cert_path(&proxy_dir);
                     if !ca_path.exists() {
                         eprintln!("No CA certificate found. Run `vtz proxy init` first.");
