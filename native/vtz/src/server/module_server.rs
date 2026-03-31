@@ -102,7 +102,7 @@ pub async fn handle_source_file(
 
     // CSS files: serve as a JS module that injects a <style> tag
     if clean_path.ends_with(".css") {
-        return handle_css_source_file(&file_path, clean_path);
+        return handle_css_source_file(state, &file_path, clean_path).await;
     }
 
     // Asset files (images, fonts): serve raw file or synthetic JS module
@@ -193,26 +193,50 @@ pub async fn handle_source_file(
 /// creates/updates a `<style>` tag in `<head>`. This enables:
 /// - `import './styles.css'` to work as a side-effect import
 /// - HMR via module re-import (the style tag is updated in place)
-fn handle_css_source_file(file_path: &Path, url_path: &str) -> Response<Body> {
-    match std::fs::read_to_string(file_path) {
-        Ok(css_content) => {
-            let js_module = css_server::css_to_js_module(&css_content, url_path);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from(js_module))
-                .unwrap()
+async fn handle_css_source_file(
+    state: Arc<DevServerState>,
+    file_path: &Path,
+    url_path: &str,
+) -> Response<Body> {
+    let result = state.pipeline.compile_css_for_browser(file_path, url_path);
+    let file_str = file_path.to_string_lossy().to_string();
+
+    if !result.errors.is_empty() {
+        let source = std::fs::read_to_string(file_path).unwrap_or_default();
+        let primary = &result.errors[0];
+        let mut error = DevError::build(&primary.message).with_file(&file_str);
+
+        if let (Some(line), Some(column)) = (primary.line, primary.column) {
+            error = error.with_location(line, column);
+            if !source.is_empty() {
+                error = error.with_snippet(extract_snippet(&source, line, 3));
+            }
+        } else if !source.is_empty() {
+            error = error.with_snippet(extract_snippet(&source, 1, 3));
         }
-        Err(e) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from(format!("Failed to read CSS file: {}", e)))
-            .unwrap(),
+
+        let broadcaster = state.error_broadcaster.clone();
+        tokio::spawn(async move {
+            broadcaster.report_error(error).await;
+        });
+    } else {
+        let broadcaster = state.error_broadcaster.clone();
+        tokio::spawn(async move {
+            broadcaster
+                .clear_file(ErrorCategory::Build, &file_str)
+                .await;
+        });
     }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(result.code))
+        .unwrap()
 }
 
 /// Check if a URL path points to a static asset file (image, font, etc.).
@@ -2115,6 +2139,137 @@ mod tests {
             code.contains("export default"),
             "JS module should export the CSS string"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_css_runs_postcss_when_config_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        let node_modules = tmp.path().join("node_modules");
+        std::fs::create_dir_all(node_modules.join("postcss")).unwrap();
+        std::fs::create_dir_all(node_modules.join("fake-prefixer")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/styles.css"),
+            "body { display: flex; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("postcss.config.js"),
+            "module.exports = { plugins: { 'fake-prefixer': {} } };",
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/package.json"),
+            r#"{"name":"postcss","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/index.js"),
+            r#"module.exports = function postcss(plugins) {
+  return {
+    async process(css, options) {
+      let next = css;
+      for (const plugin of plugins) {
+        next = await plugin(next, options);
+      }
+      return { css: next };
+    },
+  };
+};"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("fake-prefixer/package.json"),
+            r#"{"name":"fake-prefixer","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("fake-prefixer/index.js"),
+            r#"module.exports = function fakePrefixer() {
+  return (css) => css.replace("display: flex", "display: -webkit-flex;\n  display: flex");
+};"#,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/styles.css")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = String::from_utf8(body.to_vec()).unwrap();
+        assert!(code.contains("display: -webkit-flex;"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_css_postcss_error_reports_overlay_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+        let node_modules = tmp.path().join("node_modules");
+        std::fs::create_dir_all(node_modules.join("postcss")).unwrap();
+        std::fs::create_dir_all(node_modules.join("broken-plugin")).unwrap();
+        std::fs::write(tmp.path().join("src/styles.css"), "@broken;\n").unwrap();
+        std::fs::write(
+            tmp.path().join("postcss.config.js"),
+            "module.exports = { plugins: { 'broken-plugin': {} } };",
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/package.json"),
+            r#"{"name":"postcss","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("postcss/index.js"),
+            r#"module.exports = function postcss(plugins) {
+  return {
+    async process(css, options) {
+      for (const plugin of plugins) {
+        await plugin(css, options);
+      }
+      return { css };
+    },
+  };
+};"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("broken-plugin/package.json"),
+            r#"{"name":"broken-plugin","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node_modules.join("broken-plugin/index.js"),
+            r#"module.exports = function brokenPlugin() {
+  return () => {
+    const error = new Error("Unknown at-rule @broken");
+    error.reason = "Unknown at-rule @broken";
+    error.line = 1;
+    error.column = 1;
+    throw error;
+  };
+};"#,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/styles.css")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state.clone()), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let current = state.error_broadcaster.current_state().await;
+        let payload = current.to_json();
+        assert!(payload.contains("Unknown at-rule @broken"));
+        assert!(payload.contains("\"line\":1"));
     }
 
     #[tokio::test]

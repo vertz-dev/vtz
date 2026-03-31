@@ -113,6 +113,14 @@ impl Default for RestartTriggers {
                 ".env.development".to_string(),
                 "tsconfig.json".to_string(),
                 "tsconfig.app.json".to_string(),
+                "postcss.config.js".to_string(),
+                "postcss.config.cjs".to_string(),
+                "postcss.config.mjs".to_string(),
+                "postcss.config.ts".to_string(),
+                "tailwind.config.js".to_string(),
+                "tailwind.config.cjs".to_string(),
+                "tailwind.config.mjs".to_string(),
+                "tailwind.config.ts".to_string(),
             ],
         }
     }
@@ -210,6 +218,8 @@ mod tests {
         assert!(triggers.is_restart_trigger(Path::new("/project/.env")));
         assert!(triggers.is_restart_trigger(Path::new("/project/.env.local")));
         assert!(triggers.is_restart_trigger(Path::new("/project/bun.lock")));
+        assert!(triggers.is_restart_trigger(Path::new("/project/postcss.config.js")));
+        assert!(triggers.is_restart_trigger(Path::new("/project/tailwind.config.ts")));
     }
 
     #[test]
