@@ -55,6 +55,8 @@ pub enum Command {
     Publish(PublishArgs),
     /// Patch installed dependencies
     Patch(PatchArgs),
+    /// Manage the local development proxy
+    Proxy(ProxyArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -102,6 +104,10 @@ pub struct DevArgs {
     /// Framework plugin to use (vertz, react). Auto-detected from package.json if omitted.
     #[arg(long)]
     pub plugin: Option<String>,
+
+    /// Custom name for proxy subdomain override (e.g., --name dashboard → https://dashboard.localhost)
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -517,6 +523,38 @@ pub struct PatchListArgs {
     /// Output NDJSON to stdout
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ProxyArgs {
+    #[command(subcommand)]
+    pub command: ProxyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProxyCommand {
+    /// Initialize the proxy (first-time setup)
+    Init(ProxyInitArgs),
+    /// Start the proxy daemon
+    Start(ProxyStartArgs),
+    /// Stop the proxy daemon
+    Stop,
+    /// Show registered dev servers and their URLs
+    Status,
+}
+
+#[derive(Parser, Debug)]
+pub struct ProxyInitArgs {
+    /// Port for the proxy to listen on
+    #[arg(long, default_value_t = 4000)]
+    pub port: u16,
+}
+
+#[derive(Parser, Debug)]
+pub struct ProxyStartArgs {
+    /// Port for the proxy to listen on
+    #[arg(long, default_value_t = 4000)]
+    pub port: u16,
 }
 
 #[cfg(test)]
@@ -1630,5 +1668,68 @@ mod tests {
     fn test_no_watch_deps_default_false() {
         let args = parse_dev(&["vtz", "dev"]);
         assert!(!args.no_watch_deps);
+    }
+
+    // --- Dev --name flag tests ---
+
+    #[test]
+    fn test_dev_name_flag() {
+        let args = parse_dev(&["vtz", "dev", "--name", "dashboard"]);
+        assert_eq!(args.name, Some("dashboard".to_string()));
+    }
+
+    #[test]
+    fn test_dev_name_default_none() {
+        let args = parse_dev(&["vtz", "dev"]);
+        assert!(args.name.is_none());
+    }
+
+    // --- Proxy CLI tests ---
+
+    fn parse_proxy(args: &[&str]) -> ProxyCommand {
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Command::Proxy(proxy_args) => proxy_args.command,
+            other => panic!("Expected Proxy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_proxy_init_default_port() {
+        let cmd = parse_proxy(&["vtz", "proxy", "init"]);
+        match cmd {
+            ProxyCommand::Init(args) => assert_eq!(args.port, 4000),
+            other => panic!("Expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_proxy_init_custom_port() {
+        let cmd = parse_proxy(&["vtz", "proxy", "init", "--port", "8443"]);
+        match cmd {
+            ProxyCommand::Init(args) => assert_eq!(args.port, 8443),
+            other => panic!("Expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_proxy_start_default_port() {
+        let cmd = parse_proxy(&["vtz", "proxy", "start"]);
+        match cmd {
+            ProxyCommand::Start(args) => assert_eq!(args.port, 4000),
+            other => panic!("Expected Start, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_proxy_stop() {
+        let cmd = parse_proxy(&["vtz", "proxy", "stop"]);
+        assert!(matches!(cmd, ProxyCommand::Stop));
+    }
+
+    #[test]
+    fn test_proxy_status() {
+        let cmd = parse_proxy(&["vtz", "proxy", "status"]);
+        assert!(matches!(cmd, ProxyCommand::Status));
     }
 }

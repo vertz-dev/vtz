@@ -854,7 +854,24 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
         vec![]
     };
 
+    // Register with proxy if running
+    let proxy_subdomain = crate::proxy::client::register_dev_server(
+        &config.root_dir,
+        actual_port,
+        config.proxy_name.as_deref(),
+    );
+
     print_banner_with_upstream(&actual_config, start.elapsed(), &upstream_package_names);
+
+    if let Some(ref sub) = proxy_subdomain {
+        use owo_colors::OwoColorize;
+        eprintln!(
+            "  {}  {}",
+            "Proxy:".dimmed(),
+            format!("http://{sub}.localhost").cyan().underline()
+        );
+        eprintln!();
+    }
 
     // Select plugin based on config (CLI flag > .vertzrc > auto-detect > default)
     let plugin: Arc<dyn crate::plugin::FrameworkPlugin> = match config.plugin {
@@ -1289,10 +1306,17 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
         }
     }
 
-    axum::serve(bind.listener, router)
+    let result = axum::serve(bind.listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(io::Error::other)
+        .map_err(io::Error::other);
+
+    // Deregister from proxy on shutdown
+    if let Some(sub) = proxy_subdomain {
+        crate::proxy::client::deregister_dev_server(&sub);
+    }
+
+    result
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
