@@ -66,18 +66,11 @@ pub fn is_proxy_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Register a dev server with the proxy.
-///
-/// Returns the subdomain if registration was successful, or `None` if proxy isn't running.
-pub fn register_dev_server(
+fn build_route_entry(
     root_dir: &Path,
     port: u16,
     name_override: Option<&str>,
-) -> Option<String> {
-    if !is_proxy_running() {
-        return None;
-    }
-
+) -> Option<RouteEntry> {
     // Detect branch and project once, reuse for both subdomain and entry
     let branch = detect_git_branch(root_dir).unwrap_or_else(|| "main".to_string());
     let project = detect_project_name(root_dir);
@@ -92,17 +85,31 @@ pub fn register_dev_server(
         return None;
     }
 
-    let entry = RouteEntry {
-        subdomain: subdomain.clone(),
+    Some(RouteEntry {
+        subdomain,
         port,
         branch,
         project,
         pid: std::process::id(),
         root_dir: root_dir.to_path_buf(),
-    };
+    })
+}
 
+/// Register a dev server with the proxy.
+///
+/// Returns the subdomain if registration was successful, or `None` if proxy isn't running.
+pub fn register_dev_server(
+    root_dir: &Path,
+    port: u16,
+    name_override: Option<&str>,
+) -> Option<String> {
+    if !is_proxy_running() {
+        return None;
+    }
+
+    let entry = build_route_entry(root_dir, port, name_override)?;
     routes::register(&entry).ok()?;
-    Some(subdomain)
+    Some(entry.subdomain)
 }
 
 /// Deregister a dev server from the proxy.
@@ -193,5 +200,29 @@ mod tests {
     fn detect_git_branch_returns_none_for_no_git() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(detect_git_branch(dir.path()), None);
+    }
+
+    #[test]
+    fn build_route_entry_uses_sanitized_name_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "my-awesome-app"}"#,
+        )
+        .unwrap();
+
+        let entry = build_route_entry(dir.path(), 3000, Some("Dashboard !!!")).unwrap();
+
+        assert_eq!(entry.subdomain, "dashboard");
+        assert_eq!(entry.project, "my-awesome-app");
+        assert_eq!(entry.branch, "main");
+        assert_eq!(entry.port, 3000);
+        assert_eq!(entry.root_dir, dir.path());
+    }
+
+    #[test]
+    fn build_route_entry_returns_none_when_name_sanitizes_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_route_entry(dir.path(), 3000, Some("!!!")).is_none());
     }
 }

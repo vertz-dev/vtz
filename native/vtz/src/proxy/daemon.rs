@@ -106,7 +106,7 @@ async fn proxy_handler(
 
     let subdomain = match extract_subdomain(host) {
         Some(s) => s,
-        None => return dashboard_response(&state).await,
+        None => return dashboard_response(&state, host).await,
     };
 
     // Periodically refresh the route table from disk
@@ -298,6 +298,17 @@ async fn convert_response(resp: reqwest::Response) -> Response<Body> {
     }
 }
 
+fn dashboard_link_href(subdomain: &str, host: &str) -> String {
+    let port = host
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+    match port {
+        Some(port) => format!("//{subdomain}.localhost:{port}"),
+        None => format!("//{subdomain}.localhost"),
+    }
+}
+
 /// Escape HTML special characters to prevent XSS.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -308,7 +319,7 @@ fn html_escape(s: &str) -> String {
 }
 
 /// Dashboard page listing all registered dev servers.
-async fn dashboard_response(state: &ProxyState) -> Response<Body> {
+async fn dashboard_response(state: &ProxyState, host: &str) -> Response<Body> {
     state.reload_routes().await;
     let table = state.route_table.read().await;
 
@@ -331,8 +342,9 @@ async fn dashboard_response(state: &ProxyState) -> Response<Body> {
     for entry in table.values() {
         let sub = html_escape(&entry.subdomain);
         let branch = html_escape(&entry.branch);
+        let href = html_escape(&dashboard_link_href(&entry.subdomain, host));
         rows.push_str(&format!(
-            "<tr><td><a href=\"http://{sub}.localhost\">{sub}</a></td>\
+            "<tr><td><a href=\"{href}\">{sub}</a></td>\
              <td>{port}</td><td>{branch}</td><td>{pid}</td></tr>",
             port = entry.port,
             pid = entry.pid,
@@ -576,7 +588,7 @@ mod tests {
         let routes = dir.path().join("routes");
         let state = ProxyState::new(routes);
 
-        let resp = dashboard_response(&state).await;
+        let resp = dashboard_response(&state, "localhost").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -593,13 +605,14 @@ mod tests {
         routes::register_in(&routes, &entry).unwrap();
 
         let state = ProxyState::new(routes);
-        let resp = dashboard_response(&state).await;
+        let resp = dashboard_response(&state, "localhost:4000").await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("feat-test.test-app"));
         assert!(html.contains("3000"));
+        assert!(html.contains("href=\"//feat-test.test-app.localhost:4000\""));
     }
 
     #[tokio::test]
@@ -907,7 +920,7 @@ mod tests {
         routes::register_in(&routes, &entry).unwrap();
 
         let state = ProxyState::new(routes);
-        let resp = dashboard_response(&state).await;
+        let resp = dashboard_response(&state, "localhost").await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -915,5 +928,37 @@ mod tests {
         // The raw <script> tag should NOT appear in the HTML
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn dashboard_link_href_preserves_proxy_port() {
+        assert_eq!(
+            dashboard_link_href("feat-auth.my-app", "localhost:8443"),
+            "//feat-auth.my-app.localhost:8443"
+        );
+    }
+
+    #[test]
+    fn dashboard_link_href_omits_port_when_not_present() {
+        assert_eq!(
+            dashboard_link_href("feat-auth.my-app", "localhost"),
+            "//feat-auth.my-app.localhost"
+        );
+    }
+
+    #[test]
+    fn dashboard_link_href_ignores_non_numeric_port() {
+        assert_eq!(
+            dashboard_link_href("feat-auth.my-app", "localhost:notaport"),
+            "//feat-auth.my-app.localhost"
+        );
+    }
+
+    #[test]
+    fn dashboard_link_href_handles_empty_host() {
+        assert_eq!(
+            dashboard_link_href("feat-auth.my-app", ""),
+            "//feat-auth.my-app.localhost"
+        );
     }
 }
