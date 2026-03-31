@@ -4,13 +4,13 @@
 
 Every feature needs a design doc in `plans/` before implementation:
 
-1. **API Surface** — concrete TypeScript examples (must compile)
+1. **API Surface** — concrete Rust examples (must compile)
 2. **Manifesto Alignment** — which principles, what tradeoffs, what was rejected
 3. **Non-Goals** — what this deliberately won't do
 4. **Unknowns** — "none identified" or list with resolution (discussion / needs POC)
 5. **POC Results** — question, what was tried, what was learned, link to closed POC PR
 6. **Type Flow Map** — trace every generic from definition to consumer. No dead generics.
-7. **E2E Acceptance Test** — concrete input/output, from developer perspective, includes @ts-expect-error for invalid usage
+7. **E2E Acceptance Test** — concrete input/output, from developer perspective, includes `compile_fail` tests for invalid usage
 
 ## Design Approval
 

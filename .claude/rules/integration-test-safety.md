@@ -85,17 +85,17 @@ When implementing a `stop()` method:
 - Cancel pending debounce timers
 - Clear in-flight Promises or set a flag to short-circuit them
 
-### 6. Integration tests that start real servers go in `.local.ts` files
+### 6. Integration tests that start real servers go in separate test files
 
 Tests that `axum::serve()` on a real port, create WebSocket connections, or use file watchers are **local-only**. They don't run in CI because:
 - CI runners have stricter process exit semantics
 - Port binding and WebSocket teardown can race with the test runner
 - File watcher events are non-deterministic across OS/CI environments
 
-Name these files `*.local.ts` (not `.test.ts`). Add a `test:integration` script in `package.json` for running them explicitly:
+Name these files with a `_local` suffix (not the default test name). Add a dedicated test target for running them explicitly:
 
-```json
-"test:integration": "bun test src/__tests__/my-integration.local.ts"
+```bash
+"test:integration": "cargo test --test my_integration_local"
 ```
 
 ### 7. Environment variables must be cleaned up in `afterEach`
@@ -123,5 +123,5 @@ Before merging integration tests, verify:
 - [ ] All `axum::serve()` instances stopped in `afterEach`
 - [ ] All file watchers closed in `afterEach`
 - [ ] No environment variables leaks between tests
-- [ ] Tests that need real servers use `.local.ts` extension
+- [ ] Tests that need real servers use dedicated test modules with `_local` suffix
 - [ ] No fire-and-forget `async` calls in handlers
