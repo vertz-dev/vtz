@@ -2,13 +2,22 @@ use crate::plugin::{
     ClientScript, CompileContext, CompileDiagnostic, CompileOutput, FrameworkPlugin,
 };
 
+/// React Refresh runtime bootstrap JS (embedded at compile time).
+const REACT_REFRESH_RUNTIME_JS: &str = include_str!("../assets/react-refresh-runtime.js");
+
+/// React Refresh module setup JS (embedded at compile time).
+const REACT_REFRESH_SETUP_JS: &str = include_str!("../assets/react-refresh-setup.js");
+
 /// The React framework plugin.
 ///
-/// Provides React-specific compilation (TypeScript stripping, JSX transform),
-/// import resolution for `react` / `react-dom`, and React-compatible HTML shell.
+/// Provides React-specific compilation (TypeScript stripping, JSX transform,
+/// React Refresh wrapping), import resolution for `react` / `react-dom`,
+/// React Refresh HMR, and React-compatible HTML shell.
 pub struct ReactPlugin {
     /// Whether to use the automatic JSX runtime (React 17+).
     pub jsx_runtime: JsxRuntime,
+    /// Whether to enable React Refresh for HMR (default: true in dev).
+    pub fast_refresh: bool,
 }
 
 /// Which JSX runtime to use for React compilation.
@@ -24,6 +33,7 @@ impl Default for ReactPlugin {
     fn default() -> Self {
         Self {
             jsx_runtime: JsxRuntime::Automatic,
+            fast_refresh: true,
         }
     }
 }
@@ -34,7 +44,7 @@ impl FrameworkPlugin for ReactPlugin {
     }
 
     fn compile(&self, source: &str, ctx: &CompileContext) -> CompileOutput {
-        compile_react(source, ctx, self.jsx_runtime)
+        compile_react(source, ctx, self.jsx_runtime, self.fast_refresh)
     }
 
     // resolve_import: uses default (None → /@deps/ resolution).
@@ -42,8 +52,21 @@ impl FrameworkPlugin for ReactPlugin {
     // specifiers resolved via the default /@deps/ route.
 
     fn hmr_client_scripts(&self) -> Vec<ClientScript> {
-        // Phase 2: no HMR scripts yet (added in Phase 3)
-        vec![]
+        if !self.fast_refresh {
+            return vec![];
+        }
+        vec![
+            ClientScript {
+                // React Refresh runtime bootstrap (global $RefreshReg$ / $RefreshSig$)
+                content: REACT_REFRESH_RUNTIME_JS.to_string(),
+                is_module: false,
+            },
+            ClientScript {
+                // Module that imports react-refresh/runtime and wires it up
+                content: REACT_REFRESH_SETUP_JS.to_string(),
+                is_module: true,
+            },
+        ]
     }
 
     fn root_element_id(&self) -> &str {
@@ -72,7 +95,7 @@ impl FrameworkPlugin for ReactPlugin {
     }
 
     fn supports_fast_refresh(&self) -> bool {
-        false // Phase 3 will enable this
+        self.fast_refresh
     }
 }
 
@@ -83,13 +106,20 @@ impl FrameworkPlugin for ReactPlugin {
 /// 2. Build semantic scoping with oxc_semantic
 /// 3. Transform (TypeScript strip + React JSX) with oxc_transformer
 /// 4. Generate code with oxc_codegen
-fn compile_react(source: &str, ctx: &CompileContext, jsx_runtime: JsxRuntime) -> CompileOutput {
+fn compile_react(
+    source: &str,
+    ctx: &CompileContext,
+    jsx_runtime: JsxRuntime,
+    fast_refresh: bool,
+) -> CompileOutput {
     use oxc_allocator::Allocator;
     use oxc_codegen::Codegen;
     use oxc_parser::Parser;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
-    use oxc_transformer::{JsxOptions, JsxRuntime as OxcJsxRuntime, TransformOptions, Transformer};
+    use oxc_transformer::{
+        JsxOptions, JsxRuntime as OxcJsxRuntime, ReactRefreshOptions, TransformOptions, Transformer,
+    };
 
     let allocator = Allocator::default();
 
@@ -145,9 +175,16 @@ fn compile_react(source: &str, ctx: &CompileContext, jsx_runtime: JsxRuntime) ->
         JsxRuntime::Classic => OxcJsxRuntime::Classic,
     };
 
+    let refresh_options = if fast_refresh {
+        Some(ReactRefreshOptions::default())
+    } else {
+        None
+    };
+
     let transform_options = TransformOptions {
         jsx: JsxOptions {
             runtime: oxc_jsx_runtime,
+            refresh: refresh_options,
             ..JsxOptions::default()
         },
         ..TransformOptions::default()
@@ -219,8 +256,8 @@ mod tests {
     }
 
     #[test]
-    fn test_no_hmr_scripts_in_phase_2() {
-        assert!(make_plugin().hmr_client_scripts().is_empty());
+    fn test_hmr_scripts_present_by_default() {
+        assert!(!make_plugin().hmr_client_scripts().is_empty());
     }
 
     #[test]
@@ -290,6 +327,7 @@ mod tests {
     fn test_compile_tsx_classic_runtime() {
         let plugin = ReactPlugin {
             jsx_runtime: JsxRuntime::Classic,
+            ..Default::default()
         };
         let (fp, root, src) = make_ctx("/project/src/App.tsx");
         let ctx = CompileContext {
@@ -485,5 +523,134 @@ mod tests {
     fn test_default_jsx_runtime_is_automatic() {
         let plugin = ReactPlugin::default();
         assert_eq!(plugin.jsx_runtime, JsxRuntime::Automatic);
+    }
+
+    // ── Phase 3: React Refresh / HMR tests ──
+
+    #[test]
+    fn test_supports_fast_refresh_default() {
+        assert!(make_plugin().supports_fast_refresh());
+    }
+
+    #[test]
+    fn test_supports_fast_refresh_disabled() {
+        let plugin = ReactPlugin {
+            fast_refresh: false,
+            ..Default::default()
+        };
+        assert!(!plugin.supports_fast_refresh());
+    }
+
+    #[test]
+    fn test_hmr_client_scripts_returns_two_scripts() {
+        let scripts = make_plugin().hmr_client_scripts();
+        assert_eq!(scripts.len(), 2, "Expected 2 scripts (bootstrap + setup)");
+        // First: React Refresh bootstrap (non-module)
+        assert!(!scripts[0].is_module);
+        assert!(
+            scripts[0].content.contains("$RefreshReg$"),
+            "Bootstrap should define $RefreshReg$"
+        );
+        // Second: setup module (ES module)
+        assert!(scripts[1].is_module);
+        assert!(
+            scripts[1].content.contains("react-refresh"),
+            "Setup should import react-refresh"
+        );
+    }
+
+    #[test]
+    fn test_hmr_client_scripts_empty_when_refresh_disabled() {
+        let plugin = ReactPlugin {
+            fast_refresh: false,
+            ..Default::default()
+        };
+        assert!(plugin.hmr_client_scripts().is_empty());
+    }
+
+    #[test]
+    fn test_compile_tsx_includes_refresh_reg() {
+        let plugin = make_plugin();
+        let (fp, root, src) = make_ctx("/project/src/Counter.tsx");
+        let ctx = CompileContext {
+            file_path: fp,
+            root_dir: root,
+            src_dir: src,
+            target: "dom",
+        };
+        let output = plugin.compile(
+            "export default function Counter() { return <div>0</div>; }",
+            &ctx,
+        );
+        let errors: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|d| !d.is_warning)
+            .collect();
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        // React Refresh transform should inject $RefreshReg$ calls
+        assert!(
+            output.code.contains("$RefreshReg$"),
+            "Expected $RefreshReg$ in output, got: {}",
+            output.code
+        );
+    }
+
+    #[test]
+    fn test_compile_tsx_includes_refresh_sig() {
+        let plugin = make_plugin();
+        let (fp, root, src) = make_ctx("/project/src/UseHook.tsx");
+        let ctx = CompileContext {
+            file_path: fp,
+            root_dir: root,
+            src_dir: src,
+            target: "dom",
+        };
+        // Component that uses a hook — should get $RefreshSig$ tracking
+        let output = plugin.compile(
+            r#"
+            import { useState } from 'react';
+            export function Counter() {
+                const [count, setCount] = useState(0);
+                return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
+            }
+            "#,
+            &ctx,
+        );
+        let errors: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|d| !d.is_warning)
+            .collect();
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert!(
+            output.code.contains("$RefreshSig$"),
+            "Expected $RefreshSig$ for hook-using component, got: {}",
+            output.code
+        );
+    }
+
+    #[test]
+    fn test_compile_tsx_no_refresh_when_disabled() {
+        let plugin = ReactPlugin {
+            fast_refresh: false,
+            ..Default::default()
+        };
+        let (fp, root, src) = make_ctx("/project/src/App.tsx");
+        let ctx = CompileContext {
+            file_path: fp,
+            root_dir: root,
+            src_dir: src,
+            target: "dom",
+        };
+        let output = plugin.compile(
+            "export default function App() { return <div>Hello</div>; }",
+            &ctx,
+        );
+        assert!(
+            !output.code.contains("$RefreshReg$"),
+            "Should NOT have $RefreshReg$ when refresh disabled, got: {}",
+            output.code
+        );
     }
 }
