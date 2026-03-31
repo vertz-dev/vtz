@@ -126,6 +126,9 @@ pub fn css_to_js_module(css_content: &str, file_url: &str) -> String {
         .replace('`', "\\`")
         .replace("${", "\\${");
 
+    // Sanitize the file URL for use as a JS string and DOM id
+    let safe_id = file_url.replace('"', "%22").replace('\\', "/");
+
     format!(
         r#"const __vtz_css_id = "__vtz_css_{id}";
 const __vtz_css = `{css}`;
@@ -143,7 +146,7 @@ const __vtz_css = `{css}`;
 }})();
 export default __vtz_css;
 "#,
-        id = file_url,
+        id = safe_id,
         css = escaped,
     )
 }
@@ -263,6 +266,18 @@ body { margin: 0; }"#;
     }
 
     #[test]
+    fn test_css_to_js_module_resolves_parent_dir_imports() {
+        let css = "@import '../shared/reset.css';";
+        let js = css_to_js_module(css, "/src/components/App.css");
+
+        assert!(
+            js.contains("@import '/src/shared/reset.css'"),
+            "Parent dir @import should resolve correctly. JS:\n{}",
+            js
+        );
+    }
+
+    #[test]
     fn test_css_to_js_module_preserves_absolute_at_imports() {
         let css = r#"@import 'https://fonts.googleapis.com/css2?family=Inter';
 body { font-family: Inter; }"#;
@@ -271,6 +286,19 @@ body { font-family: Inter; }"#;
         assert!(
             js.contains("https://fonts.googleapis.com"),
             "Absolute @import URLs should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_css_to_js_module_handles_empty_css() {
+        let js = css_to_js_module("", "/src/empty.css");
+        assert!(
+            js.contains("export default __vtz_css"),
+            "Empty CSS should still produce a valid JS module"
+        );
+        assert!(
+            js.contains("const __vtz_css = ``"),
+            "Empty CSS should produce an empty template literal"
         );
     }
 
