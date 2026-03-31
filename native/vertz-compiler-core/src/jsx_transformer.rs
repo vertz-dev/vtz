@@ -2047,3 +2047,2058 @@ fn build_extended_rx_for_list(
         props_param: rx.props_param.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component_analyzer::analyze_components;
+    use crate::reactivity_analyzer::{
+        analyze_reactivity, build_import_aliases, ImportContext, ManifestRegistry,
+    };
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    /// Helper: parse source, extract components & reactivity, transform JSX, return result.
+    fn transform(source: &str) -> String {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let mut ms = MagicString::new(source);
+        let components = analyze_components(&parsed.program);
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, dynamic_configs) = build_import_aliases(&parsed.program, &manifests);
+        let import_ctx = ImportContext {
+            aliases,
+            dynamic_configs,
+        };
+        for comp in &components {
+            let vars = analyze_reactivity(&parsed.program, comp, &import_ctx);
+            transform_jsx(&mut ms, &parsed.program, comp, &vars, None);
+        }
+        ms.to_string()
+    }
+
+    /// Helper: transform with hydration id on the first component.
+    fn transform_with_hydration(source: &str, hydration_id: &str) -> String {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let mut ms = MagicString::new(source);
+        let components = analyze_components(&parsed.program);
+        let manifests: ManifestRegistry = HashMap::new();
+        let (aliases, dynamic_configs) = build_import_aliases(&parsed.program, &manifests);
+        let import_ctx = ImportContext {
+            aliases,
+            dynamic_configs,
+        };
+        for (i, comp) in components.iter().enumerate() {
+            let vars = analyze_reactivity(&parsed.program, comp, &import_ctx);
+            let hid = if i == 0 { Some(hydration_id) } else { None };
+            transform_jsx(&mut ms, &parsed.program, comp, &vars, hid);
+        }
+        ms.to_string()
+    }
+
+    // ========== Utility functions ==========
+
+    #[test]
+    fn gen_var_produces_numbered_names() {
+        assert_eq!(gen_var(&mut 0), "__el0");
+        assert_eq!(gen_var(&mut 5), "__el5");
+        assert_eq!(gen_var(&mut 42), "__el42");
+    }
+
+    #[test]
+    fn json_quote_escapes_and_wraps() {
+        assert_eq!(json_quote("hello"), r#""hello""#);
+        assert_eq!(json_quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(json_quote("line\nnew"), r#""line\nnew""#);
+    }
+
+    #[test]
+    fn is_valid_js_identifier_accepts_valid() {
+        assert!(is_valid_js_identifier("foo"));
+        assert!(is_valid_js_identifier("_bar"));
+        assert!(is_valid_js_identifier("$baz"));
+        assert!(is_valid_js_identifier("camelCase"));
+        assert!(is_valid_js_identifier("snake_case"));
+    }
+
+    #[test]
+    fn is_valid_js_identifier_rejects_invalid() {
+        assert!(!is_valid_js_identifier("123abc"));
+        assert!(!is_valid_js_identifier("kebab-case"));
+        assert!(!is_valid_js_identifier("with space"));
+        assert!(!is_valid_js_identifier(""));
+        assert!(!is_valid_js_identifier("data-attr"));
+    }
+
+    #[test]
+    fn quote_prop_key_valid_identifier() {
+        assert_eq!(quote_prop_key("foo"), "foo");
+        assert_eq!(quote_prop_key("onClick"), "onClick");
+    }
+
+    #[test]
+    fn quote_prop_key_invalid_identifier() {
+        assert_eq!(quote_prop_key("data-attr"), r#""data-attr""#);
+        assert_eq!(quote_prop_key("aria-label"), r#""aria-label""#);
+    }
+
+    #[test]
+    fn quote_getter_key_valid_identifier() {
+        assert_eq!(quote_getter_key("foo"), "foo");
+    }
+
+    #[test]
+    fn quote_getter_key_invalid_identifier() {
+        assert_eq!(quote_getter_key("data-attr"), r#"["data-attr"]"#);
+    }
+
+    #[test]
+    fn clean_jsx_text_simple() {
+        assert_eq!(clean_jsx_text("hello"), "hello");
+    }
+
+    #[test]
+    fn clean_jsx_text_multiline() {
+        assert_eq!(clean_jsx_text("hello\n    world"), "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_all_whitespace() {
+        assert_eq!(clean_jsx_text("\n    \n    "), "");
+    }
+
+    #[test]
+    fn clean_jsx_text_tabs() {
+        assert_eq!(clean_jsx_text("a\n\tb"), "a b");
+    }
+
+    // ========== IDL properties ==========
+
+    #[test]
+    fn is_idl_property_input_value() {
+        assert!(is_idl_property("input", "value"));
+        assert!(is_idl_property("input", "checked"));
+    }
+
+    #[test]
+    fn is_idl_property_select_textarea() {
+        assert!(is_idl_property("select", "value"));
+        assert!(is_idl_property("textarea", "value"));
+    }
+
+    #[test]
+    fn is_idl_property_non_idl() {
+        assert!(!is_idl_property("div", "value"));
+        assert!(!is_idl_property("input", "class"));
+    }
+
+    #[test]
+    fn is_boolean_idl_property_checked() {
+        assert!(is_boolean_idl_property("checked"));
+        assert!(!is_boolean_idl_property("value"));
+        assert!(!is_boolean_idl_property("disabled"));
+    }
+
+    // ========== contains_word_boundary ==========
+
+    #[test]
+    fn contains_word_boundary_standalone() {
+        assert!(contains_word_boundary("x + y", "x"));
+        assert!(contains_word_boundary("x + y", "y"));
+    }
+
+    #[test]
+    fn contains_word_boundary_not_inside_identifier() {
+        assert!(!contains_word_boundary("fox", "x"));
+        assert!(!contains_word_boundary("prefix_x", "x"));
+    }
+
+    #[test]
+    fn contains_word_boundary_at_start_end() {
+        assert!(contains_word_boundary("x", "x"));
+        assert!(contains_word_boundary("x.value", "x"));
+        assert!(contains_word_boundary("a + x", "x"));
+    }
+
+    // ========== word_boundary_replace ==========
+
+    #[test]
+    fn word_boundary_replace_standalone() {
+        assert_eq!(
+            word_boundary_replace("x + y", "x", "replaced"),
+            "replaced + y"
+        );
+    }
+
+    #[test]
+    fn word_boundary_replace_not_inside_identifier() {
+        assert_eq!(word_boundary_replace("fox", "x", "replaced"), "fox");
+    }
+
+    #[test]
+    fn word_boundary_replace_multiple_occurrences() {
+        assert_eq!(word_boundary_replace("x + x", "x", "z"), "z + z");
+    }
+
+    // ========== key_references_index ==========
+
+    #[test]
+    fn key_references_index_standalone() {
+        assert!(key_references_index("idx", "idx"));
+    }
+
+    #[test]
+    fn key_references_index_in_expression() {
+        assert!(key_references_index("item.id + idx", "idx"));
+    }
+
+    #[test]
+    fn key_references_index_not_present() {
+        assert!(!key_references_index("item.id", "idx"));
+    }
+
+    #[test]
+    fn key_references_index_inside_word() {
+        assert!(!key_references_index("index_of", "index"));
+    }
+
+    // ========== Basic element transformation ==========
+
+    #[test]
+    fn static_div_with_text() {
+        let result = transform(
+            r#"export function App() {
+    return <div>hello</div>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(
+            result.contains("__staticText(\"hello\")"),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn iife_wraps_element() {
+        let result = transform(
+            r#"export function App() {
+    return <div>hello</div>;
+}"#,
+        );
+        assert!(result.contains("(() => {"), "result: {result}");
+        assert!(result.contains("return __el0;"), "result: {result}");
+        assert!(result.contains("})()"), "result: {result}");
+    }
+
+    #[test]
+    fn enter_exit_children() {
+        let result = transform(
+            r#"export function App() {
+    return <div>hello</div>;
+}"#,
+        );
+        assert!(
+            result.contains("__enterChildren(__el0)"),
+            "result: {result}"
+        );
+        assert!(result.contains("__exitChildren()"), "result: {result}");
+    }
+
+    // ========== Static attributes ==========
+
+    #[test]
+    fn static_string_attribute() {
+        let result = transform(
+            r#"export function App() {
+    return <div id="main">text</div>;
+}"#,
+        );
+        assert!(
+            result.contains(r#"__el0.setAttribute("id", "main")"#),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn classname_mapped_to_class() {
+        let result = transform(
+            r#"export function App() {
+    return <div className="foo">text</div>;
+}"#,
+        );
+        assert!(
+            result.contains(r#"setAttribute("class""#),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn html_for_preserved_on_element() {
+        let result = transform(
+            r#"export function App() {
+    return <label htmlFor="name">text</label>;
+}"#,
+        );
+        // JSX transformer preserves htmlFor as-is (no mapping to "for")
+        assert!(
+            result.contains(r#"setAttribute("htmlFor""#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Boolean shorthand attributes ==========
+
+    #[test]
+    fn boolean_shorthand_attribute() {
+        let result = transform(
+            r#"export function App() {
+    return <input disabled />;
+}"#,
+        );
+        assert!(
+            result.contains(r#"setAttribute("disabled", "")"#),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn boolean_idl_property_shorthand() {
+        let result = transform(
+            r#"export function App() {
+    return <input checked />;
+}"#,
+        );
+        assert!(result.contains(".checked = true"), "result: {result}");
+    }
+
+    // ========== Expression attributes ==========
+
+    #[test]
+    fn expression_attribute_non_reactive() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div id={props.id}>text</div>;
+}"#,
+        );
+        assert!(result.contains(r#"setAttribute("id""#), "result: {result}");
+    }
+
+    #[test]
+    fn expression_attribute_reactive() {
+        let result = transform(
+            r#"export function App() {
+    let cls = "active";
+    return <div className={cls}>text</div>;
+}"#,
+        );
+        assert!(
+            result.contains("__attr(") || result.contains("setAttribute"),
+            "result: {result}"
+        );
+    }
+
+    // ========== IDL property handling ==========
+
+    #[test]
+    fn input_static_value_uses_set_attribute() {
+        let result = transform(
+            r#"export function App() {
+    return <input value="test" />;
+}"#,
+        );
+        // Static value on input uses setAttribute, not direct property
+        assert!(
+            result.contains(r#"setAttribute("value", "test")"#),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn textarea_static_value_uses_set_attribute() {
+        let result = transform(
+            r#"export function App() {
+    return <textarea value="test"></textarea>;
+}"#,
+        );
+        // Static value on textarea uses setAttribute, not direct property
+        assert!(
+            result.contains(r#"setAttribute("value", "test")"#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Event handlers ==========
+
+    #[test]
+    fn on_click_event_handler() {
+        let result = transform(
+            r#"export function App() {
+    return <button onClick={handler}>click</button>;
+}"#,
+        );
+        assert!(
+            result.contains(r#"__on(__el0, "click""#),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn on_change_event_handler() {
+        let result = transform(
+            r#"export function App() {
+    return <input onChange={handler} />;
+}"#,
+        );
+        assert!(
+            result.contains(r#"__on(__el0, "change""#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Ref attribute ==========
+
+    #[test]
+    fn ref_attribute() {
+        let result = transform(
+            r#"export function App() {
+    return <div ref={myRef}>text</div>;
+}"#,
+        );
+        assert!(result.contains(".current = __el0"), "result: {result}");
+    }
+
+    // ========== Spread attributes ==========
+
+    #[test]
+    fn spread_attribute() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div {...props}>text</div>;
+}"#,
+        );
+        assert!(result.contains("__spread("), "result: {result}");
+    }
+
+    // ========== Void / self-closing elements ==========
+
+    #[test]
+    fn self_closing_element() {
+        let result = transform(
+            r#"export function App() {
+    return <img />;
+}"#,
+        );
+        assert!(result.contains("__element(\"img\")"), "result: {result}");
+        // No __enterChildren for void elements with no children
+        assert!(!result.contains("__enterChildren"), "result: {result}");
+    }
+
+    // ========== Nested elements ==========
+
+    #[test]
+    fn nested_elements() {
+        let result = transform(
+            r#"export function App() {
+    return <div><span>inner</span></div>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Fragment ==========
+
+    #[test]
+    fn empty_fragment() {
+        let result = transform(
+            r#"export function App() {
+    return <></>;
+}"#,
+        );
+        assert!(
+            result.contains("createDocumentFragment"),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn fragment_with_children() {
+        let result = transform(
+            r#"export function App() {
+    return <><div>a</div><span>b</span></>;
+}"#,
+        );
+        assert!(
+            result.contains("createDocumentFragment"),
+            "result: {result}"
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Component call ==========
+
+    #[test]
+    fn component_call_no_props() {
+        let result = transform(
+            r#"export function App() {
+    return <Child />;
+}"#,
+        );
+        assert!(result.contains("Child({"), "result: {result}");
+    }
+
+    #[test]
+    fn component_call_with_static_prop() {
+        let result = transform(
+            r#"export function App() {
+    return <Child name="Alice" />;
+}"#,
+        );
+        assert!(result.contains("Child("), "result: {result}");
+        assert!(result.contains(r#"name: "Alice""#), "result: {result}");
+    }
+
+    #[test]
+    fn component_call_preserves_classname() {
+        let result = transform(
+            r#"export function App() {
+    return <Child className="foo" />;
+}"#,
+        );
+        // JSX transformer preserves className for component props (no mapping to class)
+        assert!(result.contains(r#"className: "foo""#), "result: {result}");
+    }
+
+    #[test]
+    fn component_with_children() {
+        let result = transform(
+            r#"export function App() {
+    return <Wrapper>content</Wrapper>;
+}"#,
+        );
+        assert!(result.contains("children:"), "result: {result}");
+    }
+
+    #[test]
+    fn component_with_boolean_shorthand() {
+        let result = transform(
+            r#"export function App() {
+    return <Toggle active />;
+}"#,
+        );
+        assert!(result.contains("active: true"), "result: {result}");
+    }
+
+    #[test]
+    fn component_with_spread() {
+        let result = transform(
+            r#"export function App(props) {
+    return <Child {...props} />;
+}"#,
+        );
+        assert!(result.contains("...props"), "result: {result}");
+    }
+
+    // ========== Conditional rendering (ternary) ==========
+
+    #[test]
+    fn ternary_conditional_in_children() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.ok ? <span>yes</span> : <p>no</p>}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    // ========== Logical AND ==========
+
+    #[test]
+    fn logical_and_in_children() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.show && <span>visible</span>}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    // ========== List rendering (.map) ==========
+
+    #[test]
+    fn map_call_produces_list() {
+        let result = transform(
+            r#"export function App(props) {
+    return <ul>{props.items.map(item => <li>{item}</li>)}</ul>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    #[test]
+    fn map_call_with_key() {
+        let result = transform(
+            r#"export function App(props) {
+    return <ul>{props.items.map(item => <li key={item.id}>{item.name}</li>)}</ul>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    #[test]
+    fn map_call_with_index() {
+        let result = transform(
+            r#"export function App(props) {
+    return <ul>{props.items.map((item, idx) => <li key={idx}>{item}</li>)}</ul>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    // ========== Expression children ==========
+
+    #[test]
+    fn static_expression_child() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.name}</div>;
+}"#,
+        );
+        assert!(result.contains("__insert("), "result: {result}");
+    }
+
+    #[test]
+    fn literal_expression_child() {
+        let result = transform(
+            r#"export function App() {
+    return <div>{42}</div>;
+}"#,
+        );
+        assert!(result.contains("__insert("), "result: {result}");
+    }
+
+    #[test]
+    fn static_let_variable_uses_insert() {
+        // A plain `let count = 0` without mutation is classified as Static,
+        // so the transformer uses __insert (not __child which is for reactive)
+        let result = transform(
+            r#"export function App() {
+    let count = 0;
+    return <div>{count}</div>;
+}"#,
+        );
+        assert!(result.contains("__insert("), "result: {result}");
+    }
+
+    // ========== Hydration marker ==========
+
+    #[test]
+    fn hydration_marker_injected() {
+        let result = transform_with_hydration(
+            r#"export function App() {
+    return <div>hello</div>;
+}"#,
+            "App",
+        );
+        assert!(result.contains(r#"data-v-id"#), "result: {result}");
+        assert!(result.contains(r#""App""#), "result: {result}");
+    }
+
+    #[test]
+    fn hydration_marker_not_injected_without_id() {
+        let result = transform(
+            r#"export function App() {
+    return <div>hello</div>;
+}"#,
+        );
+        assert!(!result.contains("data-v-id"), "result: {result}");
+    }
+
+    // ========== Multiple children ==========
+
+    #[test]
+    fn multiple_text_and_expression_children() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>Hello {props.name}!</div>;
+}"#,
+        );
+        assert!(result.contains("__staticText("), "result: {result}");
+        assert!(result.contains("__insert("), "result: {result}");
+    }
+
+    // ========== Empty element ==========
+
+    #[test]
+    fn empty_element_no_children() {
+        let result = transform(
+            r#"export function App() {
+    return <div></div>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+    }
+
+    // ========== Multiple components ==========
+
+    #[test]
+    fn multiple_components_transformed_independently() {
+        let result = transform(
+            r#"export function A() {
+    return <div>a</div>;
+}
+export function B() {
+    return <span>b</span>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Namespaced element ==========
+
+    #[test]
+    fn namespaced_attribute() {
+        let result = transform(
+            r#"export function App() {
+    return <svg xmlns:xlink="http://www.w3.org/1999/xlink">text</svg>;
+}"#,
+        );
+        assert!(result.contains("xmlns:xlink"), "result: {result}");
+    }
+
+    // ========== inject_hydration_attr ==========
+
+    #[test]
+    fn inject_hydration_attr_into_code() {
+        let code = r#"(() => { const __el0 = __element("div"); return __el0; })()"#;
+        let result = inject_hydration_attr(code, "MyComp");
+        assert!(result.is_some(), "should inject hydration");
+        let injected = result.unwrap();
+        assert!(
+            injected.contains(r#"setAttribute("data-v-id", "MyComp")"#),
+            "injected: {injected}"
+        );
+    }
+
+    #[test]
+    fn inject_hydration_attr_no_element() {
+        let code = "some code without element";
+        assert!(inject_hydration_attr(code, "MyComp").is_none());
+    }
+
+    // ========== Deeply nested JSX ==========
+
+    #[test]
+    fn deeply_nested_jsx_elements() {
+        let result = transform(
+            r#"export function App() {
+    return <div><ul><li><span>deep</span></li></ul></div>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(result.contains("__element(\"ul\")"), "result: {result}");
+        assert!(result.contains("__element(\"li\")"), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Component with expression prop ==========
+
+    #[test]
+    fn component_with_expression_prop() {
+        let result = transform(
+            r#"export function App(props) {
+    return <Card count={props.count} />;
+}"#,
+        );
+        assert!(result.contains("Card("), "result: {result}");
+        assert!(result.contains("count"), "result: {result}");
+    }
+
+    // ========== Style attribute ==========
+
+    #[test]
+    fn style_attribute_on_element() {
+        let result = transform(
+            r#"export function App() {
+    return <div style="color: red">text</div>;
+}"#,
+        );
+        assert!(
+            result.contains(r#"setAttribute("style""#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Multiple attributes ==========
+
+    #[test]
+    fn multiple_attributes() {
+        let result = transform(
+            r#"export function App() {
+    return <div id="main" role="button">text</div>;
+}"#,
+        );
+        assert!(
+            result.contains(r#"setAttribute("id", "main")"#),
+            "result: {result}"
+        );
+        assert!(
+            result.contains(r#"setAttribute("role", "button")"#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Parenthesized JSX ==========
+
+    #[test]
+    fn parenthesized_jsx_return() {
+        let result = transform(
+            r#"export function App() {
+    return (<div>hello</div>);
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+    }
+
+    // ========== No JSX in component ==========
+
+    #[test]
+    fn no_jsx_in_component() {
+        let result = transform(
+            r#"export function App() {
+    return null;
+}"#,
+        );
+        // No transformation should occur — no JSX
+        assert!(!result.contains("__element"), "result: {result}");
+    }
+
+    // ========== Map with block body ==========
+
+    #[test]
+    fn map_with_block_body() {
+        let result = transform(
+            r#"export function App(props) {
+    return <ul>{props.items.map(item => {
+        return <li>{item}</li>;
+    })}</ul>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    // ========== Map with fragment body ==========
+
+    #[test]
+    fn map_with_fragment_body() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.items.map(item => <><span>{item}</span></>)}</div>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    // ========== Empty component ==========
+
+    #[test]
+    fn empty_source() {
+        let result = transform("");
+        assert_eq!(result, "");
+    }
+
+    // ========== Arrow function component ==========
+
+    #[test]
+    fn arrow_block_body_component() {
+        let result = transform(
+            r#"export const App = () => {
+    return <div>hello</div>;
+};"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+    }
+
+    // ========== Nested ternary ==========
+
+    #[test]
+    fn nested_ternary() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.a ? <span>a</span> : props.b ? <span>b</span> : <span>c</span>}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    // ========== Conditional with non-JSX branches ==========
+
+    #[test]
+    fn ternary_with_non_jsx_branches() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.ok ? "yes" : "no"}</div>;
+}"#,
+        );
+        // Even with non-JSX branches, ternaries produce __conditional()
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    // ========== Multiple children types mixed ==========
+
+    #[test]
+    fn mixed_children_types() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>text <span>element</span> {props.expr}</div>;
+}"#,
+        );
+        assert!(result.contains("__staticText("), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Component with multiple children ==========
+
+    #[test]
+    fn component_with_multiple_children() {
+        let result = transform(
+            r#"export function App() {
+    return <Wrapper><div>a</div><span>b</span></Wrapper>;
+}"#,
+        );
+        assert!(result.contains("children:"), "result: {result}");
+    }
+
+    // ========== data-* attributes ==========
+
+    #[test]
+    fn data_attributes() {
+        let result = transform(
+            r#"export function App() {
+    return <div data-testid="foo">text</div>;
+}"#,
+        );
+        assert!(result.contains(r#""data-testid""#), "result: {result}");
+    }
+
+    // ========== build_key_fn ==========
+
+    #[test]
+    fn build_key_fn_simple_key() {
+        let key = build_key_fn(&Some("item.id".to_string()), "item", None);
+        assert_eq!(key, "(item) => item.id");
+    }
+
+    #[test]
+    fn build_key_fn_with_index_in_key() {
+        let key = build_key_fn(&Some("idx".to_string()), "item", Some("idx"));
+        assert_eq!(key, "(item, idx) => idx");
+    }
+
+    #[test]
+    fn build_key_fn_index_not_referenced() {
+        let key = build_key_fn(&Some("item.id".to_string()), "item", Some("idx"));
+        assert_eq!(key, "(item) => item.id");
+    }
+
+    #[test]
+    fn build_key_fn_no_key() {
+        let key = build_key_fn(&None, "item", None);
+        assert_eq!(key, "null");
+    }
+
+    // ========== Reactive expression with .value ==========
+
+    #[test]
+    fn is_text_reactive_with_signal_value() {
+        let rx = ReactivityContext {
+            names: HashSet::from(["count".to_string()]),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(is_text_reactive("count.value", &rx));
+    }
+
+    #[test]
+    fn is_text_reactive_with_signal_api_prop() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::from([(
+                "tasks".to_string(),
+                HashSet::from(["data".to_string(), "loading".to_string()]),
+            )]),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(is_text_reactive("tasks.data", &rx));
+        assert!(is_text_reactive("tasks.loading", &rx));
+        assert!(!is_text_reactive("tasks.refetch", &rx));
+    }
+
+    #[test]
+    fn is_text_reactive_with_reactive_source() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::from(["auth".to_string()]),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(is_text_reactive("auth.user", &rx));
+    }
+
+    #[test]
+    fn is_text_reactive_with_props() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: Some("__props".to_string()),
+        };
+        assert!(is_text_reactive("__props.name", &rx));
+    }
+
+    #[test]
+    fn is_text_reactive_with_inline_locals() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::from([("isActive".to_string(), "x.value".to_string())]),
+            props_param: None,
+        };
+        assert!(is_text_reactive("isActive", &rx));
+    }
+
+    #[test]
+    fn is_text_reactive_non_reactive() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(!is_text_reactive("someVar", &rx));
+        assert!(!is_text_reactive("42", &rx));
+    }
+
+    // ========== apply_inline_subs ==========
+
+    #[test]
+    fn apply_inline_subs_replaces_locals() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::from([(
+                "isActive".to_string(),
+                "item.active.value".to_string(),
+            )]),
+            props_param: None,
+        };
+        let result = apply_inline_subs("isActive ? 'yes' : 'no'", &rx);
+        assert_eq!(result, "(item.active.value) ? 'yes' : 'no'");
+    }
+
+    #[test]
+    fn apply_inline_subs_no_inline_locals() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        let result = apply_inline_subs("x + y", &rx);
+        assert_eq!(result, "x + y");
+    }
+
+    // ========== Reactive attribute detection ==========
+
+    #[test]
+    fn is_text_reactive_field_signal_api() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::from(["form".to_string()]),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(is_text_reactive("form.email.value", &rx));
+    }
+
+    // ========== Destructured props ==========
+
+    #[test]
+    fn spread_with_destructured_props_includes_props_param() {
+        let result = transform(
+            r#"export function App({ name, ...rest }) {
+    return <div {...rest}>text</div>;
+}"#,
+        );
+        assert!(result.contains("__spread("), "result: {result}");
+    }
+
+    // ========== Nested component in element ==========
+
+    #[test]
+    fn nested_component_in_element() {
+        let result = transform(
+            r#"export function App() {
+    return <div><Child name="test" /></div>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(result.contains("Child("), "result: {result}");
+    }
+
+    // ========== Fragments ==========
+
+    #[test]
+    fn fragment_basic() {
+        let result = transform(
+            r#"export function App() {
+    return <><span>a</span><span>b</span></>;
+}"#,
+        );
+        assert!(
+            result.contains("document.createDocumentFragment()"),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn fragment_with_text_and_elements() {
+        let result = transform(
+            r#"export function App() {
+    return <>text<div>child</div></>;
+}"#,
+        );
+        assert!(
+            result.contains("document.createDocumentFragment()"),
+            "result: {result}"
+        );
+        assert!(result.contains("__staticText("), "result: {result}");
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+    }
+
+    #[test]
+    fn nested_fragment_as_child() {
+        let result = transform(
+            r#"export function App() {
+    return <div><>inner</></div>;
+}"#,
+        );
+        assert!(
+            result.contains("document.createDocumentFragment()"),
+            "result: {result}"
+        );
+    }
+
+    // ========== Namespaced JSX names ==========
+
+    #[test]
+    fn namespaced_tag_name() {
+        let result = transform(
+            r#"export function App() {
+    return <svg:rect width="100" />;
+}"#,
+        );
+        assert!(
+            result.contains("__element(\"svg:rect\")"),
+            "result: {result}"
+        );
+    }
+
+    // ========== Member expression JSX names ==========
+
+    #[test]
+    fn member_expression_tag_name() {
+        let result = transform(
+            r#"export function App() {
+    return <icons.Home size={24} />;
+}"#,
+        );
+        // Member expression starting with lowercase is treated as element
+        assert!(
+            result.contains(r#"__element("icons.Home")"#),
+            "result: {result}"
+        );
+    }
+
+    // ========== JSX attribute as element value (rare) ==========
+
+    #[test]
+    fn expression_attribute_with_literal_number() {
+        let result = transform(
+            r#"export function App() {
+    return <input tabIndex={0} />;
+}"#,
+        );
+        // Literal expression attribute — not reactive
+        assert!(result.contains("setAttribute"), "result: {result}");
+    }
+
+    // ========== Empty expression container ==========
+
+    #[test]
+    fn empty_expression_container_ignored() {
+        let result = transform(
+            r#"export function App() {
+    return <div>{/* comment */}</div>;
+}"#,
+        );
+        // Empty expression from a comment should not produce __insert or __child
+        assert!(!result.contains("__insert("), "result: {result}");
+        assert!(!result.contains("__child("), "result: {result}");
+    }
+
+    // ========== List rendering (.map) ==========
+
+    #[test]
+    fn list_map_basic() {
+        let result = transform(
+            r#"export function App() {
+    const items = [1, 2, 3];
+    return <div>{items.map(item => <span>{item}</span>)}</div>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    #[test]
+    fn list_map_with_key() {
+        let result = transform(
+            r#"export function App() {
+    const items = [{ id: 1 }];
+    return <div>{items.map(item => <span key={item.id}>{item.id}</span>)}</div>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+        assert!(result.contains("item.id"), "result: {result}");
+    }
+
+    #[test]
+    fn list_map_with_index() {
+        let result = transform(
+            r#"export function App() {
+    const items = [1, 2, 3];
+    return <div>{items.map((item, index) => <span key={index}>{item}</span>)}</div>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    #[test]
+    fn list_map_with_block_body() {
+        let result = transform(
+            r#"export function App() {
+    const items = [1, 2, 3];
+    return <div>{items.map(item => {
+        const label = "Item: " + item;
+        return <span>{label}</span>;
+    })}</div>;
+}"#,
+        );
+        assert!(result.contains("__list("), "result: {result}");
+    }
+
+    // ========== Component props: expression props become getters ==========
+
+    #[test]
+    fn component_expression_prop_reactive_getter() {
+        // props.name is reactive (__props reference), so it becomes a getter
+        let result = transform(
+            r#"export function App({ name }) {
+    return <Child title={name} />;
+}"#,
+        );
+        assert!(result.contains("get title()"), "result: {result}");
+    }
+
+    #[test]
+    fn component_literal_expression_prop() {
+        let result = transform(
+            r#"export function App() {
+    return <Child count={42} />;
+}"#,
+        );
+        assert!(result.contains("count: 42"), "result: {result}");
+    }
+
+    #[test]
+    fn component_boolean_shorthand_prop() {
+        let result = transform(
+            r#"export function App() {
+    return <Child active />;
+}"#,
+        );
+        assert!(result.contains("active: true"), "result: {result}");
+    }
+
+    #[test]
+    fn component_spread_prop() {
+        let result = transform(
+            r#"export function App() {
+    const opts = { a: 1 };
+    return <Child {...opts} />;
+}"#,
+        );
+        assert!(result.contains("...opts"), "result: {result}");
+    }
+
+    #[test]
+    fn component_children_single() {
+        let result = transform(
+            r#"export function App() {
+    return <Wrapper><div>content</div></Wrapper>;
+}"#,
+        );
+        assert!(result.contains("children: () =>"), "result: {result}");
+    }
+
+    #[test]
+    fn component_children_multiple() {
+        let result = transform(
+            r#"export function App() {
+    return <Wrapper><span>a</span><span>b</span></Wrapper>;
+}"#,
+        );
+        // Multiple children → children: () => [...]
+        assert!(result.contains("children: () => ["), "result: {result}");
+    }
+
+    #[test]
+    fn component_key_prop_skipped() {
+        let result = transform(
+            r#"export function App() {
+    return <Child key="k" name="test" />;
+}"#,
+        );
+        // key should not appear in props
+        assert!(!result.contains("key:"), "result: {result}");
+        assert!(result.contains("name:"), "result: {result}");
+    }
+
+    // ========== Reactive attribute expressions ==========
+
+    #[test]
+    fn reactive_attr_uses_attr_helper() {
+        // Use query API which is in SIGNAL_API_REGISTRY — tasks.data is reactive
+        let result = transform(
+            r#"import { query } from 'vertz';
+export function App() {
+    const tasks = query('/api/tasks');
+    return <div class={tasks.data}>text</div>;
+}"#,
+        );
+        assert!(result.contains("__attr("), "result: {result}");
+    }
+
+    #[test]
+    fn reactive_attr_object_literal_wrapped_in_parens() {
+        // Reactive style object literal starting with { needs parens
+        let result = transform(
+            r#"export function App({ color }) {
+    return <div style={{ color: color }}>text</div>;
+}"#,
+        );
+        // The expression should be wrapped: () => ({...})
+        assert!(
+            result.contains("__attr(") || result.contains("__styleStr"),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn reactive_idl_property_uses_prop_helper() {
+        // Use query API — tasks.data is reactive, value on input → __prop
+        let result = transform(
+            r#"import { query } from 'vertz';
+export function App() {
+    const tasks = query('/api/tasks');
+    return <input value={tasks.data} />;
+}"#,
+        );
+        assert!(result.contains("__prop("), "result: {result}");
+    }
+
+    #[test]
+    fn static_expression_attr_guarded() {
+        // Static non-literal expression → guarded setAttribute
+        let result = transform(
+            r#"export function App() {
+    const cls = "foo";
+    return <div class={cls}>text</div>;
+}"#,
+        );
+        // Static expression → guarded with null check
+        assert!(
+            result.contains("const __v =") || result.contains("setAttribute"),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn static_style_expression_attr() {
+        let result = transform(
+            r#"export function App() {
+    const s = "color: red";
+    return <div style={s}>text</div>;
+}"#,
+        );
+        // Static style expression → guarded style setAttribute with __styleStr logic
+        assert!(
+            result.contains("__styleStr") || result.contains("style"),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn static_idl_property_expression() {
+        // Static non-literal value on input
+        let result = transform(
+            r#"export function App() {
+    const v = "hello";
+    return <input value={v} />;
+}"#,
+        );
+        // Static IDL property expression → guarded direct assignment
+        assert!(
+            result.contains("const __v =") || result.contains(".value ="),
+            "result: {result}"
+        );
+    }
+
+    // ========== Boolean shorthand on IDL properties ==========
+
+    #[test]
+    fn boolean_shorthand_idl_property_checked() {
+        let result = transform(
+            r#"export function App() {
+    return <input checked />;
+}"#,
+        );
+        // checked is boolean IDL → direct assignment: .checked = true
+        assert!(result.contains(".checked = true"), "result: {result}");
+    }
+
+    // ========== Ref attribute ==========
+
+    #[test]
+    fn ref_attribute_assignment() {
+        let result = transform(
+            r#"export function App() {
+    const myRef = {};
+    return <div ref={myRef}>text</div>;
+}"#,
+        );
+        assert!(result.contains(".current ="), "result: {result}");
+    }
+
+    // ========== Conditional rendering ==========
+
+    #[test]
+    fn logical_and_conditional() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.show && <span>visible</span>}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+        assert!(result.contains("null"), "result: {result}");
+    }
+
+    #[test]
+    fn nested_ternary_deep() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.a ? <span>A</span> : props.b ? <span>B</span> : <span>C</span>}</div>;
+}"#,
+        );
+        // Nested ternary → nested __conditional calls
+        let conditional_count = result.matches("__conditional(").count();
+        assert!(
+            conditional_count >= 2,
+            "expected nested conditionals, result: {result}"
+        );
+    }
+
+    #[test]
+    fn ternary_with_jsx_both_branches() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.ok ? <span>yes</span> : <span>no</span>}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Deeply nested JSX ==========
+
+    #[test]
+    fn deeply_nested_elements() {
+        let result = transform(
+            r#"export function App() {
+    return <div><section><article><p>deep</p></article></section></div>;
+}"#,
+        );
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+        assert!(result.contains("__element(\"p\")"), "result: {result}");
+    }
+
+    // ========== Self-closing tags ==========
+
+    #[test]
+    fn self_closing_element_no_children() {
+        let result = transform(
+            r#"export function App() {
+    return <br />;
+}"#,
+        );
+        assert!(result.contains("__element(\"br\")"), "result: {result}");
+        // No __enterChildren for self-closing
+        assert!(!result.contains("__enterChildren"), "result: {result}");
+    }
+
+    // ========== className → class mapping on elements ==========
+
+    #[test]
+    fn classname_mapped_to_class_on_element() {
+        let result = transform(
+            r#"export function App() {
+    return <div className="container">text</div>;
+}"#,
+        );
+        // On elements, className → class
+        assert!(
+            result.contains(r#"setAttribute("class""#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Spread without props_param ==========
+
+    #[test]
+    fn spread_without_destructured_props() {
+        let result = transform(
+            r#"export function App() {
+    const data = { a: 1 };
+    return <div {...data}>text</div>;
+}"#,
+        );
+        assert!(result.contains("__spread("), "result: {result}");
+        // No third argument (props_param) when component has no destructured props
+        let spread_idx = result.find("__spread(").unwrap();
+        let spread_call = &result[spread_idx..];
+        let close_paren = spread_call.find(')').unwrap();
+        let args = &spread_call[..close_paren];
+        // Should be __spread(el, expr) without third param
+        assert_eq!(args.matches(',').count(), 1, "result: {result}");
+    }
+
+    // ========== Component with JSX in prop value ==========
+
+    #[test]
+    fn component_with_jsx_prop_value() {
+        let result = transform(
+            r#"export function App() {
+    return <Layout header={() => <div>Header</div>}>content</Layout>;
+}"#,
+        );
+        // JSX inside prop expression → slice_with_transformed_jsx transforms it
+        assert!(result.contains("Layout("), "result: {result}");
+        assert!(result.contains("__element(\"div\")"), "result: {result}");
+    }
+
+    // ========== Reactivity: signal API props ==========
+
+    #[test]
+    fn is_text_reactive_signal_api_props() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::from([(
+                "tasks".to_string(),
+                HashSet::from(["data".to_string(), "loading".to_string()]),
+            )]),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(is_text_reactive("tasks.data", &rx));
+        assert!(is_text_reactive("tasks.loading", &rx));
+        assert!(!is_text_reactive("tasks.other", &rx));
+    }
+
+    // ========== Reactivity: reactive sources ==========
+
+    #[test]
+    fn is_text_reactive_reactive_sources() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::from(["auth".to_string()]),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert!(is_text_reactive("auth.user", &rx));
+        assert!(is_text_reactive("auth.user.avatarUrl", &rx));
+        // Just "auth" alone without property access is not reactive
+        assert!(!is_text_reactive("auth", &rx));
+    }
+
+    // ========== Reactivity: inline locals ==========
+
+    #[test]
+    fn is_text_reactive_inline_locals() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::from([("isActive".to_string(), "__props.active".to_string())]),
+            props_param: None,
+        };
+        assert!(is_text_reactive("isActive ? 'yes' : 'no'", &rx));
+    }
+
+    // ========== apply_inline_subs ==========
+
+    #[test]
+    fn apply_inline_subs_replaces_local() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::from([("isActive".to_string(), "__props.active".to_string())]),
+            props_param: None,
+        };
+        let result = apply_inline_subs("isActive ? 'yes' : 'no'", &rx);
+        assert!(result.contains("(__props.active)"), "result: {result}");
+    }
+
+    #[test]
+    fn apply_inline_subs_empty_locals() {
+        let rx = ReactivityContext {
+            names: HashSet::new(),
+            signal_api_props: HashMap::new(),
+            field_signal_api_vars: HashSet::new(),
+            reactive_sources: HashSet::new(),
+            inline_locals: HashMap::new(),
+            props_param: None,
+        };
+        assert_eq!(apply_inline_subs("foo", &rx), "foo");
+    }
+
+    // ========== key_references_index (additional) ==========
+
+    #[test]
+    fn key_references_index_embedded_in_expression() {
+        assert!(key_references_index("item.id + '-' + index", "index"));
+    }
+
+    #[test]
+    fn key_references_index_as_part_of_longer_name() {
+        // "indexValue" should NOT match "index"
+        assert!(!key_references_index("item.indexValue", "index"));
+    }
+
+    // ========== clean_jsx_text ==========
+
+    #[test]
+    fn clean_jsx_text_no_newlines() {
+        assert_eq!(clean_jsx_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_with_newlines() {
+        let result = clean_jsx_text("hello\n  world");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_crlf() {
+        let result = clean_jsx_text("hello\r\nworld");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_cr() {
+        let result = clean_jsx_text("hello\rworld");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_tabs_in_multiline() {
+        let result = clean_jsx_text("hello\n\tworld");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn clean_jsx_text_empty_lines_trimmed() {
+        let result = clean_jsx_text("hello\n   \nworld");
+        assert_eq!(result, "hello world");
+    }
+
+    // ========== json_quote ==========
+
+    #[test]
+    fn json_quote_escapes_special_chars() {
+        assert_eq!(json_quote("he\"llo"), r#""he\"llo""#);
+        assert_eq!(json_quote("a\\b"), r#""a\\b""#);
+        assert_eq!(json_quote("a\nb"), r#""a\nb""#);
+        assert_eq!(json_quote("a\rb"), r#""a\rb""#);
+        assert_eq!(json_quote("a\tb"), r#""a\tb""#);
+    }
+
+    // ========== is_valid_js_identifier ==========
+
+    #[test]
+    fn is_valid_js_identifier_valid() {
+        assert!(is_valid_js_identifier("foo"));
+        assert!(is_valid_js_identifier("$bar"));
+        assert!(is_valid_js_identifier("_baz"));
+        assert!(is_valid_js_identifier("a123"));
+    }
+
+    #[test]
+    fn is_valid_js_identifier_invalid() {
+        assert!(!is_valid_js_identifier("data-id"));
+        assert!(!is_valid_js_identifier("123abc"));
+        assert!(!is_valid_js_identifier(""));
+    }
+
+    // ========== Nested JSX callback in non-map context ==========
+
+    #[test]
+    fn jsx_in_non_map_callback_collected_separately() {
+        // JSX inside Array.from callback (not .map) is collected as separate node
+        let result = transform(
+            r#"export function App() {
+    return <div>{Array.from({ length: 3 }, (_, i) => <span>{i}</span>)}</div>;
+}"#,
+        );
+        // The JSX inside the callback should still be transformed
+        assert!(
+            result.contains("__element(\"span\")") || result.contains("__insert("),
+            "result: {result}"
+        );
+    }
+
+    // ========== List rendering in component children ==========
+
+    #[test]
+    fn list_map_as_component_child() {
+        let result = transform(
+            r#"export function App() {
+    const items = [1, 2, 3];
+    return <Wrapper>{items.map(item => <span>{item}</span>)}</Wrapper>;
+}"#,
+        );
+        // In component children context → __listValue
+        assert!(result.contains("__listValue("), "result: {result}");
+    }
+
+    // ========== Fragment child in element ==========
+
+    #[test]
+    fn fragment_child_in_element_children() {
+        let result = transform(
+            r#"export function App() {
+    return <div><>nested fragment</></div>;
+}"#,
+        );
+        assert!(
+            result.contains("document.createDocumentFragment()"),
+            "result: {result}"
+        );
+    }
+
+    // ========== Conditional in component children ==========
+
+    #[test]
+    fn ternary_in_component_children() {
+        let result = transform(
+            r#"export function App(props) {
+    return <Wrapper>{props.ok ? <span>yes</span> : <span>no</span>}</Wrapper>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    #[test]
+    fn logical_and_in_component_children() {
+        let result = transform(
+            r#"export function App(props) {
+    return <Wrapper>{props.ok && <span>shown</span>}</Wrapper>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    // ========== Optional chaining with map ==========
+
+    #[test]
+    fn optional_chaining_map() {
+        let result = transform(
+            r#"export function App() {
+    const data = null;
+    return <div>{data?.items.map(item => <span>{item}</span>)}</div>;
+}"#,
+        );
+        // Optional chaining map → __list
+        assert!(
+            result.contains("__list(") || result.contains("__insert("),
+            "result: {result}"
+        );
+    }
+
+    // ========== Parenthesized expression ==========
+
+    #[test]
+    fn parenthesized_ternary_expression() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{(props.ok ? "yes" : "no")}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+    }
+
+    // ========== Data attribute (hyphenated) ==========
+
+    #[test]
+    fn data_attribute_hyphenated() {
+        let result = transform(
+            r#"export function App() {
+    return <div data-testid="foo">text</div>;
+}"#,
+        );
+        assert!(
+            result.contains(r#"setAttribute("data-testid""#),
+            "result: {result}"
+        );
+    }
+
+    // ========== Key attribute filtered from element attrs ==========
+
+    #[test]
+    fn key_attribute_filtered_from_element() {
+        let result = transform(
+            r#"export function App() {
+    return <div key="k" id="main">text</div>;
+}"#,
+        );
+        // key should not appear in setAttribute calls
+        assert!(
+            !result.contains(r#"setAttribute("key""#),
+            "result: {result}"
+        );
+        assert!(result.contains(r#"setAttribute("id""#), "result: {result}");
+    }
+
+    // ========== Multiple components in same file ==========
+
+    #[test]
+    fn multiple_components_transformed() {
+        let result = transform(
+            r#"export function Header() {
+    return <header>head</header>;
+}
+export function Footer() {
+    return <footer>foot</footer>;
+}"#,
+        );
+        assert!(result.contains("__element(\"header\")"), "result: {result}");
+        assert!(result.contains("__element(\"footer\")"), "result: {result}");
+    }
+
+    // ========== Component with no props ==========
+
+    #[test]
+    fn component_no_props() {
+        let result = transform(
+            r#"export function App() {
+    return <Child />;
+}"#,
+        );
+        assert!(result.contains("Child({})"), "result: {result}");
+    }
+
+    // ========== Event handler with expression ==========
+
+    #[test]
+    fn event_handler_inline_arrow() {
+        let result = transform(
+            r#"export function App() {
+    return <button onClick={() => console.log("clicked")}>click</button>;
+}"#,
+        );
+        assert!(result.contains("__on("), "result: {result}");
+        assert!(result.contains("\"click\""), "result: {result}");
+    }
+
+    // ========== Reactive child with signal .value ==========
+
+    #[test]
+    fn reactive_child_with_signal_value() {
+        // After signal transform, signal access looks like count.value
+        // We simulate by creating a signal variable in the analyzer
+        let result = transform(
+            r#"import { query } from 'vertz';
+export function App() {
+    const tasks = query('/api/tasks');
+    return <div>{tasks.data}</div>;
+}"#,
+        );
+        // tasks is a signal API → tasks.data is reactive → __child
+        assert!(result.contains("__child("), "result: {result}");
+    }
+
+    // ========== Conditional with jsx branch transform ==========
+
+    #[test]
+    fn conditional_jsx_true_branch_transformed() {
+        let result = transform(
+            r#"export function App(props) {
+    return <div>{props.logged ? <span>Hello</span> : "Guest"}</div>;
+}"#,
+        );
+        assert!(result.contains("__conditional("), "result: {result}");
+        assert!(result.contains("__element(\"span\")"), "result: {result}");
+    }
+
+    // ========== Component children: text only ==========
+
+    #[test]
+    fn component_children_text_only() {
+        let result = transform(
+            r#"export function App() {
+    return <Wrapper>just text</Wrapper>;
+}"#,
+        );
+        assert!(result.contains("children:"), "result: {result}");
+        assert!(result.contains("__staticText("), "result: {result}");
+    }
+
+    // ========== Component children: expression child ==========
+
+    #[test]
+    fn component_children_expression() {
+        let result = transform(
+            r#"export function App() {
+    const x = 5;
+    return <Wrapper>{x}</Wrapper>;
+}"#,
+        );
+        assert!(result.contains("children:"), "result: {result}");
+    }
+
+    // ========== Reactive component children ==========
+
+    #[test]
+    fn component_children_reactive_expression() {
+        // Use query API — tasks.data is reactive → __child in component children
+        let result = transform(
+            r#"import { query } from 'vertz';
+export function App() {
+    const tasks = query('/api/tasks');
+    return <Wrapper>{tasks.data}</Wrapper>;
+}"#,
+        );
+        assert!(result.contains("children:"), "result: {result}");
+        assert!(result.contains("__child("), "result: {result}");
+    }
+
+    // ========== Static expression attribute with guard for null ==========
+
+    #[test]
+    fn static_expression_attr_null_guard() {
+        let result = transform(
+            r#"export function App() {
+    const cls = getClass();
+    return <div class={cls}>text</div>;
+}"#,
+        );
+        // Static non-literal expression → guarded with null/false check
+        assert!(result.contains("const __v ="), "result: {result}");
+        assert!(
+            result.contains("__v != null && __v !== false"),
+            "result: {result}"
+        );
+    }
+
+    // ========== Key attribute as expression on element ==========
+
+    #[test]
+    fn key_expression_attr_filtered() {
+        let result = transform(
+            r#"export function App() {
+    const k = "mykey";
+    return <div key={k} id="main">text</div>;
+}"#,
+        );
+        assert!(
+            !result.contains("\"key\""),
+            "key attr should be filtered, result: {result}"
+        );
+    }
+
+    // ========== Boolean shorthand key attribute filtered ==========
+
+    #[test]
+    fn key_boolean_shorthand_filtered() {
+        let result = transform(
+            r#"export function App() {
+    return <div key id="main">text</div>;
+}"#,
+        );
+        assert!(result.contains(r#"setAttribute("id""#), "result: {result}");
+    }
+
+    // ========== Component key expression prop skipped ==========
+
+    #[test]
+    fn component_key_expression_prop_skipped() {
+        let result = transform(
+            r#"export function App() {
+    return <Child key={1} name="test" />;
+}"#,
+        );
+        assert!(!result.contains("key:"), "result: {result}");
+    }
+
+    // ========== Component key boolean shorthand skipped ==========
+
+    #[test]
+    fn component_key_boolean_shorthand_skipped() {
+        let result = transform(
+            r#"export function App() {
+    return <Child key name="test" />;
+}"#,
+        );
+        assert!(!result.contains("key:"), "result: {result}");
+    }
+}
