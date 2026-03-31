@@ -1747,4 +1747,1628 @@ mod tests {
         .await;
         assert_eq!(result, serde_json::json!("correct-error"));
     }
+
+    // --- digest: SHA-1 and SHA-384 ---
+
+    #[tokio::test]
+    async fn test_digest_sha1() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const hash = await crypto.subtle.digest('SHA-1', new TextEncoder().encode('abc'));
+            return new Uint8Array(hash).length;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(20)); // SHA-1 = 160 bits = 20 bytes
+    }
+
+    #[tokio::test]
+    async fn test_digest_sha384() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const hash = await crypto.subtle.digest('SHA-384', new TextEncoder().encode('abc'));
+            return new Uint8Array(hash).length;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(48)); // SHA-384 = 384 bits = 48 bytes
+    }
+
+    // --- HMAC import errors ---
+
+    #[tokio::test]
+    async fn test_hmac_import_non_raw_format_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'pkcs8', new Uint8Array(32),
+                    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('raw') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_hmac_import_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(32),
+                    { name: 'HMAC' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_hmac_import_unsupported_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(32),
+                    { name: 'HMAC', hash: 'MD5' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('MD5') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- AES-GCM import ---
+
+    #[tokio::test]
+    async fn test_aes_gcm_import_raw() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const rawKey = new Uint8Array(32);
+            crypto.getRandomValues(rawKey);
+            const key = await crypto.subtle.importKey(
+                'raw', rawKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
+            );
+            return [
+                key.type === 'secret',
+                key.algorithm.name === 'AES-GCM',
+                key.extractable === true
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(item.as_bool().unwrap(), "AES-GCM import check {} failed", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aes_gcm_import_non_raw_format_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'pkcs8', new Uint8Array(32),
+                    { name: 'AES-GCM' }, false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('raw') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_aes_gcm_import_wrong_key_size_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(24),
+                    { name: 'AES-GCM' }, false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('128 or 256 bits') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_aes_gcm_import_128_bit_key() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const rawKey = new Uint8Array(16);
+            crypto.getRandomValues(rawKey);
+            const key = await crypto.subtle.importKey(
+                'raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']
+            );
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const ct = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv }, key, new TextEncoder().encode('test')
+            );
+            const pt = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv }, key, ct
+            );
+            return new TextDecoder().decode(new Uint8Array(pt)) === 'test';
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    // --- AES-GCM encrypt/decrypt edge cases ---
+
+    #[tokio::test]
+    async fn test_aes_gcm_with_additional_data() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+            );
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const aad = new TextEncoder().encode('associated data');
+            const ct = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv, additionalData: aad }, key,
+                new TextEncoder().encode('secret')
+            );
+            // Decrypt with same AAD should work
+            const pt = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv, additionalData: aad }, key, ct
+            );
+            const decoded = new TextDecoder().decode(new Uint8Array(pt));
+            // Decrypt with different AAD should fail
+            let wrongAadFailed = false;
+            try {
+                await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode('wrong') },
+                    key, ct
+                );
+            } catch (e) { wrongAadFailed = true; }
+            return [decoded === 'secret', wrongAadFailed];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        assert!(arr[0].as_bool().unwrap(), "should decrypt with correct AAD");
+        assert!(arr[1].as_bool().unwrap(), "should fail with wrong AAD");
+    }
+
+    #[tokio::test]
+    async fn test_aes_gcm_wrong_iv_size_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 }, false, ['encrypt']
+            );
+            try {
+                await crypto.subtle.encrypt(
+                    { name: 'AES-GCM', iv: new Uint8Array(8) }, key,
+                    new TextEncoder().encode('test')
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('12 bytes') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_non_aes_gcm_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 }, false, ['encrypt']
+            );
+            try {
+                await crypto.subtle.encrypt(
+                    { name: 'RSA-OAEP', iv: new Uint8Array(12) }, key,
+                    new TextEncoder().encode('test')
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('AES-GCM') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_non_aes_gcm_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+            );
+            try {
+                await crypto.subtle.decrypt(
+                    { name: 'RSA-OAEP', iv: new Uint8Array(12) }, key,
+                    new Uint8Array(32)
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('AES-GCM') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_wrong_usage_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+            );
+            try {
+                await crypto.subtle.encrypt(
+                    { name: 'AES-GCM', iv: new Uint8Array(12) }, key,
+                    new TextEncoder().encode('test')
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('encrypt') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_wrong_usage_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 256 }, false, ['encrypt']
+            );
+            try {
+                await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: new Uint8Array(12) }, key,
+                    new Uint8Array(32)
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('decrypt') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- AES-GCM generateKey edge cases ---
+
+    #[tokio::test]
+    async fn test_generate_key_aes_gcm_128() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt']
+            );
+            const exported = await crypto.subtle.exportKey('raw', key);
+            return new Uint8Array(exported).length;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(16)); // 128 bits = 16 bytes
+    }
+
+    #[tokio::test]
+    async fn test_generate_key_aes_gcm_missing_length_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'AES-GCM' }, false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('length') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_key_aes_gcm_invalid_length_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'AES-GCM', length: 192 }, false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('128 or 256') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_key_unsupported_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'ChaCha20' }, false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('generateKey') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- HMAC generateKey with different hashes ---
+
+    #[tokio::test]
+    async fn test_hmac_generate_key_sha512() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-512' }, true, ['sign', 'verify']
+            );
+            const exported = await crypto.subtle.exportKey('raw', key);
+            const data = new TextEncoder().encode('test');
+            const sig = await crypto.subtle.sign('HMAC', key, data);
+            const valid = await crypto.subtle.verify('HMAC', key, sig, data);
+            return [
+                new Uint8Array(exported).length === 128,
+                sig.byteLength > 0,
+                valid
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        assert!(
+            arr[0].as_bool().unwrap(),
+            "SHA-512 HMAC key should be 128 bytes"
+        );
+        assert!(arr[1].as_bool().unwrap(), "signature should have bytes");
+        assert!(arr[2].as_bool().unwrap(), "signature should verify");
+    }
+
+    #[tokio::test]
+    async fn test_hmac_generate_key_sha384() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-384' }, true, ['sign', 'verify']
+            );
+            const exported = await crypto.subtle.exportKey('raw', key);
+            return new Uint8Array(exported).length === 128;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_hmac_generate_key_sha1() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-1' }, true, ['sign']
+            );
+            const exported = await crypto.subtle.exportKey('raw', key);
+            return new Uint8Array(exported).length === 64;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_hmac_generate_key_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'HMAC' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- ECDSA P-384 ---
+
+    #[tokio::test]
+    async fn test_ecdsa_p384_sign_verify() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'ECDSA', namedCurve: 'P-384' }, false, ['sign', 'verify']
+            );
+            const data = new TextEncoder().encode('test data');
+            const sig = await crypto.subtle.sign(
+                { name: 'ECDSA', hash: 'SHA-384' }, keyPair.privateKey, data
+            );
+            const valid = await crypto.subtle.verify(
+                { name: 'ECDSA', hash: 'SHA-384' }, keyPair.publicKey, sig, data
+            );
+            return [
+                keyPair.privateKey.type === 'private',
+                keyPair.publicKey.type === 'public',
+                sig.byteLength > 0,
+                valid
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(item.as_bool().unwrap(), "ECDSA P-384 check {} failed", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_generate_unsupported_curve_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'ECDSA', namedCurve: 'P-521' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('P-521') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_generate_missing_curve_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'ECDSA' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('namedCurve') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_sign_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']
+            );
+            try {
+                await crypto.subtle.sign(
+                    { name: 'ECDSA' }, keyPair.privateKey, new Uint8Array([1,2,3])
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_verify_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']
+            );
+            try {
+                await crypto.subtle.verify(
+                    { name: 'ECDSA' }, keyPair.publicKey, new Uint8Array(64), new Uint8Array([1,2,3])
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_unsupported_curve_hash_combo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']
+            );
+            try {
+                await crypto.subtle.sign(
+                    { name: 'ECDSA', hash: 'SHA-384' }, keyPair.privateKey, new Uint8Array([1,2,3])
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('curve/hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- ECDSA import ---
+
+    #[tokio::test]
+    async fn test_ecdsa_import_export_roundtrip() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+            );
+            // Export public key as raw
+            const pubRaw = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+            // Export private key as pkcs8
+            const privPkcs8 = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+            // Re-import
+            const importedPub = await crypto.subtle.importKey(
+                'raw', pubRaw, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']
+            );
+            const importedPriv = await crypto.subtle.importKey(
+                'pkcs8', privPkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']
+            );
+            // Sign with reimported private, verify with reimported public
+            const data = new TextEncoder().encode('roundtrip');
+            const sig = await crypto.subtle.sign(
+                { name: 'ECDSA', hash: 'SHA-256' }, importedPriv, data
+            );
+            const valid = await crypto.subtle.verify(
+                { name: 'ECDSA', hash: 'SHA-256' }, importedPub, sig, data
+            );
+            return [
+                importedPub.type === 'public',
+                importedPriv.type === 'private',
+                valid
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(
+                item.as_bool().unwrap(),
+                "ECDSA import roundtrip check {} failed",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_import_unsupported_format_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'spki', new Uint8Array(65),
+                    { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('pkcs8') && e.message.includes('raw') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_import_missing_curve_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(65),
+                    { name: 'ECDSA' }, false, ['verify']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('namedCurve') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_ecdsa_import_unsupported_curve_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(65),
+                    { name: 'ECDSA', namedCurve: 'P-521' }, false, ['verify']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('P-521') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- RSA generate + sign/verify ---
+
+    #[tokio::test]
+    async fn test_rsa_generate_sign_verify_sha256() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048 },
+                true, ['sign', 'verify']
+            );
+            const data = new TextEncoder().encode('RSA test');
+            const sig = await crypto.subtle.sign(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.privateKey, data
+            );
+            const valid = await crypto.subtle.verify(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.publicKey, sig, data
+            );
+            const invalid = await crypto.subtle.verify(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.publicKey, sig,
+                new TextEncoder().encode('wrong')
+            );
+            return [
+                keyPair.privateKey.type === 'private',
+                keyPair.publicKey.type === 'public',
+                sig.byteLength === 256,
+                valid, !invalid
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(item.as_bool().unwrap(), "RSA SHA-256 check {} failed", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rsa_sign_verify_sha384() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-384', modulusLength: 2048 },
+                false, ['sign', 'verify']
+            );
+            const data = new TextEncoder().encode('SHA-384 test');
+            const sig = await crypto.subtle.sign(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.privateKey, data
+            );
+            const valid = await crypto.subtle.verify(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.publicKey, sig, data
+            );
+            return [sig.byteLength === 256, valid];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        assert!(arr[0].as_bool().unwrap(), "RSA-384 sig should be 256 bytes");
+        assert!(arr[1].as_bool().unwrap(), "RSA-384 should verify");
+    }
+
+    #[tokio::test]
+    async fn test_rsa_sign_verify_sha512() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-512', modulusLength: 2048 },
+                false, ['sign', 'verify']
+            );
+            const data = new TextEncoder().encode('SHA-512 test');
+            const sig = await crypto.subtle.sign(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.privateKey, data
+            );
+            const valid = await crypto.subtle.verify(
+                { name: 'RSASSA-PKCS1-v1_5' }, keyPair.publicKey, sig, data
+            );
+            return [sig.byteLength === 256, valid];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        assert!(arr[0].as_bool().unwrap(), "RSA-512 sig should be 256 bytes");
+        assert!(arr[1].as_bool().unwrap(), "RSA-512 should verify");
+    }
+
+    // --- RSA import/export ---
+
+    #[tokio::test]
+    async fn test_rsa_import_export_roundtrip() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048 },
+                true, ['sign', 'verify']
+            );
+            // Export
+            const privPkcs8 = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+            const pubSpki = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+            // Re-import
+            const importedPriv = await crypto.subtle.importKey(
+                'pkcs8', privPkcs8,
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['sign']
+            );
+            const importedPub = await crypto.subtle.importKey(
+                'spki', pubSpki,
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['verify']
+            );
+            // Sign with reimported key, verify with reimported key
+            const data = new TextEncoder().encode('roundtrip');
+            const sig = await crypto.subtle.sign(
+                { name: 'RSASSA-PKCS1-v1_5' }, importedPriv, data
+            );
+            const valid = await crypto.subtle.verify(
+                { name: 'RSASSA-PKCS1-v1_5' }, importedPub, sig, data
+            );
+            return [
+                importedPriv.type === 'private',
+                importedPub.type === 'public',
+                valid
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(
+                item.as_bool().unwrap(),
+                "RSA import roundtrip check {} failed",
+                i
+            );
+        }
+    }
+
+    // --- RSA error paths ---
+
+    #[tokio::test]
+    async fn test_rsa_generate_sha1_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-1', modulusLength: 2048 },
+                    false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('SHA-1') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_rsa_generate_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048 },
+                    false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_rsa_generate_unsupported_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.generateKey(
+                    { name: 'RSASSA-PKCS1-v1_5', hash: 'MD5', modulusLength: 2048 },
+                    false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('MD5') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_rsa_import_unsupported_format_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(256),
+                    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('pkcs8') && e.message.includes('spki') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_rsa_import_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'pkcs8', new Uint8Array(256),
+                    { name: 'RSASSA-PKCS1-v1_5' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_rsa_import_sha1_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'pkcs8', new Uint8Array(256),
+                    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-1' }, false, ['sign']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('SHA-1') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- sign/verify unsupported algorithms ---
+
+    #[tokio::test]
+    async fn test_sign_unsupported_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
+            );
+            try {
+                await crypto.subtle.sign(
+                    { name: 'ChaCha20' }, key, new Uint8Array([1,2,3])
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('sign') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_unsupported_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
+            );
+            try {
+                await crypto.subtle.verify(
+                    { name: 'ChaCha20' }, key, new Uint8Array(32), new Uint8Array([1,2,3])
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('verify') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- importKey unsupported algorithm ---
+
+    #[tokio::test]
+    async fn test_import_unsupported_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'raw', new Uint8Array(32),
+                    { name: 'ChaCha20' }, false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('importKey') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- exportKey unsupported format ---
+
+    #[tokio::test]
+    async fn test_export_unsupported_format_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']
+            );
+            try {
+                await crypto.subtle.exportKey('pkcs8', key);
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('format') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- Key not found ---
+
+    #[tokio::test]
+    async fn test_sign_key_not_found() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                // Use internal op directly with a bogus key ID
+                const result = Deno.core.ops.op_crypto_subtle_sign({
+                    algorithm: { name: 'HMAC' },
+                    keyId: 9999,
+                    data: Array.from(new Uint8Array([1,2,3]))
+                });
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('not found') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_key_not_found() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                const result = Deno.core.ops.op_crypto_subtle_verify({
+                    algorithm: { name: 'HMAC' },
+                    keyId: 9999,
+                    signature: Array.from(new Uint8Array(32)),
+                    data: Array.from(new Uint8Array([1,2,3]))
+                });
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('not found') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_export_key_not_found() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                const result = Deno.core.ops.op_crypto_subtle_export_key({
+                    format: 'raw',
+                    keyId: 9999
+                });
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('not found') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- HKDF edge cases ---
+
+    #[tokio::test]
+    async fn test_hkdf_import_key() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('secret'),
+                { name: 'HKDF' }, false, ['deriveBits', 'deriveKey']
+            );
+            return [
+                key.type === 'secret',
+                key.algorithm.name === 'HKDF',
+                key.extractable === false
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(item.as_bool().unwrap(), "HKDF import check {} failed", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hkdf_import_non_raw_format_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            try {
+                await crypto.subtle.importKey(
+                    'pkcs8', new Uint8Array(32),
+                    { name: 'HKDF' }, false, ['deriveBits']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('raw') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_hkdf_derive_bits_sha384() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key material'),
+                { name: 'HKDF' }, false, ['deriveBits']
+            );
+            const bits = await crypto.subtle.deriveBits(
+                { name: 'HKDF', hash: 'SHA-384',
+                  salt: new TextEncoder().encode('salt'),
+                  info: new TextEncoder().encode('info') },
+                ikm, 256
+            );
+            return bits.byteLength === 32;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_hkdf_derive_bits_sha512() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key material'),
+                { name: 'HKDF' }, false, ['deriveBits']
+            );
+            const bits = await crypto.subtle.deriveBits(
+                { name: 'HKDF', hash: 'SHA-512',
+                  salt: new TextEncoder().encode('salt'),
+                  info: new TextEncoder().encode('info') },
+                ikm, 512
+            );
+            return bits.byteLength === 64;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_hkdf_derive_bits_unsupported_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key'),
+                { name: 'HKDF' }, false, ['deriveBits']
+            );
+            try {
+                await crypto.subtle.deriveBits(
+                    { name: 'HKDF', hash: 'MD5',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    ikm, 256
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('MD5') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_hkdf_derive_bits_missing_hash_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key'),
+                { name: 'HKDF' }, false, ['deriveBits']
+            );
+            try {
+                await crypto.subtle.deriveBits(
+                    { name: 'HKDF',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    ikm, 256
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('hash') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_derive_bits_wrong_usage_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key'),
+                { name: 'HKDF' }, false, ['deriveKey']
+            );
+            try {
+                await crypto.subtle.deriveBits(
+                    { name: 'HKDF', hash: 'SHA-256',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    ikm, 256
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('deriveBits') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_derive_bits_non_hkdf_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-256' }, false, ['deriveBits']
+            );
+            try {
+                await crypto.subtle.deriveBits(
+                    { name: 'PBKDF2', hash: 'SHA-256',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    key, 256
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('HKDF') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- deriveKey edge cases ---
+
+    #[tokio::test]
+    async fn test_hkdf_derive_key_to_hmac() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('password'),
+                { name: 'HKDF' }, false, ['deriveKey']
+            );
+            const key = await crypto.subtle.deriveKey(
+                { name: 'HKDF', hash: 'SHA-256',
+                  salt: new TextEncoder().encode('salt'),
+                  info: new TextEncoder().encode('info') },
+                ikm,
+                { name: 'HMAC', hash: 'SHA-256', length: 256 },
+                true, ['sign', 'verify']
+            );
+            const data = new TextEncoder().encode('test');
+            const sig = await crypto.subtle.sign('HMAC', key, data);
+            const valid = await crypto.subtle.verify('HMAC', key, sig, data);
+            return [
+                key.type === 'secret',
+                key.algorithm.name === 'HMAC',
+                valid
+            ];
+        "#,
+        )
+        .await;
+        let arr = result.as_array().unwrap();
+        for (i, item) in arr.iter().enumerate() {
+            assert!(
+                item.as_bool().unwrap(),
+                "HKDF deriveKey→HMAC check {} failed",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_derive_key_wrong_usage_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key'),
+                { name: 'HKDF' }, false, ['deriveBits']
+            );
+            try {
+                await crypto.subtle.deriveKey(
+                    { name: 'HKDF', hash: 'SHA-256',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    ikm,
+                    { name: 'AES-GCM', length: 256 },
+                    false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('deriveKey') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_derive_key_non_hkdf_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-256' }, false, ['deriveKey']
+            );
+            try {
+                await crypto.subtle.deriveKey(
+                    { name: 'PBKDF2', hash: 'SHA-256',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    key,
+                    { name: 'AES-GCM', length: 256 },
+                    false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('HKDF') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    #[tokio::test]
+    async fn test_derive_key_unsupported_derived_algo_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key'),
+                { name: 'HKDF' }, false, ['deriveKey']
+            );
+            try {
+                await crypto.subtle.deriveKey(
+                    { name: 'HKDF', hash: 'SHA-256',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    ikm,
+                    { name: 'ChaCha20', length: 256 },
+                    false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('deriveKey') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
+
+    // --- ECDSA export public key as raw ---
+
+    #[tokio::test]
+    async fn test_ecdsa_export_public_key_raw() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+            );
+            const pubRaw = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+            // P-256 uncompressed public key = 65 bytes (0x04 prefix + 32 + 32)
+            return new Uint8Array(pubRaw).length === 65;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    // --- RSA export formats ---
+
+    #[tokio::test]
+    async fn test_rsa_export_public_key_spki() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048 },
+                true, ['sign', 'verify']
+            );
+            const spki = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+            return spki.byteLength > 0;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_rsa_export_private_key_pkcs8() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const keyPair = await crypto.subtle.generateKey(
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048 },
+                true, ['sign', 'verify']
+            );
+            const pkcs8 = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+            return pkcs8.byteLength > 0;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    // --- HMAC with custom key length ---
+
+    #[tokio::test]
+    async fn test_hmac_generate_key_custom_length() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const key = await crypto.subtle.generateKey(
+                { name: 'HMAC', hash: 'SHA-256', length: 128 }, true, ['sign']
+            );
+            const exported = await crypto.subtle.exportKey('raw', key);
+            return new Uint8Array(exported).length === 16;
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    // --- AES-GCM deriveKey missing length ---
+
+    #[tokio::test]
+    async fn test_derive_key_aes_gcm_missing_length_fails() {
+        let mut rt = create_runtime();
+        let result = run_async(
+            &mut rt,
+            r#"
+            const ikm = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('key'),
+                { name: 'HKDF' }, false, ['deriveKey']
+            );
+            try {
+                await crypto.subtle.deriveKey(
+                    { name: 'HKDF', hash: 'SHA-256',
+                      salt: new Uint8Array(), info: new Uint8Array() },
+                    ikm,
+                    { name: 'AES-GCM' },
+                    false, ['encrypt']
+                );
+                return 'no-throw';
+            } catch (e) {
+                return e.message.includes('length') ? 'correct-error' : e.message;
+            }
+        "#,
+        )
+        .await;
+        assert_eq!(result, serde_json::json!("correct-error"));
+    }
 }
