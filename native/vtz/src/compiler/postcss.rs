@@ -195,16 +195,22 @@ pub fn process_css(
             column: None,
         })?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(POSTCSS_RUNNER.as_bytes())
-            .map_err(|err| PostCssError {
+    // Write the runner script then close stdin to signal EOF.
+    // If writing fails, kill the child to avoid a leaked process.
+    {
+        let mut stdin = child.stdin.take().expect("stdin was set to piped");
+        if let Err(err) = stdin.write_all(POSTCSS_RUNNER.as_bytes()) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PostCssError {
                 message: format!("Failed to send PostCSS runner to Node.js: {}", err),
                 file: Some(file_path.to_path_buf()),
                 line: None,
                 column: None,
-            })?;
-    }
+            });
+        }
+    } // stdin dropped here — pipe closed
 
     let output = child.wait_with_output().map_err(|err| PostCssError {
         message: format!("Failed to wait for PostCSS: {}", err),

@@ -205,17 +205,8 @@ impl CompilationPipeline {
             };
         }
 
-        let source = match std::fs::read_to_string(file_path) {
-            Ok(source) => source,
-            Err(err) => {
-                return self.error_module(&format!(
-                    "Failed to read CSS file '{}': {}",
-                    file_path.display(),
-                    err
-                ));
-            }
-        };
-
+        // When PostCSS is configured the JS runner reads the file itself,
+        // so only read from Rust when falling back to raw CSS.
         let processed_css = match postcss::find_postcss_config(&self.root_dir) {
             Some(config_path) => {
                 match postcss::process_css(&self.root_dir, file_path, &config_path) {
@@ -234,7 +225,16 @@ impl CompilationPipeline {
                     }
                 }
             }
-            None => source,
+            None => match std::fs::read_to_string(file_path) {
+                Ok(source) => source,
+                Err(err) => {
+                    return self.error_module(&format!(
+                        "Failed to read CSS file '{}': {}",
+                        file_path.display(),
+                        err
+                    ));
+                }
+            },
         };
 
         let code = crate::server::css_server::css_to_js_module(&processed_css, url_path);

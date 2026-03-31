@@ -2265,10 +2265,22 @@ mod tests {
         let resp = handle_source_file(State(state.clone()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let current = state.error_broadcaster.current_state().await;
-        let payload = current.to_json();
-        assert!(payload.contains("Unknown at-rule @broken"));
+        // The error is reported via a fire-and-forget tokio::spawn, so poll
+        // with a hard deadline instead of a single fixed sleep.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let payload = loop {
+            tokio::task::yield_now().await;
+            let current = state.error_broadcaster.current_state().await;
+            let p = current.to_json();
+            if p.contains("Unknown at-rule @broken") {
+                break p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for PostCSS error to appear in error broadcaster"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         assert!(payload.contains("\"line\":1"));
     }
 
