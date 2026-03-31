@@ -223,4 +223,13 @@ No way to force cert regeneration without manually deleting files. A `--force` f
 
 ## Resolution
 
-Awaiting fixes for **BLOCKER-1** and **BLOCKER-2**. SHOULD-FIX items should be addressed before the PR is opened to main. NIT items can be deferred to a follow-up.
+All blockers and should-fix items resolved in commit 175b47d:
+
+- **BLOCKER-1**: Fixed. `write_private()` with 0o600 permissions wired into `generate_ca()` and `generate_server_cert()` for key files. Two new `#[cfg(unix)]` tests verify permissions.
+- **BLOCKER-2**: Fixed. `ws_proxy` now sends Close frames to both sides when either direction terminates in `tokio::select!`.
+- **SHOULD-FIX-1**: Fixed. Banner reads proxy port from `proxy.port` file. Port file written/cleaned by `proxy init` and `proxy start`.
+- **SHOULD-FIX-2**: Fixed. `generate_ca()` checks `has_ca()` and returns early if CA exists.
+- **SHOULD-FIX-3**: Deferred to follow-up (rcgen default validity is adequate for dev use).
+- **SHOULD-FIX-4**: Fixed. Upstream WS connection failures are logged via `eprintln!`.
+- **SHOULD-FIX-5**: Fixed. `proxy trust` command shows platform-specific error on non-macOS.
+- **NITs**: Deferred to follow-up.
