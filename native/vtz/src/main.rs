@@ -1053,7 +1053,23 @@ async fn main() {
                                 unsafe {
                                     libc::kill(pid as libc::pid_t, libc::SIGTERM);
                                 }
-                                eprintln!("Stopped proxy (PID {})", pid);
+                                // Verify the process actually stopped
+                                let mut stopped = false;
+                                for _ in 0..10 {
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    if !routes::is_pid_alive(pid) {
+                                        stopped = true;
+                                        break;
+                                    }
+                                }
+                                if stopped {
+                                    eprintln!("Stopped proxy (PID {})", pid);
+                                } else {
+                                    eprintln!(
+                                        "Warning: proxy (PID {}) did not stop; you may need to `kill -9 {}`",
+                                        pid, pid
+                                    );
+                                }
                             } else {
                                 eprintln!("Proxy is not running (stale PID file)");
                             }

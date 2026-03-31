@@ -78,20 +78,19 @@ pub fn register_dev_server(
         return None;
     }
 
+    // Detect branch and project once, reuse for both subdomain and entry
+    let branch = detect_git_branch(root_dir).unwrap_or_else(|| "main".to_string());
+    let project = detect_project_name(root_dir);
+
     let subdomain = if let Some(name) = name_override {
         naming::sanitize_label(name)
     } else {
-        let branch = detect_git_branch(root_dir).unwrap_or_else(|| "main".to_string());
-        let project = detect_project_name(root_dir);
         naming::to_subdomain(&branch, &project)
     };
 
     if subdomain.is_empty() {
         return None;
     }
-
-    let branch = detect_git_branch(root_dir).unwrap_or_else(|| "unknown".to_string());
-    let project = detect_project_name(root_dir);
 
     let entry = RouteEntry {
         subdomain: subdomain.clone(),

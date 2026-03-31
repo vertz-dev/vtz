@@ -39,11 +39,11 @@ pub fn sanitize_label(input: &str) -> String {
     // Strip leading/trailing dashes
     let trimmed = result.trim_matches('-');
 
-    // Truncate to DNS label limit
+    // Truncate to DNS label limit, then strip any trailing dash from the cut
     if trimmed.len() <= MAX_LABEL_LEN {
         trimmed.to_string()
     } else {
-        trimmed[..MAX_LABEL_LEN].to_string()
+        trimmed[..MAX_LABEL_LEN].trim_end_matches('-').to_string()
     }
 }
 
@@ -106,6 +106,15 @@ mod tests {
         let long_input = "a".repeat(100);
         let result = sanitize_label(&long_input);
         assert_eq!(result.len(), 63);
+    }
+
+    #[test]
+    fn sanitize_truncation_does_not_leave_trailing_dash() {
+        // 62 a's + dash + more chars → truncates at 63, dash is at position 62
+        let input = format!("{}-bbb", "a".repeat(62));
+        let result = sanitize_label(&input);
+        assert!(!result.ends_with('-'));
+        assert_eq!(result.len(), 62);
     }
 
     #[test]

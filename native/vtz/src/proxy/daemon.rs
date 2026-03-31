@@ -8,18 +8,23 @@ use axum::Router;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+
+/// Maximum request body size the proxy will buffer (100 MB).
+const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+
+/// Minimum interval between route reloads from disk (seconds).
+const ROUTE_RELOAD_INTERVAL_SECS: u64 = 2;
 
 /// Shared state for the proxy daemon.
 #[derive(Debug, Clone)]
 pub struct ProxyState {
-    /// Map from subdomain to route entry.
-    pub route_table: Arc<RwLock<HashMap<String, RouteEntry>>>,
-    /// The routes directory to watch.
-    pub routes_dir: PathBuf,
-    /// HTTP client for forwarding requests.
-    pub client: reqwest::Client,
+    route_table: Arc<RwLock<HashMap<String, RouteEntry>>>,
+    routes_dir: PathBuf,
+    client: reqwest::Client,
+    last_reload: Arc<RwLock<Instant>>,
 }
 
 impl ProxyState {
@@ -28,6 +33,7 @@ impl ProxyState {
             route_table: Arc::new(RwLock::new(HashMap::new())),
             routes_dir,
             client: reqwest::Client::new(),
+            last_reload: Arc::new(RwLock::new(Instant::now())),
         }
     }
 
@@ -39,10 +45,28 @@ impl ProxyState {
         for entry in entries {
             table.insert(entry.subdomain.clone(), entry);
         }
+        *self.last_reload.write().await = Instant::now();
     }
 
-    /// Look up a route by subdomain.
+    /// Reload routes only if the cache is stale (older than ROUTE_RELOAD_INTERVAL_SECS).
+    async fn reload_routes_if_stale(&self) {
+        let elapsed = self.last_reload.read().await.elapsed().as_secs();
+        if elapsed >= ROUTE_RELOAD_INTERVAL_SECS {
+            self.reload_routes().await;
+        }
+    }
+
+    /// Look up a route by subdomain. Reloads on cache miss.
     pub async fn lookup(&self, subdomain: &str) -> Option<RouteEntry> {
+        // Try cached first
+        {
+            let table = self.route_table.read().await;
+            if let Some(entry) = table.get(subdomain) {
+                return Some(entry.clone());
+            }
+        }
+        // Cache miss — force reload and retry
+        self.reload_routes().await;
         let table = self.route_table.read().await;
         table.get(subdomain).cloned()
     }
@@ -66,8 +90,8 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> R
         None => return dashboard_response(&state).await,
     };
 
-    // Reload routes for fresh data (cheap for small route counts)
-    state.reload_routes().await;
+    // Periodically refresh the route table from disk
+    state.reload_routes_if_stale().await;
 
     let route = match state.lookup(&subdomain).await {
         Some(r) => r,
@@ -107,8 +131,8 @@ async fn forward_request(
         _ => reqwest::Method::GET,
     };
 
-    // Collect body bytes
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    // Collect body bytes (bounded to prevent OOM)
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_SIZE).await {
         Ok(b) => b,
         Err(e) => {
             return Response::builder()
@@ -161,6 +185,15 @@ async fn convert_response(resp: reqwest::Response) -> Response<Body> {
     }
 }
 
+/// Escape HTML special characters to prevent XSS.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 /// Dashboard page listing all registered dev servers.
 async fn dashboard_response(state: &ProxyState) -> Response<Body> {
     state.reload_routes().await;
@@ -183,12 +216,12 @@ async fn dashboard_response(state: &ProxyState) -> Response<Body> {
 
     let mut rows = String::new();
     for entry in table.values() {
+        let sub = html_escape(&entry.subdomain);
+        let branch = html_escape(&entry.branch);
         rows.push_str(&format!(
             "<tr><td><a href=\"http://{sub}.localhost\">{sub}</a></td>\
              <td>{port}</td><td>{branch}</td><td>{pid}</td></tr>",
-            sub = entry.subdomain,
             port = entry.port,
-            branch = entry.branch,
             pid = entry.pid,
         ));
     }
@@ -438,5 +471,40 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.text().await.unwrap(), "Hello from backend!");
+    }
+
+    // --- html_escape tests ---
+
+    #[test]
+    fn html_escape_handles_special_chars() {
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("\"hello\""), "&quot;hello&quot;");
+        assert_eq!(html_escape("it's"), "it&#x27;s");
+    }
+
+    #[test]
+    fn html_escape_passes_through_safe_strings() {
+        assert_eq!(html_escape("feat-auth.my-app"), "feat-auth.my-app");
+        assert_eq!(html_escape("fix/bug-123"), "fix/bug-123");
+    }
+
+    #[tokio::test]
+    async fn dashboard_html_escapes_branch_names() {
+        let dir = test_routes_dir();
+        let routes = dir.path().join("routes");
+        let mut entry = test_route_entry("test-app", 3000);
+        entry.branch = "<script>alert(1)</script>".to_string();
+        routes::register_in(&routes, &entry).unwrap();
+
+        let state = ProxyState::new(routes);
+        let resp = dashboard_response(&state).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        // The raw <script> tag should NOT appear in the HTML
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 }
