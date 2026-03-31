@@ -65,3 +65,121 @@ pub fn inject_context_stable_ids(ms: &mut MagicString, program: &Program, rel_fi
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::magic_string::MagicString;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn transform(source: &str, path: &str) -> String {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let mut ms = MagicString::new(source);
+        inject_context_stable_ids(&mut ms, &parsed.program, path);
+        ms.to_string()
+    }
+
+    #[test]
+    fn bare_const_no_args() {
+        let result = transform("const Ctx = createContext();", "test.tsx");
+        assert_eq!(
+            result,
+            "const Ctx = createContext(undefined, 'test.tsx::Ctx');"
+        );
+    }
+
+    #[test]
+    fn bare_const_with_default_value() {
+        let result = transform("const Ctx = createContext(0);", "test.tsx");
+        assert_eq!(result, "const Ctx = createContext(0, 'test.tsx::Ctx');");
+    }
+
+    #[test]
+    fn export_named_no_args() {
+        let result = transform("export const Ctx = createContext();", "test.tsx");
+        assert_eq!(
+            result,
+            "export const Ctx = createContext(undefined, 'test.tsx::Ctx');"
+        );
+    }
+
+    #[test]
+    fn export_named_with_default_value() {
+        let result = transform("export const Ctx = createContext(\"hello\");", "test.tsx");
+        assert_eq!(
+            result,
+            "export const Ctx = createContext(\"hello\", 'test.tsx::Ctx');"
+        );
+    }
+
+    #[test]
+    fn skips_function_declaration() {
+        let source = "function foo() {}";
+        assert_eq!(transform(source, "test.tsx"), source);
+    }
+
+    #[test]
+    fn skips_non_call_init() {
+        let source = "const Ctx = someValue;";
+        assert_eq!(transform(source, "test.tsx"), source);
+    }
+
+    #[test]
+    fn skips_non_create_context_callee() {
+        let source = "const Ctx = otherFunc();";
+        assert_eq!(transform(source, "test.tsx"), source);
+    }
+
+    #[test]
+    fn skips_array_pattern_binding() {
+        let source = "const [a] = createContext();";
+        assert_eq!(transform(source, "test.tsx"), source);
+    }
+
+    #[test]
+    fn backslash_in_path_escaped() {
+        let result = transform("const Ctx = createContext();", "src\\ctx.tsx");
+        assert_eq!(
+            result,
+            "const Ctx = createContext(undefined, 'src\\\\ctx.tsx::Ctx');"
+        );
+    }
+
+    #[test]
+    fn single_quote_in_path_escaped() {
+        let result = transform("const Ctx = createContext();", "it's/ctx.tsx");
+        assert_eq!(
+            result,
+            "const Ctx = createContext(undefined, 'it\\'s/ctx.tsx::Ctx');"
+        );
+    }
+
+    #[test]
+    fn export_named_function_skipped() {
+        let source = "export function foo() {}";
+        assert_eq!(transform(source, "test.tsx"), source);
+    }
+
+    #[test]
+    fn multiple_contexts_in_one_file() {
+        let source = "const A = createContext();\nconst B = createContext(42);";
+        let result = transform(source, "test.tsx");
+        assert_eq!(
+            result,
+            "const A = createContext(undefined, 'test.tsx::A');\nconst B = createContext(42, 'test.tsx::B');"
+        );
+    }
+
+    #[test]
+    fn no_init_skipped() {
+        let source = "let Ctx;\nconst Other = createContext();";
+        let result = transform(source, "test.tsx");
+        assert_eq!(
+            result,
+            "let Ctx;\nconst Other = createContext(undefined, 'test.tsx::Other');"
+        );
+    }
+}

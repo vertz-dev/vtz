@@ -258,3 +258,205 @@ impl<'a> Visit<'a> for JsxDetector {
         self.found = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn analyze(source: &str) -> Vec<ComponentInfo> {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        analyze_components(&parsed.program)
+    }
+
+    // ── Function declarations ──────────────────────────────────────────
+
+    #[test]
+    fn function_decl_returning_jsx_element() {
+        let result = analyze("function App() { return <div/>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(!result[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn function_decl_no_jsx_not_detected() {
+        let result = analyze("function App() { return 42; }");
+        assert!(result.is_empty());
+    }
+
+    // ── Variable declarations ──────────────────────────────────────────
+
+    #[test]
+    fn arrow_block_body_with_jsx() {
+        let result = analyze("const App = () => { return <div/>; };");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(!result[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn arrow_expression_body_jsx() {
+        let result = analyze("const App = () => <div/>;");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(result[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn arrow_no_jsx_not_detected() {
+        let result = analyze("const App = () => 42;");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn function_expr_with_jsx() {
+        let result = analyze("const App = function() { return <div/>; };");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(!result[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn function_expr_no_jsx_not_detected() {
+        let result = analyze("const App = function() { return 42; };");
+        assert!(result.is_empty());
+    }
+
+    // ── Export named ───────────────────────────────────────────────────
+
+    #[test]
+    fn export_named_function() {
+        let result = analyze("export function App() { return <div/>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+    }
+
+    #[test]
+    fn export_named_const_arrow() {
+        let result = analyze("export const App = () => <div/>;");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(result[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn export_named_const_function_expr() {
+        let result = analyze("export const App = function() { return <div/>; };");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(!result[0].is_arrow_expression);
+    }
+
+    // ── Export default ─────────────────────────────────────────────────
+
+    #[test]
+    fn export_default_function_with_name() {
+        let result = analyze("export default function App() { return <div/>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+    }
+
+    #[test]
+    fn export_default_function_no_name_not_detected() {
+        let result = analyze("export default function() { return <div/>; }");
+        assert!(result.is_empty());
+    }
+
+    // ── Expression wrappers ────────────────────────────────────────────
+
+    #[test]
+    fn parenthesized_arrow() {
+        let result = analyze("const App = (() => <div/>);");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+        assert!(result[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn ts_as_expression_arrow() {
+        let result = analyze("const App = (() => <div/>) as any;");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+    }
+
+    #[test]
+    fn ts_satisfies_expression() {
+        let result = analyze("const App = (() => <div/>) satisfies any;");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+    }
+
+    // ── Props extraction ───────────────────────────────────────────────
+
+    #[test]
+    fn props_param_simple_identifier() {
+        let result = analyze("function App(props) { return <div>{props.x}</div>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].props_param, Some("props".to_string()));
+        assert!(result[0].destructured_prop_names.is_empty());
+    }
+
+    #[test]
+    fn destructured_props() {
+        let result = analyze("function App({ title, onClick }) { return <div>{title}</div>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].props_param, None);
+        assert_eq!(
+            result[0].destructured_prop_names,
+            vec!["title".to_string(), "onClick".to_string()]
+        );
+    }
+
+    #[test]
+    fn multiple_params_no_props() {
+        let result = analyze("function App(a, b) { return <div/>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].props_param, None);
+        assert!(result[0].destructured_prop_names.is_empty());
+    }
+
+    #[test]
+    fn no_params() {
+        let result = analyze("function App() { return <div/>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].props_param, None);
+        assert!(result[0].destructured_prop_names.is_empty());
+    }
+
+    #[test]
+    fn arrow_with_destructured_props() {
+        let result = analyze("const App = ({ title }: Props) => <div>{title}</div>;");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].destructured_prop_names, vec!["title".to_string()]);
+    }
+
+    // ── JSX Fragment ───────────────────────────────────────────────────
+
+    #[test]
+    fn fragment_detected() {
+        let result = analyze("function App() { return <>Hi</>; }");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "App");
+    }
+
+    // ── Other ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn class_not_detected() {
+        let result = analyze("class App { render() { return <div/>; } }");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn multiple_components() {
+        let result =
+            analyze("function App() { return <div/>; }\nfunction Header() { return <h1/>; }");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "App");
+        assert_eq!(result[1].name, "Header");
+    }
+}
