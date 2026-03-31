@@ -111,6 +111,8 @@ impl Default for RestartTriggers {
                 ".env".to_string(),
                 ".env.local".to_string(),
                 ".env.development".to_string(),
+                "tsconfig.json".to_string(),
+                "tsconfig.app.json".to_string(),
             ],
         }
     }
@@ -216,7 +218,14 @@ mod tests {
 
         assert!(!triggers.is_restart_trigger(Path::new("/project/src/app.tsx")));
         assert!(!triggers.is_restart_trigger(Path::new("/project/src/utils.ts")));
-        assert!(!triggers.is_restart_trigger(Path::new("/project/tsconfig.json")));
+    }
+
+    #[test]
+    fn test_tsconfig_triggers_restart() {
+        let triggers = RestartTriggers::default();
+
+        assert!(triggers.is_restart_trigger(Path::new("/project/tsconfig.json")));
+        assert!(triggers.is_restart_trigger(Path::new("/project/tsconfig.app.json")));
     }
 
     #[test]

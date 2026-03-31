@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use crate::compiler::cache::{CachedModule, CompilationCache};
 use crate::compiler::import_rewriter;
 use crate::plugin::{CompileContext, FrameworkPlugin};
+use crate::tsconfig::TsconfigPaths;
 
 /// A structured compilation error with source location.
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ pub struct CompilationPipeline {
     root_dir: PathBuf,
     src_dir: PathBuf,
     plugin: Arc<dyn FrameworkPlugin>,
+    tsconfig_paths: Option<TsconfigPaths>,
 }
 
 impl CompilationPipeline {
@@ -56,7 +58,16 @@ impl CompilationPipeline {
             root_dir,
             src_dir,
             plugin,
+            tsconfig_paths: None,
         }
+    }
+
+    /// Set the tsconfig path aliases for import resolution.
+    pub fn with_tsconfig_paths(mut self, paths: TsconfigPaths) -> Self {
+        if !paths.is_empty() {
+            self.tsconfig_paths = Some(paths);
+        }
+        self
     }
 
     /// Get the shared CSS store.
@@ -114,8 +125,13 @@ impl CompilationPipeline {
         let processed = self.plugin.post_process(&output.code, &ctx);
 
         // Rewrite import specifiers for browser consumption
-        let code =
-            import_rewriter::rewrite_imports(&processed, file_path, &self.src_dir, &self.root_dir);
+        let code = import_rewriter::rewrite_imports(
+            &processed,
+            file_path,
+            &self.src_dir,
+            &self.root_dir,
+            self.tsconfig_paths.as_ref(),
+        );
 
         // Handle extracted CSS
         let css = output.css;
