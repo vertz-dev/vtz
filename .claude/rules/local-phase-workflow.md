@@ -110,7 +110,7 @@ When all phases are complete:
 
 1. Rebase the feature branch on latest `main` to ensure no conflicts
 2. Run full quality gates one final time after rebase (tests, typecheck, lint)
-3. **Update docs** — if the feature touches public API, update `packages/mint-docs/` (Mintlify): new APIs, changed behavior, gotchas
+3. **Update docs** — if the feature touches public API, update README or relevant documentation: new APIs, changed behavior, gotchas
 4. Push the feature branch to GitHub
 5. Open a single PR: `feat/<feature-name>` → `main`
 6. PR description includes:
@@ -163,14 +163,14 @@ Standard post-merge process:
 
 ## The `reviews/` Directory
 
-- Lives in the vertz repo at `reviews/<feature-name>/`
+- Lives in the vtz repo at `reviews/<feature-name>/`
 - Created when a feature starts, deleted when the feature merges to main
 - **Not committed to main** — these are working artifacts, not permanent history
 - The final PR description summarizes the reviews for the permanent record
 
 ## Wiki Archival
 
-Completed plans and post-implementation reviews are archived to the **GitHub wiki** (`vertz-dev/vertz.wiki.git`) to keep the repo lean. Active plans stay in `plans/` until their feature is merged.
+Completed plans and post-implementation reviews are archived to the **GitHub wiki** (`vertz-dev/vtz.wiki.git`) to keep the repo lean. Active plans stay in `plans/` until their feature is merged.
 
 ### Naming Convention
 
@@ -184,15 +184,15 @@ Completed plans and post-implementation reviews are archived to the **GitHub wik
 
 ```bash
 # Clone the wiki repo
-git clone https://github.com/vertz-dev/vertz.wiki.git /tmp/vertz-wiki
+git clone https://github.com/vertz-dev/vtz.wiki.git /tmp/vtz-wiki
 
 # Copy completed plan and review
-cp plans/<feature>.md /tmp/vertz-wiki/plan-<feature>.md
-cp plans/post-implementation-reviews/<feature>.md /tmp/vertz-wiki/review-<feature>.md
+cp plans/<feature>.md /tmp/vtz-wiki/plan-<feature>.md
+cp plans/post-implementation-reviews/<feature>.md /tmp/vtz-wiki/review-<feature>.md
 
 # Update Home.md index with new entries
 # Commit and push
-cd /tmp/vertz-wiki
+cd /tmp/vtz-wiki
 git add . && git commit -m "archive: <feature-name>"
 git push
 
@@ -205,4 +205,4 @@ git push
 - **Active plans** (`plans/`) — currently being implemented, stay in the repo
 - **Completed plans** — moved to wiki after merge, removed from repo (or moved to `plans/archived/` if wiki push isn't possible)
 - **Home.md** in the wiki — always kept up-to-date with a table of all archived plans and reviews
-- Agents can fetch archived plans on demand: `git clone https://github.com/vertz-dev/vertz.wiki.git /tmp/vertz-wiki`
+- Agents can fetch archived plans on demand: `git clone https://github.com/vertz-dev/vtz.wiki.git /tmp/vtz-wiki`
