@@ -840,9 +840,13 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
 
     print_banner_with_upstream(&actual_config, start.elapsed(), &upstream_package_names);
 
-    // Default to VertzPlugin. Future: select based on config/CLI.
-    let plugin: Arc<dyn crate::plugin::FrameworkPlugin> =
-        Arc::new(crate::plugin::vertz::VertzPlugin);
+    // Select plugin based on config (CLI flag > .vertzrc > auto-detect > default)
+    let plugin: Arc<dyn crate::plugin::FrameworkPlugin> = match config.plugin {
+        crate::config::PluginChoice::React => {
+            Arc::new(crate::plugin::react::ReactPlugin::default())
+        }
+        crate::config::PluginChoice::Vertz => Arc::new(crate::plugin::vertz::VertzPlugin),
+    };
 
     let (router, state) = build_router(&config, plugin);
 

@@ -27,6 +27,12 @@ async fn main() {
             // Wire --no-watch-deps flag
             config.watch_deps = !args.no_watch_deps;
 
+            // Resolve plugin choice: CLI flag > .vertzrc > auto-detect > default
+            config.plugin = vertz_runtime::config::resolve_plugin_choice(
+                args.plugin.as_deref(),
+                &config.root_dir,
+            );
+
             // Load extraWatchPaths from .vertzrc
             if let Ok(vertzrc) = vertz_runtime::pm::vertzrc::load_vertzrc(&config.root_dir) {
                 config.extra_watch_paths = vertzrc.extra_watch_paths;

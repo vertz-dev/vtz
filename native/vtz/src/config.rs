@@ -1,5 +1,15 @@
 use std::path::{Path, PathBuf};
 
+/// Which framework plugin to use for the dev server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PluginChoice {
+    /// The Vertz framework plugin (default).
+    #[default]
+    Vertz,
+    /// The React framework plugin.
+    React,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub port: u16,
@@ -31,6 +41,8 @@ pub struct ServerConfig {
     /// Additional directories to watch for dependency changes.
     /// Relative to root_dir. From .vertzrc "extraWatchPaths" field.
     pub extra_watch_paths: Vec<String>,
+    /// Which framework plugin to use.
+    pub plugin: PluginChoice,
 }
 
 /// Resolve the `auto_install` setting from multiple sources.
@@ -79,6 +91,78 @@ pub fn resolve_auto_install(
     true
 }
 
+impl PluginChoice {
+    /// Parse a plugin name string into a `PluginChoice`.
+    ///
+    /// Accepted values: "vertz", "react" (case-insensitive).
+    /// Returns `None` for unrecognized strings.
+    pub fn parse_name(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "vertz" => Some(Self::Vertz),
+            "react" => Some(Self::React),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the plugin choice from multiple sources.
+///
+/// Precedence: CLI flag > `.vertzrc` "plugin" field > auto-detect from `package.json` > default (Vertz).
+pub fn resolve_plugin_choice(cli_plugin: Option<&str>, root_dir: &Path) -> PluginChoice {
+    // 1. CLI flag takes highest priority
+    if let Some(name) = cli_plugin {
+        return PluginChoice::parse_name(name).unwrap_or_else(|| {
+            eprintln!(
+                "[config] Warning: unknown plugin '{}', falling back to vertz",
+                name
+            );
+            PluginChoice::Vertz
+        });
+    }
+
+    // 2. .vertzrc "plugin" field
+    let raw_json = std::fs::read_to_string(root_dir.join(".vertzrc"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    if let Some(ref json) = raw_json {
+        if let Some(val) = json.get("plugin").and_then(|v| v.as_str()) {
+            if let Some(choice) = PluginChoice::parse_name(val) {
+                return choice;
+            }
+            eprintln!(
+                "[config] Warning: unknown plugin '{}' in .vertzrc, falling back to auto-detect",
+                val
+            );
+        }
+    }
+
+    // 3. Auto-detect from package.json dependencies
+    if let Ok(pkg_json) = std::fs::read_to_string(root_dir.join("package.json")) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&pkg_json) {
+            let has_dep = |name: &str| {
+                parsed
+                    .get("dependencies")
+                    .and_then(|d| d.get(name))
+                    .is_some()
+                    || parsed
+                        .get("devDependencies")
+                        .and_then(|d| d.get(name))
+                        .is_some()
+            };
+
+            if has_dep("react") {
+                return PluginChoice::React;
+            }
+            // @vertz/ui or any @vertz/* package → VertzPlugin
+            // (but we fall through to default anyway)
+        }
+    }
+
+    // 4. Default
+    PluginChoice::Vertz
+}
+
 impl ServerConfig {
     pub fn new(port: u16, host: String, public_dir: PathBuf) -> Self {
         let root_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -101,6 +185,7 @@ impl ServerConfig {
             auto_install: true,
             watch_deps: true,
             extra_watch_paths: Vec::new(),
+            plugin: PluginChoice::default(),
         }
     }
 
@@ -125,6 +210,7 @@ impl ServerConfig {
             auto_install: true,
             watch_deps: true,
             extra_watch_paths: Vec::new(),
+            plugin: PluginChoice::default(),
         }
     }
 
@@ -374,5 +460,123 @@ mod tests {
             ServerConfig::with_root(3000, "localhost".to_string(), PathBuf::from("public"), root);
         assert!(config.watch_deps);
         assert!(config.extra_watch_paths.is_empty());
+    }
+
+    // --- PluginChoice tests ---
+
+    #[test]
+    fn test_plugin_choice_default_is_vertz() {
+        assert_eq!(PluginChoice::default(), PluginChoice::Vertz);
+    }
+
+    #[test]
+    fn test_plugin_choice_from_str_vertz() {
+        assert_eq!(PluginChoice::parse_name("vertz"), Some(PluginChoice::Vertz));
+    }
+
+    #[test]
+    fn test_plugin_choice_from_str_react() {
+        assert_eq!(PluginChoice::parse_name("react"), Some(PluginChoice::React));
+    }
+
+    #[test]
+    fn test_plugin_choice_from_str_case_insensitive() {
+        assert_eq!(PluginChoice::parse_name("React"), Some(PluginChoice::React));
+        assert_eq!(PluginChoice::parse_name("VERTZ"), Some(PluginChoice::Vertz));
+    }
+
+    #[test]
+    fn test_plugin_choice_from_str_unknown() {
+        assert_eq!(PluginChoice::parse_name("vue"), None);
+    }
+
+    #[test]
+    fn test_server_config_default_plugin_is_vertz() {
+        let config = ServerConfig::new(3000, "localhost".to_string(), PathBuf::from("public"));
+        assert_eq!(config.plugin, PluginChoice::Vertz);
+    }
+
+    // --- resolve_plugin_choice tests ---
+
+    #[test]
+    fn test_resolve_plugin_cli_flag_react() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_plugin_choice(Some("react"), dir.path());
+        assert_eq!(result, PluginChoice::React);
+    }
+
+    #[test]
+    fn test_resolve_plugin_cli_flag_vertz() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_plugin_choice(Some("vertz"), dir.path());
+        assert_eq!(result, PluginChoice::Vertz);
+    }
+
+    #[test]
+    fn test_resolve_plugin_cli_flag_unknown_falls_back_to_vertz() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_plugin_choice(Some("vue"), dir.path());
+        assert_eq!(result, PluginChoice::Vertz);
+    }
+
+    #[test]
+    fn test_resolve_plugin_vertzrc_react() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".vertzrc"), r#"{"plugin": "react"}"#).unwrap();
+        let result = resolve_plugin_choice(None, dir.path());
+        assert_eq!(result, PluginChoice::React);
+    }
+
+    #[test]
+    fn test_resolve_plugin_cli_overrides_vertzrc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".vertzrc"), r#"{"plugin": "react"}"#).unwrap();
+        let result = resolve_plugin_choice(Some("vertz"), dir.path());
+        assert_eq!(result, PluginChoice::Vertz);
+    }
+
+    #[test]
+    fn test_resolve_plugin_auto_detect_react_from_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"}}"#,
+        )
+        .unwrap();
+        let result = resolve_plugin_choice(None, dir.path());
+        assert_eq!(result, PluginChoice::React);
+    }
+
+    #[test]
+    fn test_resolve_plugin_auto_detect_react_from_dev_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"devDependencies": {"react": "^18.0.0"}}"#,
+        )
+        .unwrap();
+        let result = resolve_plugin_choice(None, dir.path());
+        assert_eq!(result, PluginChoice::React);
+    }
+
+    #[test]
+    fn test_resolve_plugin_default_is_vertz() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_plugin_choice(None, dir.path());
+        assert_eq!(result, PluginChoice::Vertz);
+    }
+
+    #[test]
+    fn test_resolve_plugin_vertzrc_overrides_auto_detect() {
+        let dir = tempfile::tempdir().unwrap();
+        // package.json has react, but .vertzrc says vertz
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"react": "^18.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".vertzrc"), r#"{"plugin": "vertz"}"#).unwrap();
+        let result = resolve_plugin_choice(None, dir.path());
+        assert_eq!(result, PluginChoice::Vertz);
     }
 }
