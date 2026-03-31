@@ -1256,3 +1256,1124 @@ fn track_callback_expr(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn analyze(source: &str) -> Vec<QueryFieldSelection> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::tsx();
+        let parser = Parser::new(&allocator, source, source_type);
+        let parsed = parser.parse();
+        analyze_field_selection(&parsed.program, source)
+    }
+
+    // ── InjectionKind::as_str ──────────────────────────────────────────
+
+    #[test]
+    fn injection_kind_as_str_insert_arg() {
+        assert_eq!(InjectionKind::InsertArg.as_str(), "insert-arg");
+    }
+
+    #[test]
+    fn injection_kind_as_str_merge_into_object() {
+        assert_eq!(InjectionKind::MergeIntoObject.as_str(), "merge-into-object");
+    }
+
+    #[test]
+    fn injection_kind_as_str_append_arg() {
+        assert_eq!(InjectionKind::AppendArg.as_str(), "append-arg");
+    }
+
+    // ── Fast bail-out ──────────────────────────────────────────────────
+
+    #[test]
+    fn returns_empty_when_source_has_no_query_call() {
+        let results = analyze("const x = fetch('/api');");
+        assert!(results.is_empty());
+    }
+
+    // ── Basic query variable detection ─────────────────────────────────
+
+    #[test]
+    fn detects_basic_query_variable() {
+        let results = analyze("const tasks = query(api.tasks.list());");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+    }
+
+    #[test]
+    fn ignores_query_call_without_arguments() {
+        let results = analyze("const tasks = query();");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ignores_non_call_inner_argument() {
+        let results = analyze("const tasks = query(someVariable);");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ignores_non_identifier_callee() {
+        let results = analyze("const tasks = obj.query(api.tasks.list());");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ignores_destructuring_pattern() {
+        let results = analyze("const { data } = query(api.tasks.list());");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ignores_declarator_without_init() {
+        // This shouldn't match because there's no initializer
+        let results = analyze("let tasks; tasks = query(api.tasks.list());");
+        assert!(results.is_empty());
+    }
+
+    // ── Arrow function wrapping ────────────────────────────────────────
+
+    #[test]
+    fn detects_query_with_arrow_expression_body() {
+        let results = analyze("const tasks = query(() => api.tasks.list());");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+    }
+
+    #[test]
+    fn detects_query_with_arrow_return_statement() {
+        let results = analyze("const tasks = query(() => { return api.tasks.list(); });");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+    }
+
+    #[test]
+    fn ignores_arrow_with_no_return() {
+        let results = analyze("const tasks = query(() => { console.log('hi'); });");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ignores_arrow_with_multiple_statements() {
+        let results =
+            analyze("const tasks = query(() => { const x = 1; return api.tasks.list(); });");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ignores_arrow_with_return_no_argument() {
+        let results = analyze("const tasks = query(() => { return; });");
+        assert!(results.is_empty());
+    }
+
+    // ── Export named declaration ────────────────────────────────────────
+
+    #[test]
+    fn detects_exported_query_variable() {
+        let results = analyze("export const tasks = query(api.tasks.list());");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+    }
+
+    // ── Inside function declaration ────────────────────────────────────
+
+    #[test]
+    fn detects_query_inside_function_body() {
+        let source = r#"
+function App() {
+    const tasks = query(api.tasks.list());
+    return tasks.data.name;
+}
+"#;
+        let results = analyze(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Inside export default function ─────────────────────────────────
+
+    #[test]
+    fn detects_query_inside_export_default_function() {
+        let source = r#"
+export default function App() {
+    const tasks = query(api.tasks.list());
+    return tasks.data.title;
+}
+"#;
+        let results = analyze(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    // ── Injection kinds ────────────────────────────────────────────────
+
+    #[test]
+    fn insert_arg_when_descriptor_has_no_arguments() {
+        let results = analyze("const tasks = query(api.tasks.list());");
+        assert_eq!(results[0].injection_kind, InjectionKind::InsertArg);
+    }
+
+    #[test]
+    fn merge_into_object_when_first_arg_is_object_literal() {
+        let results = analyze("const tasks = query(api.tasks.list({ status: 'active' }));");
+        assert_eq!(results[0].injection_kind, InjectionKind::MergeIntoObject);
+    }
+
+    #[test]
+    fn append_arg_when_first_arg_is_not_object() {
+        let results = analyze("const tasks = query(api.tasks.get(id));");
+        assert_eq!(results[0].injection_kind, InjectionKind::AppendArg);
+    }
+
+    // ── @vertz-select-all pragma ───────────────────────────────────────
+
+    #[test]
+    fn skips_query_with_select_all_pragma_inline() {
+        let source = "// @vertz-select-all\nconst tasks = query(api.tasks.list());";
+        let results = analyze(source);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn skips_query_with_select_all_pragma_with_whitespace() {
+        let source = "  // @vertz-select-all  \nconst tasks = query(api.tasks.list());";
+        let results = analyze(source);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn does_not_skip_when_pragma_is_far_away() {
+        // Pragma on a non-adjacent non-comment line shouldn't match
+        let source = "// @vertz-select-all\nconst x = 1;\nconst tasks = query(api.tasks.list());";
+        let results = analyze(source);
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── Entity name inference ──────────────────────────────────────────
+
+    #[test]
+    fn infers_entity_name_from_descriptor_chain() {
+        let results = analyze("const tasks = query(api.tasks.list());");
+        assert_eq!(results[0].inferred_entity_name, Some("tasks".to_string()));
+    }
+
+    #[test]
+    fn no_entity_name_for_simple_call() {
+        let results = analyze("const tasks = query(listTasks());");
+        assert_eq!(results[0].inferred_entity_name, None);
+    }
+
+    // ── Simple field access ────────────────────────────────────────────
+
+    #[test]
+    fn tracks_simple_field_access_through_data() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+console.log(tasks.data.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_access_through_data_items() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+console.log(tasks.data.items.title);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    // ── Structural prefix stripping ────────────────────────────────────
+
+    #[test]
+    fn strips_data_prefix_from_field_chain() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const name = tasks.data.name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+        assert!(!results[0].fields.contains(&"data".to_string()));
+    }
+
+    #[test]
+    fn strips_items_prefix_from_field_chain() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const title = tasks.data.items.title;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+        assert!(!results[0].fields.contains(&"items".to_string()));
+    }
+
+    // ── Non-entity prop filtering ──────────────────────────────────────
+
+    #[test]
+    fn excludes_loading_signal_property() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+if (tasks.data.loading) {}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.is_empty());
+    }
+
+    #[test]
+    fn excludes_error_signal_property() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+if (tasks.data.error) {}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.is_empty());
+    }
+
+    #[test]
+    fn excludes_length_array_property() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const n = tasks.data.length;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.is_empty());
+    }
+
+    // ── Nested field access ────────────────────────────────────────────
+
+    #[test]
+    fn tracks_nested_field_access() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks.data.assignee.name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"assignee".to_string()));
+        assert_eq!(results[0].nested_access.len(), 1);
+        assert_eq!(results[0].nested_access[0].field, "assignee");
+        assert_eq!(results[0].nested_access[0].nested_path, vec!["name"]);
+    }
+
+    #[test]
+    fn tracks_deeply_nested_field_access() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks.data.assignee.address.city;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"assignee".to_string()));
+        let nested = results[0]
+            .nested_access
+            .iter()
+            .find(|n| n.field == "assignee")
+            .unwrap();
+        assert_eq!(nested.nested_path, vec!["address", "city"]);
+    }
+
+    // ── Deduplication ──────────────────────────────────────────────────
+
+    #[test]
+    fn deduplicates_repeated_field_access() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const a = tasks.data.name;
+const b = tasks.data.name;
+"#;
+        let results = analyze(source);
+        let name_count = results[0].fields.iter().filter(|f| *f == "name").count();
+        assert_eq!(name_count, 1);
+    }
+
+    #[test]
+    fn deduplicates_nested_access() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const a = tasks.data.assignee.name;
+const b = tasks.data.assignee.name;
+"#;
+        let results = analyze(source);
+        let nested_count = results[0]
+            .nested_access
+            .iter()
+            .filter(|n| n.field == "assignee" && n.nested_path == vec!["name"])
+            .count();
+        assert_eq!(nested_count, 1);
+    }
+
+    // ── Array method callbacks ─────────────────────────────────────────
+
+    #[test]
+    fn tracks_fields_in_map_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => t.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_filter_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.filter(t => t.done);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"done".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_find_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.find(t => t.id);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"id".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_foreach_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.forEach(t => console.log(t.title));
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_some_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.some(t => t.active);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_every_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.every(t => t.valid);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"valid".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_callback_with_function_expression() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(function(t) { return t.name; });
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_nested_field_in_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => t.assignee.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"assignee".to_string()));
+        let nested = results[0]
+            .nested_access
+            .iter()
+            .find(|n| n.field == "assignee")
+            .unwrap();
+        assert_eq!(nested.nested_path, vec!["name"]);
+    }
+
+    // ── Relation-level map ─────────────────────────────────────────────
+
+    #[test]
+    fn tracks_relation_level_map() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.members.map(m => m.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"members".to_string()));
+        let nested = results[0]
+            .nested_access
+            .iter()
+            .find(|n| n.field == "members" && n.nested_path == vec!["name"])
+            .unwrap();
+        assert_eq!(nested.field, "members");
+    }
+
+    #[test]
+    fn tracks_relation_level_map_with_nested_callback_access() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.members.map(m => m.address.city);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"members".to_string()));
+        let nested = results[0]
+            .nested_access
+            .iter()
+            .find(|n| n.field == "members" && n.nested_path == vec!["address", "city"]);
+        assert!(nested.is_some());
+    }
+
+    // ── Opaque access ──────────────────────────────────────────────────
+
+    #[test]
+    fn detects_opaque_access_when_data_passed_as_arg() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+console.log(tasks.data);
+"#;
+        let results = analyze(source);
+        assert!(results[0].has_opaque_access);
+    }
+
+    #[test]
+    fn detects_opaque_access_when_items_passed_as_arg() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+console.log(tasks.data.items);
+"#;
+        let results = analyze(source);
+        assert!(results[0].has_opaque_access);
+    }
+
+    #[test]
+    fn no_opaque_access_for_specific_field() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+console.log(tasks.data.name);
+"#;
+        let results = analyze(source);
+        assert!(!results[0].has_opaque_access);
+    }
+
+    #[test]
+    fn detects_opaque_access_from_object_spread() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const obj = { ...tasks.data };
+"#;
+        let results = analyze(source);
+        assert!(results[0].has_opaque_access);
+    }
+
+    #[test]
+    fn detects_opaque_access_from_callback_spread() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(item => ({ ...item }));
+"#;
+        let results = analyze(source);
+        assert!(results[0].has_opaque_access);
+    }
+
+    #[test]
+    fn detects_opaque_from_computed_member_in_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(item => item[key]);
+"#;
+        let results = analyze(source);
+        assert!(results[0].has_opaque_access);
+    }
+
+    #[test]
+    fn no_opaque_from_numeric_index_in_callback() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(item => item[0]);
+"#;
+        let results = analyze(source);
+        assert!(!results[0].has_opaque_access);
+    }
+
+    // ── JSX attributes ─────────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_jsx_attribute() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const el = <div title={tasks.data.name} />;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── JSX children ───────────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_jsx_children() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const el = <div>{tasks.data.name}</div>;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Nested JSX elements ────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_nested_jsx_element() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const el = <div><span>{tasks.data.title}</span></div>;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_nested_jsx_attribute() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const el = <div><span className={tasks.data.status} /></div>;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"status".to_string()));
+    }
+
+    // ── JSX in callbacks ───────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_callback_jsx_children() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => <div>{t.name}</div>);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_callback_jsx_attribute() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => <div className={t.status} />);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"status".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_callback_nested_jsx() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => <div><span>{t.title}</span></div>);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    // ── Conditional expressions ────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_ternary_test() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks.data.active ? 'yes' : 'no';
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_ternary_consequent() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = true ? tasks.data.name : 'default';
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_ternary_alternate() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = false ? 'default' : tasks.data.title;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    // ── Optional chaining ──────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_through_optional_chain_static_member() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks?.data?.name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_fields_in_optional_chain_map() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data?.map(t => t.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── If statement ───────────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_if_test() {
+        let source = r#"
+function App() {
+    const tasks = query(api.tasks.list());
+    if (tasks.data.ready) { console.log('ok'); }
+}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"ready".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_if_consequent() {
+        let source = r#"
+function App() {
+    const tasks = query(api.tasks.list());
+    if (true) { console.log(tasks.data.name); }
+}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn tracks_field_in_if_alternate() {
+        let source = r#"
+function App() {
+    const tasks = query(api.tasks.list());
+    if (false) {} else { console.log(tasks.data.title); }
+}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    // ── Block statement ────────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_block_statement() {
+        let source = r#"
+function App() {
+    const tasks = query(api.tasks.list());
+    if (true) {
+        const x = tasks.data.name;
+    }
+}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Variable declaration ───────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_variable_init() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const name = tasks.data.name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Return statement ───────────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_return_statement() {
+        let source = r#"
+function App() {
+    const tasks = query(api.tasks.list());
+    return tasks.data.title;
+}
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"title".to_string()));
+    }
+
+    // ── Object property values ─────────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_object_property_value() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const obj = { name: tasks.data.name };
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Parenthesized expression ───────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_parenthesized_expression() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = (tasks.data.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Arrow function expression ──────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_arrow_expression_body() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const fn1 = () => tasks.data.name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Multiple query variables ───────────────────────────────────────
+
+    #[test]
+    fn tracks_multiple_query_variables_independently() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const users = query(api.users.list());
+const t = tasks.data.title;
+const u = users.data.email;
+"#;
+        let results = analyze(source);
+        assert_eq!(results.len(), 2);
+
+        let tasks_result = results.iter().find(|r| r.query_var == "tasks").unwrap();
+        let users_result = results.iter().find(|r| r.query_var == "users").unwrap();
+
+        assert!(tasks_result.fields.contains(&"title".to_string()));
+        assert!(!tasks_result.fields.contains(&"email".to_string()));
+
+        assert!(users_result.fields.contains(&"email".to_string()));
+        assert!(!users_result.fields.contains(&"title".to_string()));
+    }
+
+    // ── Multiple fields collected ──────────────────────────────────────
+
+    #[test]
+    fn collects_multiple_distinct_fields() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const a = tasks.data.name;
+const b = tasks.data.title;
+const c = tasks.data.status;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+        assert!(results[0].fields.contains(&"title".to_string()));
+        assert!(results[0].fields.contains(&"status".to_string()));
+    }
+
+    // ── Injection position ─────────────────────────────────────────────
+
+    #[test]
+    fn injection_pos_before_closing_paren_for_no_args() {
+        let source = "const tasks = query(api.tasks.list());";
+        let results = analyze(source);
+        // api.tasks.list() — pos should be just before the closing paren of list()
+        let pos = results[0].injection_pos as usize;
+        assert_eq!(&source[pos..pos + 1], ")");
+    }
+
+    #[test]
+    fn injection_pos_before_closing_brace_for_object_arg() {
+        let source = "const tasks = query(api.tasks.list({ status: 'a' }));";
+        let results = analyze(source);
+        let pos = results[0].injection_pos as usize;
+        // Should point just before the closing } of the object literal
+        assert_eq!(&source[pos..pos + 1], "}");
+    }
+
+    #[test]
+    fn injection_pos_after_last_arg_for_non_object() {
+        let source = "const tasks = query(api.tasks.get(id));";
+        let results = analyze(source);
+        let pos = results[0].injection_pos as usize;
+        // Should point right after "id"
+        assert_eq!(&source[pos..pos + 1], ")");
+    }
+
+    // ── Opaque access edge cases ───────────────────────────────────────
+
+    #[test]
+    fn no_opaque_when_callback_passes_param_to_function() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => someFunc(t));
+"#;
+        let results = analyze(source);
+        // Passing param to function in callback is not tracked as opaque
+        // (only spread and computed key access trigger opaque in callbacks)
+        assert!(!results[0].has_opaque_access);
+    }
+
+    // ── Non-entity props in nested path filtering ──────────────────────
+
+    #[test]
+    fn filters_non_entity_props_from_nested_path() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks.data.assignee.length;
+"#;
+        let results = analyze(source);
+        // assignee is the field, length is filtered from nested path
+        assert!(results[0].fields.contains(&"assignee".to_string()));
+        let nested = results[0]
+            .nested_access
+            .iter()
+            .find(|n| n.field == "assignee");
+        // nested_path should be empty since length is filtered
+        if let Some(n) = nested {
+            assert!(n.nested_path.is_empty());
+        }
+    }
+
+    // ── ChainExpression static member access ───────────────────────────
+
+    #[test]
+    fn handles_chain_expression_structural_only() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks?.data;
+"#;
+        let results = analyze(source);
+        // tasks?.data is structural-only access, no entity fields
+        assert!(results[0].fields.is_empty());
+    }
+
+    // ── Call expression recurse into callee and args ────────────────────
+
+    #[test]
+    fn tracks_field_in_call_expression_argument() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+someFunc(tasks.data.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Opaque: passing variable itself as arg ─────────────────────────
+
+    #[test]
+    fn opaque_when_passing_query_var_directly_as_arg() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+someFunc(tasks);
+"#;
+        let results = analyze(source);
+        assert!(results[0].has_opaque_access);
+    }
+
+    // ── Callback return statement ──────────────────────────────────────
+
+    #[test]
+    fn tracks_field_in_callback_return_statement() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => { return t.name; });
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Callback with non-identifier param is ignored ──────────────────
+
+    #[test]
+    fn ignores_callback_without_identifier_param() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(([a, b]) => a);
+"#;
+        let results = analyze(source);
+        // Destructured param — no param name extracted, callback not tracked
+        assert!(results[0].fields.is_empty());
+    }
+
+    // ── Export named non-variable is ignored ────────────────────────────
+
+    #[test]
+    fn ignores_export_named_function_declaration() {
+        let results = analyze("export function query() {}");
+        assert!(results.is_empty());
+    }
+
+    // ── Callback JSX attributes in nested elements ─────────────────────
+
+    #[test]
+    fn tracks_field_in_callback_nested_jsx_attribute() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => <div><span title={t.name} /></div>);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Optional chain map with relation ───────────────────────────────
+
+    #[test]
+    fn optional_chain_map_with_items() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data?.items?.map(t => t.name);
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Callback object expression tracking ────────────────────────────
+
+    #[test]
+    fn tracks_field_in_callback_object_property() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => ({ label: t.name }));
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Callback parenthesized expression ──────────────────────────────
+
+    #[test]
+    fn tracks_field_in_callback_parenthesized_expr() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => (t.name));
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Callback call expression in body ───────────────────────────────
+
+    #[test]
+    fn tracks_field_in_callback_call_expression() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+tasks.data.items.map(t => String(t.name));
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── Computed member in chain ───────────────────────────────────────
+
+    #[test]
+    fn tracks_field_through_computed_index_access() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks.data.items[0].name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+
+    // ── all NON_ENTITY_PROPS are excluded ──────────────────────────────
+
+    #[test]
+    fn excludes_all_signal_properties() {
+        for prop in &[
+            "loading",
+            "error",
+            "revalidating",
+            "refetch",
+            "revalidate",
+            "dispose",
+        ] {
+            let source = format!(
+                "const tasks = query(api.tasks.list());\nconst x = tasks.data.{};",
+                prop
+            );
+            let results = analyze(&source);
+            assert!(
+                results[0].fields.is_empty(),
+                "expected '{}' to be excluded",
+                prop
+            );
+        }
+    }
+
+    #[test]
+    fn excludes_all_array_method_properties() {
+        for prop in &[
+            "map", "filter", "find", "forEach", "some", "every", "reduce", "flatMap", "includes",
+            "indexOf", "length", "slice", "sort",
+        ] {
+            let source = format!(
+                "const tasks = query(api.tasks.list());\nconst x = tasks.data.{};",
+                prop
+            );
+            let results = analyze(&source);
+            assert!(
+                results[0].fields.is_empty(),
+                "expected '{}' to be excluded",
+                prop
+            );
+        }
+    }
+
+    // ── Pragma edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn pragma_with_blank_line_before_decl() {
+        let source = "// @vertz-select-all\n\nconst tasks = query(api.tasks.list());";
+        let results = analyze(source);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn no_pragma_match_on_code_line() {
+        let source = "const y = 1;\nconst tasks = query(api.tasks.list());";
+        let results = analyze(source);
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── Export named with arrow in query ────────────────────────────────
+
+    #[test]
+    fn export_with_arrow_wrapper() {
+        let results = analyze("export const tasks = query(() => api.tasks.list());");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query_var, "tasks");
+    }
+
+    // ── Chain expression computed member ────────────────────────────────
+
+    #[test]
+    fn chain_computed_member_continues_chain() {
+        let source = r#"
+const tasks = query(api.tasks.list());
+const x = tasks?.data?.[0]?.name;
+"#;
+        let results = analyze(source);
+        assert!(results[0].fields.contains(&"name".to_string()));
+    }
+}
