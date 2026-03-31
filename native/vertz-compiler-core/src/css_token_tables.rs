@@ -464,3 +464,738 @@ fn resolve_ring(value: &str) -> Option<String> {
     }
     Some(format!("{}px solid var(--color-ring)", num))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── property_map: exercise every arm + unknown ────────────────
+
+    #[test]
+    fn property_map_all_known_keys() {
+        let keys = [
+            "p",
+            "px",
+            "py",
+            "pt",
+            "pr",
+            "pb",
+            "pl",
+            "m",
+            "mx",
+            "my",
+            "mt",
+            "mr",
+            "mb",
+            "ml",
+            "w",
+            "h",
+            "min-w",
+            "max-w",
+            "min-h",
+            "max-h",
+            "bg",
+            "text",
+            "border",
+            "border-r",
+            "border-l",
+            "border-t",
+            "border-b",
+            "rounded",
+            "shadow",
+            "gap",
+            "items",
+            "justify",
+            "grid-cols",
+            "font",
+            "weight",
+            "leading",
+            "tracking",
+            "decoration",
+            "list",
+            "ring",
+            "overflow",
+            "overflow-x",
+            "overflow-y",
+            "cursor",
+            "transition",
+            "resize",
+            "opacity",
+            "inset",
+            "z",
+            "vt-name",
+            "view-transition-name",
+            "content",
+        ];
+        for key in &keys {
+            assert!(property_map(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn property_map_unknown_returns_none() {
+        assert!(property_map("unknown").is_none());
+    }
+
+    #[test]
+    fn property_map_spot_checks() {
+        let (props, vtype) = property_map("p").unwrap();
+        assert_eq!(props, &["padding"]);
+        assert_eq!(vtype, "spacing");
+
+        let (props, vtype) = property_map("bg").unwrap();
+        assert_eq!(props, &["background-color"]);
+        assert_eq!(vtype, "color");
+
+        let (props, vtype) = property_map("grid-cols").unwrap();
+        assert_eq!(props, &["grid-template-columns"]);
+        assert_eq!(vtype, "raw");
+
+        // vt-name and view-transition-name both map to same thing
+        assert_eq!(
+            property_map("vt-name"),
+            property_map("view-transition-name")
+        );
+    }
+
+    // ── keyword_map: exercise every arm + unknown ────────────────
+
+    #[test]
+    fn keyword_map_all_known_keys() {
+        let keys = [
+            "flex",
+            "grid",
+            "block",
+            "inline",
+            "hidden",
+            "inline-flex",
+            "flex-1",
+            "flex-col",
+            "flex-row",
+            "flex-wrap",
+            "flex-nowrap",
+            "fixed",
+            "absolute",
+            "relative",
+            "sticky",
+            "uppercase",
+            "lowercase",
+            "capitalize",
+            "outline-none",
+            "overflow-hidden",
+            "select-none",
+            "pointer-events-none",
+            "whitespace-nowrap",
+            "shrink-0",
+            "italic",
+            "not-italic",
+            "scale-0",
+            "scale-75",
+            "scale-90",
+            "scale-95",
+            "scale-100",
+            "scale-105",
+            "scale-110",
+            "scale-125",
+            "scale-150",
+        ];
+        for key in &keys {
+            assert!(keyword_map(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn keyword_map_unknown_returns_none() {
+        assert!(keyword_map("nonexistent").is_none());
+    }
+
+    #[test]
+    fn keyword_map_spot_checks() {
+        let decls = keyword_map("flex").unwrap();
+        assert_eq!(decls, &[("display", "flex")]);
+
+        let decls = keyword_map("hidden").unwrap();
+        assert_eq!(decls, &[("display", "none")]);
+
+        let decls = keyword_map("scale-150").unwrap();
+        assert_eq!(decls, &[("transform", "scale(1.5)")]);
+    }
+
+    // ── spacing_scale: exercise every arm + unknown ──────────────
+
+    #[test]
+    fn spacing_scale_all_known_keys() {
+        let keys = [
+            "0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4", "5", "6", "7", "8", "9", "10",
+            "11", "12", "14", "16", "20", "24", "28", "32", "36", "40", "44", "48", "52", "56",
+            "60", "64", "72", "80", "96", "auto",
+        ];
+        for key in &keys {
+            assert!(spacing_scale(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn spacing_scale_unknown_returns_none() {
+        assert!(spacing_scale("999").is_none());
+    }
+
+    #[test]
+    fn spacing_scale_spot_checks() {
+        assert_eq!(spacing_scale("0"), Some("0"));
+        assert_eq!(spacing_scale("4"), Some("1rem"));
+        assert_eq!(spacing_scale("auto"), Some("auto"));
+    }
+
+    // ── radius_scale ─────────────────────────────────────────────
+
+    #[test]
+    fn radius_scale_all_known_keys() {
+        let keys = ["none", "xs", "sm", "md", "lg", "xl", "2xl", "3xl", "full"];
+        for key in &keys {
+            assert!(radius_scale(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn radius_scale_unknown_returns_none() {
+        assert!(radius_scale("unknown").is_none());
+    }
+
+    #[test]
+    fn radius_scale_spot_checks() {
+        assert_eq!(radius_scale("none"), Some("0"));
+        assert_eq!(radius_scale("full"), Some("9999px"));
+    }
+
+    // ── shadow_scale ─────────────────────────────────────────────
+
+    #[test]
+    fn shadow_scale_all_known_keys() {
+        let keys = ["xs", "sm", "md", "lg", "xl", "2xl", "none"];
+        for key in &keys {
+            assert!(shadow_scale(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn shadow_scale_unknown_returns_none() {
+        assert!(shadow_scale("unknown").is_none());
+    }
+
+    // ── font_size_scale ──────────────────────────────────────────
+
+    #[test]
+    fn font_size_scale_all_known_keys() {
+        let keys = ["xs", "sm", "base", "lg", "xl", "2xl", "3xl", "4xl", "5xl"];
+        for key in &keys {
+            assert!(
+                font_size_scale(key).is_some(),
+                "expected Some for '{}'",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn font_size_scale_unknown_returns_none() {
+        assert!(font_size_scale("unknown").is_none());
+    }
+
+    // ── font_weight_scale ────────────────────────────────────────
+
+    #[test]
+    fn font_weight_scale_all_known_keys() {
+        let keys = [
+            "thin",
+            "extralight",
+            "light",
+            "normal",
+            "medium",
+            "semibold",
+            "bold",
+            "extrabold",
+            "black",
+        ];
+        for key in &keys {
+            assert!(
+                font_weight_scale(key).is_some(),
+                "expected Some for '{}'",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn font_weight_scale_unknown_returns_none() {
+        assert!(font_weight_scale("unknown").is_none());
+    }
+
+    #[test]
+    fn font_weight_spot_checks() {
+        assert_eq!(font_weight_scale("bold"), Some("700"));
+        assert_eq!(font_weight_scale("thin"), Some("100"));
+    }
+
+    // ── line_height_scale ────────────────────────────────────────
+
+    #[test]
+    fn line_height_scale_all_known_keys() {
+        let keys = ["none", "tight", "snug", "normal", "relaxed", "loose"];
+        for key in &keys {
+            assert!(
+                line_height_scale(key).is_some(),
+                "expected Some for '{}'",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn line_height_scale_unknown_returns_none() {
+        assert!(line_height_scale("unknown").is_none());
+    }
+
+    // ── alignment_map ────────────────────────────────────────────
+
+    #[test]
+    fn alignment_map_all_known_keys() {
+        let keys = [
+            "start", "end", "center", "between", "around", "evenly", "stretch", "baseline",
+        ];
+        for key in &keys {
+            assert!(alignment_map(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn alignment_map_unknown_returns_none() {
+        assert!(alignment_map("unknown").is_none());
+    }
+
+    #[test]
+    fn alignment_map_spot_checks() {
+        assert_eq!(alignment_map("center"), Some("center"));
+        assert_eq!(alignment_map("between"), Some("space-between"));
+    }
+
+    // ── size_keywords ────────────────────────────────────────────
+
+    #[test]
+    fn size_keywords_all_known_keys() {
+        let keys = [
+            "full", "svw", "dvw", "min", "max", "fit", "auto", "xs", "sm", "md", "lg", "xl", "2xl",
+            "3xl", "4xl", "5xl", "6xl", "7xl",
+        ];
+        for key in &keys {
+            assert!(size_keywords(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn size_keywords_unknown_returns_none() {
+        assert!(size_keywords("unknown").is_none());
+    }
+
+    // ── content_map ──────────────────────────────────────────────
+
+    #[test]
+    fn content_map_all_known_keys() {
+        assert_eq!(content_map("empty"), Some("''"));
+        assert_eq!(content_map("none"), Some("none"));
+    }
+
+    #[test]
+    fn content_map_unknown_returns_none() {
+        assert!(content_map("unknown").is_none());
+    }
+
+    // ── pseudo_map ───────────────────────────────────────────────
+
+    #[test]
+    fn pseudo_map_all_known_keys() {
+        let keys = [
+            "hover",
+            "focus",
+            "focus-visible",
+            "active",
+            "disabled",
+            "first",
+            "last",
+        ];
+        for key in &keys {
+            assert!(pseudo_map(key).is_some(), "expected Some for '{}'", key);
+        }
+    }
+
+    #[test]
+    fn pseudo_map_unknown_returns_none() {
+        assert!(pseudo_map("unknown").is_none());
+    }
+
+    #[test]
+    fn pseudo_map_spot_checks() {
+        assert_eq!(pseudo_map("hover"), Some(":hover"));
+        assert_eq!(pseudo_map("focus-visible"), Some(":focus-visible"));
+    }
+
+    // ── is_pseudo_prefix ─────────────────────────────────────────
+
+    #[test]
+    fn is_pseudo_prefix_true_and_false() {
+        assert!(is_pseudo_prefix("hover"));
+        assert!(!is_pseudo_prefix("notapseudo"));
+    }
+
+    // ── is_color_namespace ───────────────────────────────────────
+
+    #[test]
+    fn is_color_namespace_all_known() {
+        let namespaces = [
+            "primary",
+            "secondary",
+            "accent",
+            "background",
+            "foreground",
+            "muted",
+            "surface",
+            "destructive",
+            "danger",
+            "success",
+            "warning",
+            "info",
+            "border",
+            "ring",
+            "input",
+            "card",
+            "popover",
+            "gray",
+            "primary-foreground",
+            "secondary-foreground",
+            "accent-foreground",
+            "destructive-foreground",
+            "muted-foreground",
+            "card-foreground",
+            "popover-foreground",
+        ];
+        for ns in &namespaces {
+            assert!(is_color_namespace(ns), "expected true for '{}'", ns);
+        }
+    }
+
+    #[test]
+    fn is_color_namespace_false_for_unknown() {
+        assert!(!is_color_namespace("unknown"));
+    }
+
+    // ── is_css_color_keyword ─────────────────────────────────────
+
+    #[test]
+    fn is_css_color_keyword_all_known() {
+        let keywords = [
+            "transparent",
+            "inherit",
+            "currentColor",
+            "initial",
+            "unset",
+            "white",
+            "black",
+        ];
+        for kw in &keywords {
+            assert!(is_css_color_keyword(kw), "expected true for '{}'", kw);
+        }
+    }
+
+    #[test]
+    fn is_css_color_keyword_false_for_unknown() {
+        assert!(!is_css_color_keyword("red"));
+    }
+
+    // ── is_height_axis ───────────────────────────────────────────
+
+    #[test]
+    fn is_height_axis_true_for_height_properties() {
+        assert!(is_height_axis("h"));
+        assert!(is_height_axis("min-h"));
+        assert!(is_height_axis("max-h"));
+    }
+
+    #[test]
+    fn is_height_axis_false_for_non_height() {
+        assert!(!is_height_axis("w"));
+        assert!(!is_height_axis("min-w"));
+    }
+
+    // ── resolve_color ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_color_plain_namespace() {
+        assert_eq!(
+            resolve_color("primary"),
+            Some("var(--color-primary)".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_color_with_shade() {
+        assert_eq!(
+            resolve_color("primary.700"),
+            Some("var(--color-primary-700)".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_color_with_opacity() {
+        let result = resolve_color("primary/50").unwrap();
+        assert!(
+            result.contains("color-mix"),
+            "expected color-mix: {}",
+            result
+        );
+        assert!(result.contains("50%"), "expected 50%: {}", result);
+    }
+
+    #[test]
+    fn resolve_color_shade_with_opacity() {
+        let result = resolve_color("primary.700/50").unwrap();
+        assert!(result.contains("color-mix"));
+        assert!(result.contains("var(--color-primary-700)"));
+    }
+
+    #[test]
+    fn resolve_color_opacity_over_100_returns_none() {
+        assert!(resolve_color("primary/101").is_none());
+    }
+
+    #[test]
+    fn resolve_color_invalid_opacity_returns_none() {
+        assert!(resolve_color("primary/abc").is_none());
+    }
+
+    #[test]
+    fn resolve_color_unknown_namespace_returns_none() {
+        assert!(resolve_color("notacolor").is_none());
+    }
+
+    #[test]
+    fn resolve_color_unknown_namespace_with_shade_returns_none() {
+        assert!(resolve_color("notacolor.700").is_none());
+    }
+
+    #[test]
+    fn resolve_color_css_keyword() {
+        assert_eq!(
+            resolve_color("transparent"),
+            Some("transparent".to_string())
+        );
+        assert_eq!(resolve_color("white"), Some("white".to_string()));
+    }
+
+    #[test]
+    fn resolve_color_unknown_with_opacity_returns_none() {
+        assert!(resolve_color("notacolor/50").is_none());
+    }
+
+    // ── resolve_value ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_value_spacing() {
+        assert_eq!(resolve_value("4", "spacing", "p"), Some("1rem".to_string()));
+    }
+
+    #[test]
+    fn resolve_value_color() {
+        assert_eq!(
+            resolve_value("primary", "color", "bg"),
+            Some("var(--color-primary)".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_radius() {
+        assert_eq!(
+            resolve_value("full", "radius", "rounded"),
+            Some("9999px".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_shadow() {
+        assert!(resolve_value("sm", "shadow", "shadow").is_some());
+    }
+
+    #[test]
+    fn resolve_value_size() {
+        assert_eq!(resolve_value("full", "size", "w"), Some("100%".to_string()));
+    }
+
+    #[test]
+    fn resolve_value_alignment() {
+        assert_eq!(
+            resolve_value("center", "alignment", "items"),
+            Some("center".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_font_size() {
+        assert_eq!(
+            resolve_value("lg", "font-size", "font"),
+            Some("1.125rem".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_font_weight() {
+        assert_eq!(
+            resolve_value("bold", "font-weight", "weight"),
+            Some("700".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_line_height() {
+        assert_eq!(
+            resolve_value("tight", "line-height", "leading"),
+            Some("1.25".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_ring() {
+        let result = resolve_value("2", "ring", "ring").unwrap();
+        assert!(result.contains("2px solid"), "result: {}", result);
+    }
+
+    #[test]
+    fn resolve_value_content() {
+        assert_eq!(
+            resolve_value("empty", "content", "content"),
+            Some("''".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_raw_passthrough() {
+        assert_eq!(
+            resolve_value("hidden", "raw", "overflow"),
+            Some("hidden".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_raw_grid_cols_number() {
+        assert_eq!(
+            resolve_value("3", "raw", "grid-cols"),
+            Some("repeat(3, minmax(0, 1fr))".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_raw_grid_cols_zero() {
+        // 0 is not > 0, so falls through to raw passthrough
+        assert_eq!(
+            resolve_value("0", "raw", "grid-cols"),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_raw_grid_cols_non_number() {
+        assert_eq!(
+            resolve_value("auto", "raw", "grid-cols"),
+            Some("auto".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_value_unknown_type_passthrough() {
+        assert_eq!(
+            resolve_value("anything", "unknown-type", "x"),
+            Some("anything".to_string())
+        );
+    }
+
+    // ── resolve_size ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_size_screen_height_axis() {
+        assert_eq!(
+            resolve_value("screen", "size", "h"),
+            Some("100vh".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_size_screen_width_axis() {
+        assert_eq!(
+            resolve_value("screen", "size", "w"),
+            Some("100vw".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_size_spacing_fallback() {
+        assert_eq!(resolve_value("4", "size", "w"), Some("1rem".to_string()));
+    }
+
+    #[test]
+    fn resolve_size_keyword_fallback() {
+        assert_eq!(
+            resolve_value("fit", "size", "w"),
+            Some("fit-content".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_size_fraction_even() {
+        assert_eq!(resolve_value("1/2", "size", "w"), Some("50%".to_string()));
+    }
+
+    #[test]
+    fn resolve_size_fraction_repeating() {
+        let result = resolve_value("1/3", "size", "w").unwrap();
+        assert!(result.contains("33."), "expected ~33.x%: {}", result);
+        assert!(result.ends_with('%'));
+    }
+
+    #[test]
+    fn resolve_size_fraction_zero_denominator() {
+        assert!(resolve_value("1/0", "size", "w").is_none());
+    }
+
+    #[test]
+    fn resolve_size_no_match() {
+        assert!(resolve_value("notasize", "size", "w").is_none());
+    }
+
+    // ── resolve_ring ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_ring_valid_integer() {
+        let result = resolve_value("2", "ring", "ring").unwrap();
+        assert_eq!(result, "2px solid var(--color-ring)");
+    }
+
+    #[test]
+    fn resolve_ring_valid_float() {
+        let result = resolve_value("1.5", "ring", "ring").unwrap();
+        assert_eq!(result, "1.5px solid var(--color-ring)");
+    }
+
+    #[test]
+    fn resolve_ring_zero() {
+        let result = resolve_value("0", "ring", "ring").unwrap();
+        assert_eq!(result, "0px solid var(--color-ring)");
+    }
+
+    #[test]
+    fn resolve_ring_negative_returns_none() {
+        assert!(resolve_value("-1", "ring", "ring").is_none());
+    }
+
+    #[test]
+    fn resolve_ring_non_number_returns_none() {
+        assert!(resolve_value("abc", "ring", "ring").is_none());
+    }
+}
