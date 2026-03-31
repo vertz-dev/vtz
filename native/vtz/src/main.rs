@@ -39,6 +39,7 @@ async fn main() {
             );
 
             config.extra_watch_paths = vertzrc.extra_watch_paths;
+            config.proxy_name = args.name;
 
             if let Err(e) = vertz_runtime::server::http::start_server(config).await {
                 eprintln!("Error: {}", e);
@@ -964,6 +965,159 @@ async fn main() {
                             std::process::exit(1);
                         }
                     }
+                }
+            }
+        }
+        Command::Proxy(proxy_args) => {
+            use vertz_runtime::proxy::{daemon, routes};
+
+            let proxy_dir = routes::proxy_dir();
+            let routes_dir = routes::routes_dir();
+
+            match proxy_args.command {
+                cli::ProxyCommand::Init(args) => {
+                    // Clean stale routes first
+                    let removed = routes::clean_stale_routes();
+                    for name in &removed {
+                        eprintln!("Cleaned stale route: {}", name);
+                    }
+
+                    // Start the proxy daemon in the foreground
+                    eprintln!("Starting proxy on port {}...", args.port);
+                    match daemon::start_proxy(args.port, routes_dir).await {
+                        Ok((actual_port, handle)) => {
+                            daemon::write_pid_file(&proxy_dir, std::process::id()).unwrap_or_else(
+                                |e| {
+                                    eprintln!("Warning: failed to write PID file: {}", e);
+                                },
+                            );
+                            eprintln!(
+                                "\n\u{25b2} Vertz Proxy running on http://localhost:{}\n",
+                                actual_port
+                            );
+                            eprintln!(
+                                "  Dev servers will auto-register when started with `vtz dev`."
+                            );
+                            eprintln!("  Dashboard: http://localhost:{}\n", actual_port);
+
+                            // Block until the server exits
+                            handle.await.ok();
+                            daemon::remove_pid_file(&proxy_dir).ok();
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to start proxy: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                cli::ProxyCommand::Start(args) => {
+                    // Check if already running
+                    if let Some(pid) = daemon::read_pid_file(&proxy_dir) {
+                        if routes::is_pid_alive(pid) {
+                            eprintln!("Proxy is already running (PID {})", pid);
+                            std::process::exit(0);
+                        }
+                        // Stale PID file — clean up
+                        daemon::remove_pid_file(&proxy_dir).ok();
+                    }
+
+                    // Clean stale routes
+                    routes::clean_stale_routes();
+
+                    eprintln!("Starting proxy on port {}...", args.port);
+                    match daemon::start_proxy(args.port, routes_dir).await {
+                        Ok((actual_port, handle)) => {
+                            daemon::write_pid_file(&proxy_dir, std::process::id()).unwrap_or_else(
+                                |e| {
+                                    eprintln!("Warning: failed to write PID file: {}", e);
+                                },
+                            );
+                            eprintln!(
+                                "\u{25b2} Vertz Proxy running on http://localhost:{}",
+                                actual_port
+                            );
+                            handle.await.ok();
+                            daemon::remove_pid_file(&proxy_dir).ok();
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to start proxy: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                cli::ProxyCommand::Stop => {
+                    match daemon::read_pid_file(&proxy_dir) {
+                        Some(pid) => {
+                            if routes::is_pid_alive(pid) {
+                                // SAFETY: Sending SIGTERM to a known PID from our own PID file.
+                                unsafe {
+                                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                                }
+                                // Verify the process actually stopped
+                                let mut stopped = false;
+                                for _ in 0..10 {
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    if !routes::is_pid_alive(pid) {
+                                        stopped = true;
+                                        break;
+                                    }
+                                }
+                                if stopped {
+                                    eprintln!("Stopped proxy (PID {})", pid);
+                                } else {
+                                    eprintln!(
+                                        "Warning: proxy (PID {}) did not stop; you may need to `kill -9 {}`",
+                                        pid, pid
+                                    );
+                                }
+                            } else {
+                                eprintln!("Proxy is not running (stale PID file)");
+                            }
+                            daemon::remove_pid_file(&proxy_dir).ok();
+                        }
+                        None => {
+                            eprintln!("Proxy is not running");
+                        }
+                    }
+                }
+                cli::ProxyCommand::Status => {
+                    // Clean stale routes first
+                    routes::clean_stale_routes();
+                    let entries = routes::load_all_routes();
+
+                    // Check if proxy daemon is running
+                    let proxy_running = daemon::read_pid_file(&proxy_dir)
+                        .map(routes::is_pid_alive)
+                        .unwrap_or(false);
+
+                    if proxy_running {
+                        eprintln!("\u{25b2} Vertz Proxy — running");
+                    } else {
+                        eprintln!("\u{25b2} Vertz Proxy — stopped");
+                    }
+                    eprintln!();
+
+                    if entries.is_empty() {
+                        eprintln!("  No dev servers registered.");
+                    } else {
+                        let header_status = "STATUS";
+                        eprintln!(
+                            "  {:<30} {:<8} {:<20} {:<8} {}",
+                            "SUBDOMAIN", "PORT", "BRANCH", "PID", header_status
+                        );
+                        for entry in &entries {
+                            let status = if routes::is_pid_alive(entry.pid) {
+                                "\u{25cf} connected"
+                            } else {
+                                "\u{25cb} disconnected"
+                            };
+                            eprintln!(
+                                "  {:<30} {:<8} {:<20} {:<8} {}",
+                                entry.subdomain, entry.port, entry.branch, entry.pid, status
+                            );
+                        }
+                    }
+                    eprintln!();
                 }
             }
         }

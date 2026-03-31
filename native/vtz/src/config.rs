@@ -43,6 +43,8 @@ pub struct ServerConfig {
     pub extra_watch_paths: Vec<String>,
     /// Which framework plugin to use.
     pub plugin: PluginChoice,
+    /// Custom proxy subdomain name override (from `--name` flag).
+    pub proxy_name: Option<String>,
 }
 
 /// Resolve the `auto_install` setting from multiple sources.
@@ -190,6 +192,7 @@ impl ServerConfig {
             watch_deps: true,
             extra_watch_paths: Vec::new(),
             plugin: PluginChoice::default(),
+            proxy_name: None,
         }
     }
 
@@ -215,6 +218,7 @@ impl ServerConfig {
             watch_deps: true,
             extra_watch_paths: Vec::new(),
             plugin: PluginChoice::default(),
+            proxy_name: None,
         }
     }
 

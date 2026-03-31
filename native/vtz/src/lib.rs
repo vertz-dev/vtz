@@ -7,6 +7,7 @@ pub mod hmr;
 pub mod native_handler;
 pub mod plugin;
 pub mod pm;
+pub mod proxy;
 pub mod runtime;
 pub mod server;
 pub mod ssr;
