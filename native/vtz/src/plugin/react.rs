@@ -653,4 +653,56 @@ mod tests {
             output.code
         );
     }
+
+    #[test]
+    fn test_html_shell_script_ordering_with_react_plugin() {
+        use std::path::PathBuf;
+        let plugin = make_plugin();
+        let html = crate::server::html_shell::generate_html_shell(
+            &PathBuf::from("/project/src/main.tsx"),
+            &PathBuf::from("/project"),
+            &[],
+            None,
+            "React App",
+            &plugin,
+        );
+
+        // Bootstrap (non-module) should appear before setup (module)
+        let bootstrap_pos = html
+            .find("$RefreshReg$")
+            .expect("Bootstrap should be in HTML");
+        let setup_pos = html
+            .find("react-refresh")
+            .expect("Setup module should be in HTML");
+        assert!(
+            bootstrap_pos < setup_pos,
+            "Bootstrap must appear before setup module"
+        );
+
+        // Both should appear before the entry module script
+        let entry_pos = html
+            .find("<script type=\"module\" src=\"/src/main.tsx\">")
+            .expect("Entry module should be in HTML");
+        assert!(
+            setup_pos < entry_pos,
+            "Setup module must appear before entry module"
+        );
+
+        // Root element should be "root" (React convention)
+        assert!(
+            html.contains("<div id=\"root\">"),
+            "React plugin should use root element id 'root'"
+        );
+    }
+
+    #[test]
+    fn test_hmr_client_has_react_refresh_fallback() {
+        // The HMR client (embedded at compile time) should include
+        // the React Refresh fallback path for performFastRefresh
+        let hmr_client = include_str!("../assets/hmr-client.js");
+        assert!(
+            hmr_client.contains("__vtz_react_refresh_perform"),
+            "HMR client must include React Refresh fallback"
+        );
+    }
 }
