@@ -137,3 +137,194 @@ fn has_let_declaration(body: &FunctionBody) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component_analyzer::analyze_components;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    /// Parse source and return interactive component names.
+    fn interactive_names(source: &str) -> Vec<String> {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let components = analyze_components(&parsed.program);
+        find_interactive_components(&parsed.program, &components)
+    }
+
+    // ========== function declarations ==========
+
+    #[test]
+    fn function_decl_with_let_is_interactive() {
+        let names =
+            interactive_names("function Counter() { let count = 0; return <div>{count}</div>; }");
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    #[test]
+    fn function_decl_without_let_is_not_interactive() {
+        let names = interactive_names("function Header() { return <h1>Hello</h1>; }");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn function_decl_with_const_only_is_not_interactive() {
+        let names = interactive_names("function Info() { const x = 1; return <div>{x}</div>; }");
+        assert!(names.is_empty());
+    }
+
+    // ========== arrow functions (const =) ==========
+
+    #[test]
+    fn arrow_with_let_is_interactive() {
+        let names = interactive_names(
+            "const Counter = () => { let count = 0; return <div>{count}</div>; };",
+        );
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    #[test]
+    fn arrow_without_let_is_not_interactive() {
+        let names = interactive_names("const Header = () => { return <h1>Hi</h1>; };");
+        assert!(names.is_empty());
+    }
+
+    // ========== function expressions (const = function) ==========
+
+    #[test]
+    fn function_expr_with_let_is_interactive() {
+        let names = interactive_names(
+            "const Counter = function() { let count = 0; return <div>{count}</div>; };",
+        );
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    #[test]
+    fn function_expr_without_let_is_not_interactive() {
+        let names = interactive_names("const Header = function() { return <h1>Hi</h1>; };");
+        assert!(names.is_empty());
+    }
+
+    // ========== export named function declaration ==========
+
+    #[test]
+    fn export_named_function_with_let_is_interactive() {
+        let names = interactive_names(
+            "export function Counter() { let count = 0; return <div>{count}</div>; }",
+        );
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    #[test]
+    fn export_named_function_without_let_is_not_interactive() {
+        let names = interactive_names("export function Header() { return <h1>Hi</h1>; }");
+        assert!(names.is_empty());
+    }
+
+    // ========== export named variable (arrow / function expr) ==========
+
+    #[test]
+    fn export_named_const_arrow_with_let_is_interactive() {
+        let names = interactive_names(
+            "export const Counter = () => { let count = 0; return <div>{count}</div>; };",
+        );
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    #[test]
+    fn export_named_const_arrow_without_let_is_not_interactive() {
+        let names = interactive_names("export const Header = () => { return <h1>Hi</h1>; };");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn export_named_const_func_expr_with_let_is_interactive() {
+        let names = interactive_names(
+            "export const Counter = function() { let count = 0; return <div>{count}</div>; };",
+        );
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    // ========== export default function ==========
+
+    #[test]
+    fn export_default_function_with_let_is_interactive() {
+        let names = interactive_names(
+            "export default function Counter() { let count = 0; return <div>{count}</div>; }",
+        );
+        assert_eq!(names, vec!["Counter"]);
+    }
+
+    #[test]
+    fn export_default_function_without_let_is_not_interactive() {
+        let names = interactive_names("export default function Header() { return <h1>Hi</h1>; }");
+        assert!(names.is_empty());
+    }
+
+    // ========== multiple components ==========
+
+    #[test]
+    fn multiple_components_only_interactive_ones_returned() {
+        let source = r#"
+            function Counter() { let count = 0; return <div>{count}</div>; }
+            function Header() { return <h1>Hi</h1>; }
+            const Toggle = () => { let on = false; return <button>{on}</button>; };
+        "#;
+        let names = interactive_names(source);
+        assert_eq!(names, vec!["Counter", "Toggle"]);
+    }
+
+    // ========== empty components list ==========
+
+    #[test]
+    fn empty_components_returns_empty() {
+        let allocator = Allocator::default();
+        let source = "const x = 1;";
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let result = find_interactive_components(&parsed.program, &[]);
+        assert!(result.is_empty());
+    }
+
+    // ========== component with mismatched spans ==========
+
+    #[test]
+    fn component_info_with_wrong_spans_returns_empty() {
+        let allocator = Allocator::default();
+        let source = "function Counter() { let count = 0; return <div>{count}</div>; }";
+        let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
+        let fake_component = ComponentInfo {
+            name: "Counter".to_string(),
+            body_start: 999,
+            body_end: 9999,
+            is_arrow_expression: false,
+            props_param: None,
+            destructured_prop_names: vec![],
+        };
+        let result = find_interactive_components(&parsed.program, &[fake_component]);
+        assert!(result.is_empty());
+    }
+
+    // ========== var declaration is not interactive ==========
+
+    #[test]
+    fn function_with_var_only_is_not_interactive() {
+        let names =
+            interactive_names("function Counter() { var count = 0; return <div>{count}</div>; }");
+        assert!(names.is_empty());
+    }
+
+    // ========== non-component statements are skipped ==========
+
+    #[test]
+    fn non_component_statements_ignored() {
+        let source = r#"
+            const x = 1;
+            if (true) {}
+            function Counter() { let count = 0; return <div>{count}</div>; }
+        "#;
+        let names = interactive_names(source);
+        assert_eq!(names, vec!["Counter"]);
+    }
+}
