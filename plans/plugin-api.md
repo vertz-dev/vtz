@@ -195,15 +195,8 @@ pub trait FrameworkPlugin: Send + Sync {
         Err(format!("Unknown plugin tool: {}", name))
     }
 
-    /// Additional HTTP routes contributed by this plugin.
-    ///
-    /// Mounted under `/__vtz_ai/x/<plugin_name>/`. The runtime calls this
-    /// once at startup to get the plugin's routes. These complement the
-    /// MCP tools — they're the same data exposed as REST endpoints for
-    /// direct HTTP access (e.g., from browser devtools extensions).
-    fn ai_routes(&self) -> Vec<PluginRoute> {
-        vec![]
-    }
+    // Phase 3: ai_routes() — HTTP routes contributed by plugin.
+    // Mounted under `/__vtz_ai/x/<plugin_name>/`. Deferred to Phase 3.
 }
 ```
 
@@ -227,8 +220,9 @@ pub struct CompileOutput {
     pub css: Option<String>,
     /// Source map JSON, if available.
     pub source_map: Option<String>,
-    /// Compilation errors (non-fatal — the runtime will create error modules).
-    pub errors: Vec<CompileError>,
+    /// Compilation diagnostics — errors and warnings.
+    /// Non-fatal: the runtime creates error modules for compile failures.
+    pub diagnostics: Vec<CompileDiagnostic>,
 }
 
 /// What the HMR system should do in response to a file change.
@@ -533,18 +527,21 @@ for script in plugin.hmr_client_scripts() {
 ```
 
 **Acceptance Criteria:**
-- [ ] `FrameworkPlugin` trait defined in `native/vtz/src/plugin/mod.rs`
-- [ ] `VertzPlugin` implements `FrameworkPlugin` in `native/vtz/src/plugin/vertz.rs`
-- [ ] `CompilationPipeline::compile_for_browser()` delegates to plugin
-- [ ] HTML shell uses `plugin.hmr_client_scripts()` instead of hardcoded assets
-- [ ] File watcher uses `plugin.restart_triggers()`
-- [ ] HMR uses `plugin.hmr_strategy()` instead of hardcoded `invalidation_to_message()`
+- [x] `FrameworkPlugin` trait defined in `native/vtz/src/plugin/mod.rs`
+- [x] `VertzPlugin` implements `FrameworkPlugin` in `native/vtz/src/plugin/vertz.rs`
+- [x] `CompilationPipeline::compile_for_browser()` delegates to plugin
+- [x] HTML shell uses `plugin.hmr_client_scripts()` instead of hardcoded assets
+- [x] File watcher uses `plugin.restart_triggers()`
+- [x] HMR uses `plugin.hmr_strategy()` instead of hardcoded `invalidation_to_message()`
+- [x] `HmrAction::Handled` skips broadcast (no spurious messages to clients)
+- [x] All existing tests pass (zero behavior change)
+- [x] `cargo clippy --all-targets --release -- -D warnings` clean
+
+**Deferred to Phase 3 (MCP Extensibility):**
 - [ ] `mcp.rs` split into core tools + plugin tool dispatch via `plugin.execute_mcp_tool()`
-- [ ] `vertz_get_api_spec` moved to `VertzPlugin::mcp_tool_definitions()`
+- [ ] `vertz_get_api_spec` wired through `VertzPlugin::execute_mcp_tool()`
 - [ ] Core MCP tools renamed from `vertz_*` to `vtz_*` (runtime prefix, not framework prefix)
 - [ ] Plugin HTTP routes mounted under `/__vtz_ai/x/<plugin_name>/`
-- [ ] All existing tests pass (zero behavior change, except tool name prefix)
-- [ ] `cargo clippy --all-targets --release -- -D warnings` clean
 
 ---
 

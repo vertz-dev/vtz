@@ -470,6 +470,14 @@ mod tests {
     }
 
     #[test]
+    fn test_hmr_action_to_message_handled_returns_connected_noop() {
+        let action = HmrAction::Handled;
+        let msg = hmr_action_to_message(&action, Path::new("/project"));
+        // Handled maps to Connected as a no-op sentinel — caller should skip broadcast
+        assert!(matches!(msg, crate::hmr::protocol::HmrMessage::Connected));
+    }
+
+    #[test]
     fn test_diagnostics_to_errors_filters_warnings() {
         let diagnostics = vec![
             CompileDiagnostic {

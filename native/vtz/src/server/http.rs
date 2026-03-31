@@ -1100,11 +1100,13 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
 
                                     // Use plugin's HMR strategy to decide what action to take
                                     let action = watcher_state.plugin.hmr_strategy(&result);
-                                    let message = crate::plugin::hmr_action_to_message(
-                                        &action,
-                                        &root_dir,
-                                    );
-                                    watcher_state.hmr_hub.broadcast(message).await;
+                                    if !matches!(action, crate::plugin::HmrAction::Handled) {
+                                        let message = crate::plugin::hmr_action_to_message(
+                                            &action,
+                                            &root_dir,
+                                        );
+                                        watcher_state.hmr_hub.broadcast(message).await;
+                                    }
                                 }
                             }
                         }
