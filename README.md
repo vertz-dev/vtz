@@ -26,7 +26,7 @@ VTZ runs every layer of a Vertz app out of the box:
 |-------|---------------|
 | **UI Components** | Compiles JSX/TSX with signal-based reactivity transforms, serves components with HMR |
 | **Server Handlers** | Runs `src/server.ts` in a persistent V8 isolate, handles `/api/*` routes |
-| **SSR** | Server-side renders pages with hydration markers, supports single-pass and two-pass rendering |
+| **SSR** | Server-side renders pages in a persistent V8 isolate with AOT compilation and hydration markers |
 | **Database Queries** | Compiles Vertz query expressions with auto-thunking and field selection |
 | **Signals & Reactivity** | Detects reactive `let` declarations and auto-wraps them in `signal()` at compile time |
 | **CSS** | Extracts, transforms, and hot-reloads CSS with PostCSS and Lightning CSS support |
@@ -97,14 +97,9 @@ export default async function handler(req: Request): Promise<Response> {
 
 ### Server-Side Rendering
 
-VTZ provides built-in SSR with two rendering strategies:
+VTZ provides built-in SSR via a **persistent V8 isolate** — modules load once and are reused across renders, matching Cloudflare Workers' execution model:
 
-- **Per-request SSR** — fresh V8 runtime per render (simpler, isolated)
-- **Persistent SSR** — single V8 isolate reuses loaded modules across renders (faster)
-
-Both support:
-- Single-pass rendering (render, collect queries)
-- Two-pass rendering (Pass 1: discover data needs → fetch → Pass 2: render with data)
+- AOT single-pass rendering
 - CSS collection during render
 - Hydration data injection for client-side takeover
 - Graceful fallback to client-only shell on SSR failure
