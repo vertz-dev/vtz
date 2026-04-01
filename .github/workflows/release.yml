@@ -147,6 +147,7 @@ jobs:
           NPM_CONFIG_PROVENANCE: true
 
       - name: Create or update GitHub Release
+        if: steps.changesets.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
