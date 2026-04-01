@@ -18,8 +18,10 @@ use tokio::sync::{mpsc, oneshot};
 pub struct PersistentIsolateOptions {
     /// Root directory of the project.
     pub root_dir: PathBuf,
-    /// App entry file for SSR rendering (e.g., `src/app.tsx`).
-    pub entry_file: PathBuf,
+    /// SSR entry file (e.g., `src/app.tsx`).
+    /// This module is loaded and its exports stored as `globalThis.__vertz_app_module`
+    /// for use by the framework's SSR rendering engine.
+    pub ssr_entry: PathBuf,
     /// Optional server entry file for API routes (e.g., `src/server.ts`).
     /// When `None`, the isolate only supports SSR rendering.
     pub server_entry: Option<PathBuf>,
@@ -31,7 +33,7 @@ impl Default for PersistentIsolateOptions {
     fn default() -> Self {
         Self {
             root_dir: PathBuf::from("."),
-            entry_file: PathBuf::from("src/app.tsx"),
+            ssr_entry: PathBuf::from("src/app.tsx"),
             server_entry: None,
             channel_capacity: 256,
         }
@@ -62,6 +64,8 @@ pub struct SsrRequest {
     pub url: String,
     /// JSON-serialized session data.
     pub session_json: Option<String>,
+    /// Raw Cookie header from the HTTP request.
+    pub cookies: Option<String>,
 }
 
 /// An SSR render response from the V8 thread.
@@ -77,6 +81,12 @@ pub struct SsrResponse {
     pub error: Option<String>,
     /// Render time in milliseconds.
     pub render_time_ms: f64,
+    /// JSON-serialized SSR data for hydration (e.g., prefetched query results).
+    pub ssr_data: Option<String>,
+    /// HTML tags to inject into `<head>` (e.g., font preload links).
+    pub head_tags: Option<String>,
+    /// Redirect URL set by ProtectedRoute during SSR (server should return 302).
+    pub redirect: Option<String>,
 }
 
 /// Messages dispatched to the persistent isolate's V8 thread.
@@ -117,7 +127,7 @@ impl PersistentIsolate {
         let has_api_clone = Arc::clone(&has_api_handler);
 
         let root_dir = options.root_dir.clone();
-        let entry_file = options.entry_file.clone();
+        let ssr_entry = options.ssr_entry.clone();
         let server_entry = options.server_entry.clone();
 
         let runtime_thread = std::thread::spawn(move || {
@@ -129,7 +139,7 @@ impl PersistentIsolate {
             rt.block_on(async move {
                 isolate_event_loop(
                     root_dir,
-                    entry_file,
+                    ssr_entry,
                     server_entry,
                     message_rx,
                     initialized_clone,
@@ -242,7 +252,7 @@ impl PersistentIsolate {
 /// 5. Processes incoming messages (API or SSR)
 async fn isolate_event_loop(
     root_dir: PathBuf,
-    entry_file: PathBuf,
+    ssr_entry: PathBuf,
     server_entry: Option<PathBuf>,
     mut message_rx: mpsc::Receiver<IsolateMessage>,
     initialized: Arc<std::sync::atomic::AtomicBool>,
@@ -274,12 +284,12 @@ async fn isolate_event_loop(
         return;
     }
 
-    // 3. Load app entry module (for SSR rendering)
-    if entry_file.exists() {
-        let entry_specifier = match deno_core::ModuleSpecifier::from_file_path(&entry_file) {
+    // 3. Load SSR entry module (app.tsx) and store as globalThis.__vertz_app_module
+    if ssr_entry.exists() {
+        let entry_specifier = match deno_core::ModuleSpecifier::from_file_path(&ssr_entry) {
             Ok(s) => s,
             Err(_) => {
-                eprintln!("[Server] Invalid app entry path: {}", entry_file.display());
+                eprintln!("[Server] Invalid SSR entry path: {}", ssr_entry.display());
                 // Continue without SSR — API routes may still work
                 initialized.store(true, std::sync::atomic::Ordering::Release);
                 process_messages(&mut runtime, &mut message_rx, false).await;
@@ -289,16 +299,70 @@ async fn isolate_event_loop(
 
         if let Err(e) = runtime.load_main_module(&entry_specifier).await {
             eprintln!(
-                "[Server] Failed to load app entry module ({}): {}",
-                entry_file.display(),
+                "[Server] Failed to load SSR entry module ({}): {}",
+                ssr_entry.display(),
                 e
             );
-            // Continue anyway — app entry failing doesn't prevent API routes
+            // Continue anyway — SSR entry failing doesn't prevent API routes
         } else {
-            eprintln!(
-                "[Server] App entry loaded for SSR: {}",
-                entry_file.display()
+            // Capture module exports as globalThis.__vertz_app_module
+            let safe_url = serde_json::to_string(entry_specifier.as_str())
+                .unwrap_or_else(|_| format!("\"{}\"", entry_specifier.as_str()));
+            let capture_js = format!(
+                r#"(async function() {{
+                    const mod = await import({});
+                    globalThis.__vertz_app_module = mod;
+                }})()"#,
+                safe_url
             );
+            if let Err(e) = runtime.execute_script_void("<capture-ssr-module>", &capture_js) {
+                eprintln!("[Server] Failed to capture SSR module exports: {}", e);
+            }
+            if let Err(e) = runtime.run_event_loop().await {
+                eprintln!("[Server] Event loop error during SSR module capture: {}", e);
+            }
+
+            eprintln!(
+                "[Server] SSR entry loaded: {} (stored as globalThis.__vertz_app_module)",
+                ssr_entry.display()
+            );
+
+            // Import ssrRenderSinglePass from @vertz/ui-server/ssr and store as global.
+            // We write a temp module file so bare specifiers resolve from node_modules.
+            let ssr_init_path = ssr_entry
+                .parent()
+                .unwrap_or(root_dir.as_ref())
+                .join("__vertz_ssr_init.mjs");
+            let wrote_init = std::fs::write(
+                &ssr_init_path,
+                "import { ssrRenderSinglePass } from '@vertz/ui-server/ssr';\n\
+                 globalThis.__vertz_ssr_render_fn = ssrRenderSinglePass;\n",
+            )
+            .is_ok();
+
+            if wrote_init {
+                if let Ok(init_specifier) =
+                    deno_core::ModuleSpecifier::from_file_path(&ssr_init_path)
+                {
+                    match runtime.load_side_module(&init_specifier).await {
+                        Ok(_) => {
+                            if let Err(e) = runtime.run_event_loop().await {
+                                eprintln!("[Server] Event loop error during SSR init: {}", e);
+                            }
+                            eprintln!(
+                                "[Server] ssrRenderSinglePass loaded from @vertz/ui-server/ssr"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[Server] @vertz/ui-server/ssr not available ({}), using legacy render",
+                                e
+                            );
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&ssr_init_path);
+            }
         }
     }
 
@@ -324,7 +388,7 @@ async fn isolate_event_loop(
         };
 
         // Step a: Load the server module directly
-        let load_result = if entry_file.exists() {
+        let load_result = if ssr_entry.exists() {
             runtime.load_side_module(&entry_specifier).await
         } else {
             runtime.load_main_module(&entry_specifier).await
@@ -441,7 +505,7 @@ async fn process_messages(
             }
             IsolateMessage::Ssr(request, response_tx) => {
                 if ssr_enabled {
-                    let result = dispatch_ssr_request(runtime, &request);
+                    let result = dispatch_ssr_request(runtime, &request).await;
                     let _ = response_tx.send(result);
                 } else {
                     let _ = response_tx.send(Err(
@@ -640,10 +704,45 @@ const SSR_RESET_JS: &str = r#"
 })()
 "#;
 
-/// JavaScript to execute the SSR render and collect results.
-const SSR_RENDER_JS: &str = r#"
+/// JavaScript to execute SSR render via the framework's ssrRenderSinglePass.
+///
+/// Stores the result in `globalThis.__vertz_last_ssr_result` as a JSON string.
+/// Requires `globalThis.__vertz_ssr_render_fn` (ssrRenderSinglePass) and
+/// `globalThis.__vertz_app_module` to be set during isolate init.
+const SSR_RENDER_FRAMEWORK_JS: &str = r#"
+(async function() {
+    const url = (globalThis.location.pathname || '/') + (globalThis.location.search || '');
+
+    // Build options for ssrRenderSinglePass
+    const options = {};
+    if (globalThis.__vertz_session) {
+        options.ssrAuth = globalThis.__vertz_session;
+    }
+    if (globalThis.__vertz_cookies) {
+        options.cookies = globalThis.__vertz_cookies;
+    }
+
+    const result = await globalThis.__vertz_ssr_render_fn(
+        globalThis.__vertz_app_module,
+        url,
+        options
+    );
+    globalThis.__vertz_last_ssr_result = JSON.stringify({
+        content: result.html || '',
+        css: result.css || '',
+        ssrData: result.ssrData || [],
+        headTags: result.headTags || '',
+        redirect: result.redirect ? result.redirect.to : null,
+        isSsr: (result.html || '').length > 0,
+    });
+})()
+"#;
+
+/// Legacy JavaScript to execute SSR render via DOM scraping.
+///
+/// Used when `ssrRenderSinglePass` is not available (e.g., apps without @vertz/ui-server).
+const SSR_RENDER_LEGACY_JS: &str = r#"
 (function() {
-    // Attempt to render via SSR render function or DOM content
     let content = '';
 
     if (typeof globalThis.__vertz_ssr_render === 'function') {
@@ -665,7 +764,6 @@ const SSR_RENDER_JS: &str = r#"
         }
     }
 
-    // Collect CSS entries
     let cssEntries = [];
     if (typeof __vertz_get_collected_css === 'function') {
         cssEntries = __vertz_get_collected_css().map(e => ({ css: e.css, id: e.id || null }));
@@ -681,12 +779,15 @@ const SSR_RENDER_JS: &str = r#"
 
 /// Dispatch a single SSR render request in the V8 isolate.
 ///
+/// When `ssrRenderSinglePass` is available (stored as `globalThis.__vertz_ssr_render_fn`
+/// during init), uses the framework engine. Otherwise falls back to legacy DOM scraping.
+///
 /// 1. Resets DOM state (clean slate)
 /// 2. Sets location to the requested URL
 /// 3. Installs session data
-/// 4. Renders app content
-/// 5. Collects CSS
-fn dispatch_ssr_request(
+/// 4. Renders via framework engine or legacy path
+/// 5. Parses result
+async fn dispatch_ssr_request(
     runtime: &mut crate::runtime::js_runtime::VertzJsRuntime,
     request: &SsrRequest,
 ) -> Result<SsrResponse, String> {
@@ -715,49 +816,151 @@ fn dispatch_ssr_request(
             .map_err(|e| format!("Session install error: {}", e))?;
     }
 
-    // 4. Render and collect results
-    let result = runtime
-        .execute_script("<ssr-render>", SSR_RENDER_JS)
-        .map_err(|e| format!("SSR render error: {}", e))?;
+    // 3b. Install cookies for document.cookie during SSR
+    if let Some(ref cookies) = request.cookies {
+        let safe =
+            serde_json::to_string(cookies).map_err(|e| format!("Cookie serialize: {}", e))?;
+        let js = format!("globalThis.__vertz_cookies = {};", safe);
+        runtime
+            .execute_script_void("<ssr-cookies>", &js)
+            .map_err(|e| format!("Cookie install error: {}", e))?;
+    } else {
+        runtime
+            .execute_script_void("<ssr-cookies>", "delete globalThis.__vertz_cookies;")
+            .map_err(|e| format!("Cookie clear error: {}", e))?;
+    }
 
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-
-    let result_str = result.as_str().unwrap_or("{}");
-    let parsed: serde_json::Value =
-        serde_json::from_str(result_str).map_err(|e| format!("Parse SSR result: {}", e))?;
-
-    let content = parsed
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let css_entries: Vec<(String, Option<String>)> = parsed
-        .get("cssEntries")
-        .and_then(|arr| arr.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|e| {
-                    let css = e["css"].as_str().unwrap_or("").to_string();
-                    let id = e["id"].as_str().map(|s| s.to_string());
-                    (css, id)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let is_ssr = parsed
-        .get("isSsr")
-        .and_then(|v| v.as_bool())
+    // 4. Check if framework render function is available
+    let has_framework = runtime
+        .execute_script(
+            "<ssr-check>",
+            "typeof globalThis.__vertz_ssr_render_fn === 'function'",
+        )
+        .map(|v| v.as_bool().unwrap_or(false))
         .unwrap_or(false);
 
-    Ok(SsrResponse {
-        content,
-        css_entries,
-        is_ssr,
-        error: None,
-        render_time_ms: elapsed,
-    })
+    if has_framework {
+        // Framework path: ssrRenderSinglePass (async)
+        runtime
+            .execute_script_void("<ssr-render-framework>", SSR_RENDER_FRAMEWORK_JS)
+            .map_err(|e| format!("SSR framework render error: {}", e))?;
+
+        runtime
+            .run_event_loop()
+            .await
+            .map_err(|e| format!("SSR event loop error: {}", e))?;
+
+        let result = runtime
+            .execute_script(
+                "<ssr-read-result>",
+                "globalThis.__vertz_last_ssr_result || '{}'",
+            )
+            .map_err(|e| format!("Read SSR result error: {}", e))?;
+
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let result_str = result.as_str().unwrap_or("{}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(result_str).map_err(|e| format!("Parse SSR result: {}", e))?;
+
+        let content = parsed
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let css = parsed
+            .get("css")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let css_entries = if css.is_empty() {
+            vec![]
+        } else {
+            vec![(css, None)]
+        };
+
+        let ssr_data = parsed.get("ssrData").and_then(|d| {
+            if d.is_array() && !d.as_array().unwrap().is_empty() {
+                Some(serde_json::to_string(d).unwrap_or_default())
+            } else {
+                None
+            }
+        });
+
+        let head_tags = parsed
+            .get("headTags")
+            .and_then(|h| h.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let redirect = parsed
+            .get("redirect")
+            .and_then(|r| r.as_str())
+            .map(|s| s.to_string());
+
+        let is_ssr = parsed
+            .get("isSsr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(SsrResponse {
+            content,
+            css_entries,
+            is_ssr,
+            error: None,
+            render_time_ms: elapsed,
+            ssr_data,
+            head_tags,
+            redirect,
+        })
+    } else {
+        // Legacy path: DOM scraping (sync)
+        let result = runtime
+            .execute_script("<ssr-render-legacy>", SSR_RENDER_LEGACY_JS)
+            .map_err(|e| format!("SSR render error: {}", e))?;
+
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let result_str = result.as_str().unwrap_or("{}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(result_str).map_err(|e| format!("Parse SSR result: {}", e))?;
+
+        let content = parsed
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let css_entries: Vec<(String, Option<String>)> = parsed
+            .get("cssEntries")
+            .and_then(|arr| arr.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let css = e["css"].as_str().unwrap_or("").to_string();
+                        let id = e["id"].as_str().map(|s| s.to_string());
+                        (css, id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let is_ssr = parsed
+            .get("isSsr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(SsrResponse {
+            content,
+            css_entries,
+            is_ssr,
+            error: None,
+            render_time_ms: elapsed,
+            ssr_data: None,
+            head_tags: None,
+            redirect: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -768,7 +971,7 @@ mod tests {
     fn test_default_options() {
         let opts = PersistentIsolateOptions::default();
         assert_eq!(opts.channel_capacity, 256);
-        assert_eq!(opts.entry_file, PathBuf::from("src/app.tsx"));
+        assert_eq!(opts.ssr_entry, PathBuf::from("src/app.tsx"));
         assert!(opts.server_entry.is_none());
     }
 
@@ -796,13 +999,36 @@ mod tests {
         assert_eq!(res.body, b"{}");
     }
 
+    #[test]
+    fn test_ssr_response_has_hydration_fields() {
+        let resp = SsrResponse {
+            content: "<h1>Hello</h1>".to_string(),
+            css_entries: vec![],
+            is_ssr: true,
+            error: None,
+            render_time_ms: 1.5,
+            ssr_data: Some(r#"[{"key":"tasks","data":[]}]"#.to_string()),
+            head_tags: Some(r#"<link rel="preload" href="/font.woff2" />"#.to_string()),
+            redirect: None,
+        };
+        assert_eq!(
+            resp.ssr_data,
+            Some(r#"[{"key":"tasks","data":[]}]"#.to_string())
+        );
+        assert_eq!(
+            resp.head_tags,
+            Some(r#"<link rel="preload" href="/font.woff2" />"#.to_string())
+        );
+        assert!(resp.redirect.is_none());
+    }
+
     /// Helper: create an isolate with only a server entry (API-only mode).
     fn api_only_opts(temp_dir: &tempfile::TempDir, server_js: &str) -> PersistentIsolateOptions {
         let server_path = temp_dir.path().join("server.js");
         std::fs::write(&server_path, server_js).unwrap();
         PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: temp_dir.path().join("nonexistent-app.tsx"),
+            ssr_entry: temp_dir.path().join("nonexistent-app.tsx"),
             server_entry: Some(server_path),
             channel_capacity: 16,
         }
@@ -823,7 +1049,7 @@ mod tests {
     async fn test_create_persistent_isolate() {
         let opts = PersistentIsolateOptions {
             root_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            entry_file: PathBuf::from("/nonexistent/app.tsx"),
+            ssr_entry: PathBuf::from("/nonexistent/app.tsx"),
             server_entry: None,
             channel_capacity: 16,
         };
@@ -842,7 +1068,7 @@ mod tests {
     async fn test_handle_request_without_api_handler() {
         let opts = PersistentIsolateOptions {
             root_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            entry_file: PathBuf::from("/nonexistent/app.tsx"),
+            ssr_entry: PathBuf::from("/nonexistent/app.tsx"),
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1038,7 +1264,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1049,6 +1275,7 @@ mod tests {
         let ssr_req = SsrRequest {
             url: "/tasks".to_string(),
             session_json: None,
+            cookies: None,
         };
 
         let result = isolate.handle_ssr(ssr_req).await;
@@ -1085,7 +1312,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1096,6 +1323,7 @@ mod tests {
         // First request
         let resp1 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/page-1".to_string(),
                 session_json: None,
             })
@@ -1106,6 +1334,7 @@ mod tests {
         // Second request — should have clean DOM, no leaked content from first request
         let resp2 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/page-2".to_string(),
                 session_json: None,
             })
@@ -1136,7 +1365,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1147,6 +1376,7 @@ mod tests {
         // First request
         let resp1 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/a".to_string(),
                 session_json: None,
             })
@@ -1158,6 +1388,7 @@ mod tests {
         // Second request — CSS should be fresh (not accumulated from first request)
         let resp2 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/b".to_string(),
                 session_json: None,
             })
@@ -1188,7 +1419,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1199,6 +1430,7 @@ mod tests {
         // Request that throws
         let err_result = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/error".to_string(),
                 session_json: None,
             })
@@ -1208,6 +1440,7 @@ mod tests {
         // Next SSR request should still work
         let ok_result = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/ok".to_string(),
                 session_json: None,
             })
@@ -1254,7 +1487,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1280,6 +1513,7 @@ mod tests {
         // Test SSR request
         let ssr_resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/home".to_string(),
                 session_json: None,
             })
@@ -1319,7 +1553,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1329,6 +1563,7 @@ mod tests {
 
         let resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/profile".to_string(),
                 session_json: Some(r#"{"userId":"user-123"}"#.to_string()),
             })
@@ -1370,7 +1605,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1382,6 +1617,7 @@ mod tests {
         // Verify via SSR render that interceptor globals are present
         let resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/check".to_string(),
                 session_json: None,
             })
@@ -1440,7 +1676,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1491,7 +1727,7 @@ mod tests {
         // No server entry — SSR only
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1538,7 +1774,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1550,6 +1786,7 @@ mod tests {
         // SSR render verifies interceptor is installed
         let resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/test".to_string(),
                 session_json: None,
             })
@@ -1586,7 +1823,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: temp_dir.path().join("nonexistent-app.tsx"),
+            ssr_entry: temp_dir.path().join("nonexistent-app.tsx"),
             server_entry: Some(server_path.clone()),
             channel_capacity: 16,
         };
@@ -1681,7 +1918,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: temp_dir.path().join("nonexistent-app.tsx"),
+            ssr_entry: temp_dir.path().join("nonexistent-app.tsx"),
             server_entry: Some(server_path.clone()),
             channel_capacity: 16,
         };

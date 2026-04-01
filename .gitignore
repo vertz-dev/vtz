@@ -7,6 +7,12 @@ node_modules/
 npm/runtime/index.js
 npm/runtime/index.d.ts
 
+# Test app (local dev only)
+test-app/
+
+# Vertz dev cache
+.vertz/
+
 # OS
 .DS_Store
 

@@ -49,3 +49,43 @@ cargo build --release      # Release build
 ```bash
 cargo test --all && cargo clippy --all-targets --release -- -D warnings && cargo fmt --all -- --check
 ```
+
+## Canonical App Structure
+
+Every Vertz app follows this structure. Agents must scaffold apps consistently:
+
+```
+src/
+  app.tsx          # SSR module — exports matching SSRModule interface
+  entry-client.ts  # Client hydration — calls hydrate(App, { target: '#app' })
+  server.ts        # API server — exports { handler } via createServer()
+```
+
+### `src/app.tsx` — SSR Entry
+
+Loaded by the persistent V8 isolate for server-side rendering. Must export:
+
+- `App` — Root component function (returns DOM/VNode)
+- `styles?` — Global CSS strings (e.g., resets, body styles)
+- `theme?` — Theme object from `@vertz/ui`
+- `getInjectedCSS?` — Returns CSS from `@vertz/ui` module instance
+- `routes?` — Compiled routes for build-time SSG
+- `api?` — Code-generated API client for zero-discovery prefetch
+
+### `src/entry-client.ts` — Client Entry
+
+Browser-only hydration script. Referenced by `<script type="module">` in the HTML shell. Imports `App` from `./app` and calls the framework's `hydrate()`.
+
+### `src/server.ts` — API Server
+
+Exports a request handler for `/api/*` routes. Loaded by the persistent isolate as `globalThis.__vertz_server_module`. During SSR, `/api/*` fetch calls are intercepted and routed to this handler in-memory (no network hop).
+
+### SSR Data Flow
+
+```
+HTTP Request → Extract cookies/session → Persistent V8 isolate
+  → ssrRenderSinglePass(appModule, url, { ssrAuth, cookies })
+  → Framework: discovery → prefetch (via scoped fetch) → render
+  → SsrResponse { content, css, ssr_data, head_tags, redirect }
+  → Assemble HTML document → HTTP Response
+```
