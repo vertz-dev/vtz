@@ -4,9 +4,9 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use crate::compiler::cache::{CachedModule, CompilationCache};
+use crate::compiler::css_transform::CssTransform;
 use crate::compiler::env_replacer;
 use crate::compiler::import_rewriter;
-use crate::compiler::postcss;
 use crate::plugin::{CompileContext, FrameworkPlugin};
 use crate::tsconfig::TsconfigPaths;
 
@@ -52,6 +52,8 @@ pub struct CompilationPipeline {
     tsconfig_paths: Option<TsconfigPaths>,
     /// Public env vars for `import.meta.env` compile-time replacement.
     env: HashMap<String, String>,
+    /// Optional CSS transform hook (e.g., PostCSS, Lightning CSS).
+    css_transform: Option<Arc<dyn CssTransform>>,
 }
 
 impl CompilationPipeline {
@@ -64,6 +66,7 @@ impl CompilationPipeline {
             plugin,
             tsconfig_paths: None,
             env: HashMap::new(),
+            css_transform: None,
         }
     }
 
@@ -78,6 +81,15 @@ impl CompilationPipeline {
     /// Set the public env vars for `import.meta.env` compile-time replacement.
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Set a CSS transform hook (e.g., PostCSS).
+    ///
+    /// When set, `compile_css_for_browser` delegates to this transform
+    /// instead of reading the raw CSS file.
+    pub fn with_css_transform(mut self, transform: Arc<dyn CssTransform>) -> Self {
+        self.css_transform = Some(transform);
         self
     }
 
@@ -205,27 +217,25 @@ impl CompilationPipeline {
             };
         }
 
-        // When PostCSS is configured the JS runner reads the file itself,
-        // so only read from Rust when falling back to raw CSS.
-        let processed_css = match postcss::find_postcss_config(&self.root_dir) {
-            Some(config_path) => {
-                match postcss::process_css(&self.root_dir, file_path, &config_path) {
-                    Ok(css) => css,
-                    Err(err) => {
-                        return BrowserCompileResult {
-                            code: self.css_error_module(&err.message),
-                            source_map: None,
-                            css: None,
-                            errors: vec![CompileError {
-                                message: err.message,
-                                line: err.line,
-                                column: err.column,
-                            }],
-                        };
-                    }
+        // Delegate to the CSS transform hook if registered, otherwise read raw CSS.
+        let processed_css = if let Some(ref transform) = self.css_transform {
+            match transform.process(file_path, &self.root_dir) {
+                Ok(css) => css,
+                Err(errors) => {
+                    let message = errors
+                        .first()
+                        .map(|e| e.message.as_str())
+                        .unwrap_or("CSS transform failed");
+                    return BrowserCompileResult {
+                        code: self.css_error_module(message),
+                        source_map: None,
+                        css: None,
+                        errors,
+                    };
                 }
             }
-            None => match std::fs::read_to_string(file_path) {
+        } else {
+            match std::fs::read_to_string(file_path) {
                 Ok(source) => source,
                 Err(err) => {
                     return self.error_module(&format!(
@@ -234,7 +244,7 @@ impl CompilationPipeline {
                         err
                     ));
                 }
-            },
+            }
         };
 
         let code = crate::server::css_server::css_to_js_module(&processed_css, url_path);
@@ -1384,6 +1394,8 @@ export function App() {
 
     #[test]
     fn test_compile_css_with_postcss_config_processes_css() {
+        use crate::compiler::postcss::{find_postcss_config, PostCssCssTransform};
+
         let tmp = tempfile::tempdir().unwrap();
         let src_dir = tmp.path().join("src");
         let node_modules = tmp.path().join("node_modules");
@@ -1432,7 +1444,9 @@ export function App() {
         )
         .unwrap();
 
-        let pipeline = create_pipeline(tmp.path());
+        let config_path = find_postcss_config(tmp.path()).expect("config should exist");
+        let transform = Arc::new(PostCssCssTransform::new(config_path));
+        let pipeline = create_pipeline(tmp.path()).with_css_transform(transform);
         let result = pipeline.compile_css_for_browser(&src_dir.join("app.css"), "/src/app.css");
 
         assert!(
@@ -1446,6 +1460,8 @@ export function App() {
 
     #[test]
     fn test_compile_css_with_postcss_error_returns_error_module() {
+        use crate::compiler::postcss::{find_postcss_config, PostCssCssTransform};
+
         let tmp = tempfile::tempdir().unwrap();
         let src_dir = tmp.path().join("src");
         let node_modules = tmp.path().join("node_modules");
@@ -1497,12 +1513,78 @@ export function App() {
         )
         .unwrap();
 
-        let pipeline = create_pipeline(tmp.path());
+        let config_path = find_postcss_config(tmp.path()).expect("config should exist");
+        let transform = Arc::new(PostCssCssTransform::new(config_path));
+        let pipeline = create_pipeline(tmp.path()).with_css_transform(transform);
         let result = pipeline.compile_css_for_browser(&src_dir.join("app.css"), "/src/app.css");
 
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].line, Some(1));
         assert_eq!(result.errors[0].column, Some(1));
+        assert!(result.code.contains("CSS error"));
+        assert!(pipeline.cache().is_empty());
+    }
+
+    #[test]
+    fn test_compile_css_with_custom_transform() {
+        use crate::compiler::css_transform::CssTransform;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("app.css"), "body { color: red; }\n").unwrap();
+
+        struct UpperCaseTransform;
+
+        impl CssTransform for UpperCaseTransform {
+            fn process(
+                &self,
+                file_path: &Path,
+                _root_dir: &Path,
+            ) -> Result<String, Vec<CompileError>> {
+                let source = std::fs::read_to_string(file_path).unwrap();
+                Ok(source.to_uppercase())
+            }
+        }
+
+        let pipeline = create_pipeline(tmp.path()).with_css_transform(Arc::new(UpperCaseTransform));
+        let result = pipeline.compile_css_for_browser(&src_dir.join("app.css"), "/src/app.css");
+
+        assert!(result.errors.is_empty());
+        assert!(result.code.contains("BODY { COLOR: RED; }"));
+    }
+
+    #[test]
+    fn test_compile_css_with_transform_error() {
+        use crate::compiler::css_transform::CssTransform;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("app.css"), "@broken;\n").unwrap();
+
+        struct FailingTransform;
+
+        impl CssTransform for FailingTransform {
+            fn process(
+                &self,
+                _file_path: &Path,
+                _root_dir: &Path,
+            ) -> Result<String, Vec<CompileError>> {
+                Err(vec![CompileError {
+                    message: "Transform failed".to_string(),
+                    line: Some(1),
+                    column: Some(1),
+                }])
+            }
+        }
+
+        let pipeline = create_pipeline(tmp.path()).with_css_transform(Arc::new(FailingTransform));
+        let result = pipeline.compile_css_for_browser(&src_dir.join("app.css"), "/src/app.css");
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].message, "Transform failed");
+        assert_eq!(result.errors[0].line, Some(1));
         assert!(result.code.contains("CSS error"));
         assert!(pipeline.cache().is_empty());
     }
