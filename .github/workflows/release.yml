@@ -46,10 +46,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-
       - name: Determine version
         id: version
         run: |
@@ -58,6 +54,12 @@ jobs:
           else
             echo "version=0.0.1" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          # Include version in cache key so env-dependent builds are never stale
+          key: v${{ steps.version.outputs.version }}
 
       - name: Build runtime binary
         working-directory: native
@@ -70,10 +72,19 @@ jobs:
           cp native/target/${{ matrix.target }}/release/vtz npm/${{ matrix.pkg }}/vtz
           chmod +x npm/${{ matrix.pkg }}/vtz
 
-      - name: Verify binary
+      - name: Verify binary version matches version.txt
         run: |
+          EXPECTED="vtz ${{ steps.version.outputs.version }}"
           if [ "$(uname -m)" = "${{ matrix.expected_arch }}" ]; then
-            npm/${{ matrix.pkg }}/vtz --version || true
+            ACTUAL=$(npm/${{ matrix.pkg }}/vtz --version 2>&1)
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $ACTUAL"
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "::error::Binary version mismatch! Expected '$EXPECTED' but got '$ACTUAL'"
+              exit 1
+            fi
+          else
+            echo "Cross-compiled binary, skipping runtime version check"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -146,8 +157,7 @@ jobs:
           NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
 
-      - name: Create or update GitHub Release
-        if: steps.changesets.outputs.published == 'true'
+      - name: Upload binaries to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -168,14 +178,17 @@ jobs:
             exit 0
           fi
 
-          # Delete existing release for this version so we can recreate with fresh binaries
           if gh release view "$TAG" &>/dev/null; then
-            echo "Release $TAG exists, updating with new binaries..."
-            gh release delete "$TAG" --yes
-            git push origin --delete "$TAG" 2>/dev/null || true
+            # Release exists — delete old binary assets and upload fresh ones
+            echo "Release $TAG exists, replacing binary assets..."
+            for asset in "${ASSETS[@]}"; do
+              gh release delete-asset "$TAG" "$asset" --yes 2>/dev/null || true
+            done
+            gh release upload "$TAG" "${ASSETS[@]}"
+          else
+            # First release for this version — create it
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              "${ASSETS[@]}"
           fi
-
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            "${ASSETS[@]}"
