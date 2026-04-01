@@ -273,6 +273,19 @@ pub fn diagnostics_to_errors(diagnostics: &[CompileDiagnostic]) -> Vec<CompileEr
         .collect()
 }
 
+/// Extract warnings from compile diagnostics as `CompileError` values.
+pub fn diagnostics_to_warnings(diagnostics: &[CompileDiagnostic]) -> Vec<CompileError> {
+    diagnostics
+        .iter()
+        .filter(|d| d.is_warning)
+        .map(|d| CompileError {
+            message: d.message.clone(),
+            line: d.line,
+            column: d.column,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +541,32 @@ mod tests {
         let errors = diagnostics_to_errors(&diagnostics);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].message, "error msg");
+    }
+
+    #[test]
+    fn test_diagnostics_to_warnings_extracts_warnings_only() {
+        let diagnostics = vec![
+            CompileDiagnostic {
+                message: "error msg".into(),
+                line: Some(1),
+                column: Some(5),
+                is_warning: false,
+            },
+            CompileDiagnostic {
+                message: "[css-unknown-color-token] Unknown color token 'sm'".into(),
+                line: Some(23),
+                column: Some(5),
+                is_warning: true,
+            },
+        ];
+        let warnings = diagnostics_to_warnings(&diagnostics);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].message,
+            "[css-unknown-color-token] Unknown color token 'sm'"
+        );
+        assert_eq!(warnings[0].line, Some(23));
+        assert_eq!(warnings[0].column, Some(5));
     }
 
     #[test]
