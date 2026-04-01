@@ -3,6 +3,8 @@
 //! Uses `wry` (WebKit on macOS) to embed a native webview window.
 //! The webview loads the app from VTZ's axum dev server on localhost.
 
+pub mod bridge;
+
 use std::sync::Mutex;
 
 use tao::event::{Event, WindowEvent};
