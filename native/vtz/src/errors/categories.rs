@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// Severity level for a diagnostic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    #[default]
+    Error,
+    Warning,
+}
+
 /// Error category with priority ordering.
 ///
 /// Higher-priority errors suppress lower-priority ones.
@@ -48,6 +57,9 @@ impl std::fmt::Display for ErrorCategory {
 pub struct DevError {
     /// Error category (build, resolve, typecheck, ssr, runtime).
     pub category: ErrorCategory,
+    /// Severity level (error or warning).
+    #[serde(default)]
+    pub severity: Severity,
     /// Human-readable error message.
     pub message: String,
     /// Absolute file path where the error occurred.
@@ -72,6 +84,7 @@ impl DevError {
     pub fn build(message: impl Into<String>) -> Self {
         Self {
             category: ErrorCategory::Build,
+            severity: Severity::Error,
             message: message.into(),
             file: None,
             line: None,
@@ -85,6 +98,7 @@ impl DevError {
     pub fn resolve(message: impl Into<String>) -> Self {
         Self {
             category: ErrorCategory::Resolve,
+            severity: Severity::Error,
             message: message.into(),
             file: None,
             line: None,
@@ -98,6 +112,7 @@ impl DevError {
     pub fn ssr(message: impl Into<String>) -> Self {
         Self {
             category: ErrorCategory::Ssr,
+            severity: Severity::Error,
             message: message.into(),
             file: None,
             line: None,
@@ -111,6 +126,7 @@ impl DevError {
     pub fn typecheck(message: impl Into<String>) -> Self {
         Self {
             category: ErrorCategory::TypeCheck,
+            severity: Severity::Error,
             message: message.into(),
             file: None,
             line: None,
@@ -124,6 +140,7 @@ impl DevError {
     pub fn runtime(message: impl Into<String>) -> Self {
         Self {
             category: ErrorCategory::Runtime,
+            severity: Severity::Error,
             message: message.into(),
             file: None,
             line: None,
@@ -131,6 +148,12 @@ impl DevError {
             code_snippet: None,
             suggestion: None,
         }
+    }
+
+    /// Downgrade this diagnostic to a warning.
+    pub fn as_warning(mut self) -> Self {
+        self.severity = Severity::Warning;
+        self
     }
 
     /// Set the file location.

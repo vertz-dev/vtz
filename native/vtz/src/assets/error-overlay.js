@@ -141,13 +141,14 @@
         i > 0 ? 'border-top:1px solid #27272a' : '',
       ].join(';');
 
-      // Category dot
+      // Category dot — amber for warnings
+      var dotColor = (err.severity === 'warning') ? '#f59e0b' : color;
       var dot = document.createElement('span');
       dot.style.cssText = [
         'width:8px',
         'height:8px',
         'border-radius:50%',
-        'background:' + color,
+        'background:' + dotColor,
         'flex-shrink:0',
         'margin-top:4px',
       ].join(';');
@@ -157,10 +158,11 @@
       var content = document.createElement('div');
       content.style.cssText = 'flex:1;min-width:0;';
 
-      // Error message
+      // Error message — amber for warnings, red for errors
+      var isWarning = err.severity === 'warning';
       var msg = document.createElement('span');
       msg.textContent = err.message;
-      msg.style.cssText = 'color:#fca5a5;word-break:break-word;';
+      msg.style.cssText = 'color:' + (isWarning ? '#fcd34d' : '#fca5a5') + ';word-break:break-word;';
       content.appendChild(msg);
 
       // File link (inline, after message)
@@ -233,7 +235,8 @@
           if (!line && j === lines.length - 1) continue;
           var lineEl = document.createElement('div');
           if (line.charAt(0) === '>') {
-            lineEl.style.cssText = 'background:rgba(239,68,68,0.15);margin:0 -8px;padding:0 8px;';
+            var hlColor = isWarning ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.15)';
+            lineEl.style.cssText = 'background:' + hlColor + ';margin:0 -8px;padding:0 8px;';
           }
           lineEl.textContent = line;
           pre.appendChild(lineEl);

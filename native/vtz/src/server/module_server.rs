@@ -183,7 +183,9 @@ pub async fn handle_source_file(
             let warning_msg = &primary.message;
 
             let suggestion = suggestions::suggest_build_fix(warning_msg);
-            let mut error = DevError::build(warning_msg).with_file(&file_str);
+            let mut error = DevError::build(warning_msg)
+                .as_warning()
+                .with_file(&file_str);
 
             if let (Some(line), Some(col)) = (primary.line, primary.column) {
                 error = error.with_location(line, col);
