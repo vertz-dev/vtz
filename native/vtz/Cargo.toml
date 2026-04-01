@@ -49,6 +49,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
 uuid = { version = "1", features = ["v4"] }
 vertz-compiler-core = { path = "../vertz-compiler-core" }
+wry = { version = "0.49", optional = true }
+tao = { version = "0.32", optional = true, features = ["rwh_06"] }
 which = "7"
 oxc_transformer = "0.122.0"
 oxc_allocator = "0.122.0"
@@ -57,11 +59,19 @@ oxc_span = "0.122.0"
 oxc_codegen = "0.122.0"
 oxc_semantic = "0.122.0"
 
+[features]
+default = []
+desktop = ["wry", "tao"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[[example]]
+name = "webview_poc"
+required-features = ["desktop"]
 
 [[bench]]
 name = "crud_benchmark"

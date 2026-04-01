@@ -28,6 +28,72 @@ Three sign-offs required before implementation:
 - Developer walkthrough per feature
 - **Documentation phase** — if the feature touches public API, plan a phase (or include in the final phase) for updating README or relevant documentation
 
+## Phase Breakdown (post sign-off)
+
+After a design doc receives all three sign-offs, break each phase into its own markdown file. These are the actionable work units that agents pick up and implement.
+
+### Directory Structure
+
+```
+plans/
+  <feature-name>.md                   # design doc (high-level, stays as-is)
+  <feature-name>/
+    phase-00-<slug>.md                # one file per phase
+    phase-01-<slug>.md
+    phase-02-<slug>.md
+    ...
+```
+
+### Phase File Template
+
+```markdown
+# Phase N: <Phase Name>
+
+**Design Doc:** `plans/<feature-name>.md`
+**Issue:** #<number>
+
+## Context
+
+<1-3 paragraphs explaining what this phase accomplishes. Must be self-contained —
+an agent should understand the problem and solution without reading other phases.
+Reference the design doc for full architecture.>
+
+## Prerequisites
+
+- <Previous phase, external dependency, or "None">
+
+## Acceptance Criteria
+
+<BDD-style Given/When/Then or concrete checklist. Must be testable.>
+
+## Tasks
+
+### Task 1: <Descriptive Name>
+
+**Files:** (max 5)
+- `path/to/file.rs` (new | modify)
+- `path/to/file2.rs` (modify)
+
+<What to implement. Specific enough that an agent can start coding.>
+
+### Task 2: <Descriptive Name>
+
+**Files:** (max 5)
+- ...
+
+## Notes
+
+<Gotchas, edge cases, or non-obvious decisions. Optional.>
+```
+
+### Rules
+
+- **Self-contained** — an agent must be able to implement the phase from the file alone, without reading the design doc or other phases. Include enough context.
+- **Max 5 files per task** — keeps tasks reviewable and limits blast radius. If a task needs more than 5 files, split it.
+- **Tasks are ordered** — within a phase, tasks are executed sequentially. Earlier tasks may create files that later tasks modify.
+- **Acceptance criteria are concrete** — "it works" is not a criterion. Use BDD scenarios or explicit checklists.
+- **File paths are explicit** — every task lists exactly which files it touches and whether each is new or modified.
+
 ## Integration Tests
 
 - Must use public package imports (public crate APIs) — never relative
