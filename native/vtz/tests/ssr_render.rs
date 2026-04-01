@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use vertz_runtime::ssr::css_collector;
 use vertz_runtime::ssr::dom_shim;
 use vertz_runtime::ssr::html_document::{assemble_ssr_document, SsrHtmlOptions};
-use vertz_runtime::ssr::hydration;
 use vertz_runtime::ssr::render::{render_inline_ssr, render_to_html_sync, SsrOptions};
 use vertz_runtime::ssr::session::{extract_session_from_cookies, SsrSession};
 
@@ -180,48 +179,6 @@ fn test_css_collection_end_to_end() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Hydration Data Integration Tests
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_hydration_data_round_trip() {
-    let mut cache = std::collections::HashMap::new();
-    cache.insert(
-        "tasks".to_string(),
-        serde_json::json!({
-            "items": [
-                {"id": "1", "title": "Write SSR", "status": "done"},
-                {"id": "2", "title": "Add hydration", "status": "active"},
-            ],
-            "total": 2
-        }),
-    );
-    cache.insert(
-        "user".to_string(),
-        serde_json::json!({"id": "u1", "name": "Test User"}),
-    );
-
-    let data = hydration::HydrationData {
-        query_cache: cache,
-        render_timestamp: 1711612800000,
-        rendered_url: "/tasks".to_string(),
-    };
-
-    let script = hydration::serialize_hydration_data(&data);
-
-    // Verify it's a valid script tag
-    assert!(script.contains("<script>"));
-    assert!(script.contains("</script>"));
-    assert!(script.contains("window.__VERTZ_SSR_DATA__"));
-
-    // Verify data content (array format: [{ key, data }, ...])
-    assert!(script.contains("Write SSR"));
-    assert!(script.contains("Test User"));
-    assert!(script.contains("\"key\":\"tasks\""));
-    assert!(script.contains("\"key\":\"user\""));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Session Resolution Integration Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -282,7 +239,6 @@ fn test_full_ssr_document_structure() {
         ssr_content: "<h1>Tasks</h1><ul><li>Task 1</li><li>Task 2</li></ul>",
         inline_css: "  <style data-vertz-ssr>.task { color: blue; }</style>\n",
         theme_css: Some("body { margin: 0; }"),
-        hydration_script: "  <script>window.__VERTZ_SSR_DATA__ = {};</script>\n",
         entry_url: "/src/app.tsx",
         preload_hints: &hints,
         enable_hmr: false,
@@ -306,14 +262,6 @@ fn test_full_ssr_document_structure() {
         "Component CSS should be in <head>"
     );
 
-    // Hydration data before module script
-    let hydration_pos = html.find("__VERTZ_SSR_DATA__").unwrap();
-    let module_pos = html.find("type=\"module\"").unwrap();
-    assert!(
-        hydration_pos < module_pos,
-        "Hydration script should be before module"
-    );
-
     // Preload hints present
     assert!(html.contains("modulepreload"));
     assert!(html.contains("/@deps/@vertz/ui"));
@@ -330,11 +278,6 @@ fn test_ssr_render_full_pipeline() {
         // Inject CSS
         __vertz_inject_css('.header { background: #1a1a2e; color: white; }', 'header');
         __vertz_inject_css('.task { padding: 12px; border-bottom: 1px solid #eee; }', 'task');
-
-        // Set hydration data
-        globalThis.__vertz_ssr_queries = {
-            "task-list": { "items": [{ "id": "1", "title": "Test Task" }], "total": 1 }
-        };
 
         // Render the app
         const app = document.createElement('div');

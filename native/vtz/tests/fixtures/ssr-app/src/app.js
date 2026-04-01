@@ -64,8 +64,3 @@ app.appendChild(root);
 if (!document.body.querySelector('#app')) {
   document.body.appendChild(app);
 }
-
-// Set hydration data
-globalThis.__vertz_ssr_queries = {
-  "task-list": { "items": tasks.map((t, i) => ({ id: String(i), title: t })), "total": tasks.length }
-};

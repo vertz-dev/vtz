@@ -588,7 +588,6 @@ async fn dev_server_handler(
                                     ssr_content: &ssr_resp.content,
                                     inline_css: &css_string,
                                     theme_css: state.theme_css.as_deref(),
-                                    hydration_script: &ssr_resp.hydration_json,
                                     entry_url: &entry_url,
                                     preload_hints: &[],
                                     enable_hmr: true,

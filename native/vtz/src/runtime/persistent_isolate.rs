@@ -71,8 +71,6 @@ pub struct SsrResponse {
     pub content: String,
     /// CSS collected during rendering.
     pub css_entries: Vec<(String, Option<String>)>,
-    /// Hydration data JSON.
-    pub hydration_json: String,
     /// Whether rendering succeeded.
     pub is_ssr: bool,
     /// Error message if SSR failed.
@@ -88,7 +86,7 @@ enum IsolateMessage {
         IsolateRequest,
         oneshot::Sender<Result<IsolateResponse, String>>,
     ),
-    /// SSR render request: reset DOM, render app, collect CSS/hydration.
+    /// SSR render request: reset DOM, render app, collect CSS.
     Ssr(SsrRequest, oneshot::Sender<Result<SsrResponse, String>>),
 }
 
@@ -273,15 +271,6 @@ async fn isolate_event_loop(
     }
     if let Err(e) = crate::ssr::dom_shim::load_dom_shim(&mut runtime) {
         eprintln!("[Server] Failed to load DOM shim: {}", e);
-        return;
-    }
-
-    // Initialize SSR tracking globals
-    if let Err(e) = runtime.execute_script_void(
-        "[vertz:ssr-init]",
-        "globalThis.__vertz_ssr_queries = {}; globalThis.__vertz_ssr_mode = true;",
-    ) {
-        eprintln!("[Server] Failed to initialize SSR tracking: {}", e);
         return;
     }
 
@@ -628,7 +617,7 @@ const FETCH_INTERCEPTOR_JS: &str = r#"
 
 /// Reset DOM state between SSR requests.
 ///
-/// Clears document body, head, CSS collector, and SSR tracking. This ensures
+/// Clears document body, head, and CSS collector. This ensures
 /// each SSR render starts with a clean slate (no leaked state from previous renders).
 const SSR_RESET_JS: &str = r#"
 (function() {
@@ -645,10 +634,6 @@ const SSR_RESET_JS: &str = r#"
     if (typeof __vertz_clear_collected_css === 'function') {
         __vertz_clear_collected_css();
     }
-
-    // Reset SSR query tracking
-    globalThis.__vertz_ssr_queries = {};
-    globalThis.__vertz_ssr_mode = true;
 
     // Clear any previous render result
     delete globalThis.__vertz_last_ssr_result;
@@ -686,16 +671,9 @@ const SSR_RENDER_JS: &str = r#"
         cssEntries = __vertz_get_collected_css().map(e => ({ css: e.css, id: e.id || null }));
     }
 
-    // Collect hydration data
-    const hydrationData = {
-        url: globalThis.location.pathname,
-        queries: globalThis.__vertz_ssr_queries || {},
-    };
-
     return JSON.stringify({
         content: content,
         cssEntries: cssEntries,
-        hydrationJson: JSON.stringify(hydrationData),
         isSsr: content.length > 0,
     });
 })()
@@ -707,7 +685,7 @@ const SSR_RENDER_JS: &str = r#"
 /// 2. Sets location to the requested URL
 /// 3. Installs session data
 /// 4. Renders app content
-/// 5. Collects CSS and hydration data
+/// 5. Collects CSS
 fn dispatch_ssr_request(
     runtime: &mut crate::runtime::js_runtime::VertzJsRuntime,
     request: &SsrRequest,
@@ -768,12 +746,6 @@ fn dispatch_ssr_request(
         })
         .unwrap_or_default();
 
-    let hydration_json = parsed
-        .get("hydrationJson")
-        .and_then(|h| h.as_str())
-        .unwrap_or("{}")
-        .to_string();
-
     let is_ssr = parsed
         .get("isSsr")
         .and_then(|v| v.as_bool())
@@ -782,7 +754,6 @@ fn dispatch_ssr_request(
     Ok(SsrResponse {
         content,
         css_entries,
-        hydration_json,
         is_ssr,
         error: None,
         render_time_ms: elapsed,

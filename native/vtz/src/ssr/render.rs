@@ -6,12 +6,9 @@
 /// 3. Load the app entry module
 /// 4. Execute the app's render function to get an HTML string
 /// 5. Collect CSS injected during rendering
-/// 6. Collect hydration data
-/// 7. Assemble the complete HTML document
+/// 6. Assemble the complete HTML document
 ///
-/// Supports two modes:
-/// - **Single-pass:** Render once, capturing queries as they're registered
-/// - **Two-pass:** Pass 1 discovers queries, fetches data, Pass 2 renders with data
+/// Uses AOT single-pass rendering — data needs are resolved at compile time.
 use std::time::Instant;
 
 use deno_core::error::AnyError;
@@ -21,7 +18,6 @@ use crate::runtime::js_runtime::{VertzJsRuntime, VertzRuntimeOptions};
 use crate::ssr::css_collector;
 use crate::ssr::dom_shim;
 use crate::ssr::html_document::{assemble_ssr_document, entry_path_to_url, SsrHtmlOptions};
-use crate::ssr::hydration;
 use crate::ssr::session::{self, SsrSession};
 
 /// Result of an SSR render.
@@ -62,7 +58,7 @@ pub struct SsrOptions {
     pub enable_hmr: bool,
 }
 
-/// Perform SSR rendering: load the app, render to HTML, collect CSS and hydration data.
+/// Perform SSR rendering: load the app, render to HTML, and collect CSS.
 ///
 /// This is the main entry point for SSR. It creates a new V8 runtime for each
 /// request (isolated rendering context), loads the DOM shim and app entry,
@@ -140,12 +136,6 @@ fn render_ssr(options: &SsrOptions) -> Result<SsrResult, AnyError> {
     // Install session data
     session::install_session(&mut runtime, &options.session)?;
 
-    // Initialize SSR query tracking
-    runtime.execute_script_void(
-        "[vertz:ssr-init]",
-        "globalThis.__vertz_ssr_queries = {}; globalThis.__vertz_ssr_mode = true;",
-    )?;
-
     // Load and execute the app entry module
     let entry_specifier =
         deno_core::ModuleSpecifier::from_file_path(&options.entry_file).map_err(|_| {
@@ -169,10 +159,6 @@ fn render_ssr(options: &SsrOptions) -> Result<SsrResult, AnyError> {
     let css_entries = css_collector::collect_css(&mut runtime)?;
     let css_string = css_collector::format_css_as_style_tags(&css_entries);
 
-    // Collect hydration data
-    let hydration_data = hydration::collect_hydration_data(&mut runtime, &options.url)?;
-    let hydration_script = hydration::serialize_hydration_data(&hydration_data);
-
     let entry_url = entry_path_to_url(&options.entry_file, &options.root_dir);
 
     let html = assemble_ssr_document(&SsrHtmlOptions {
@@ -180,7 +166,6 @@ fn render_ssr(options: &SsrOptions) -> Result<SsrResult, AnyError> {
         ssr_content: &content,
         inline_css: &css_string,
         theme_css: options.theme_css.as_deref(),
-        hydration_script: &hydration_script,
         entry_url: &entry_url,
         preload_hints: &options.preload_hints,
         enable_hmr: options.enable_hmr,
@@ -255,7 +240,6 @@ fn fallback_client_shell(
         ssr_content: "",
         inline_css: "",
         theme_css: options.theme_css.as_deref(),
-        hydration_script: "",
         entry_url: &entry_url,
         preload_hints: &options.preload_hints,
         enable_hmr: options.enable_hmr,
@@ -288,12 +272,6 @@ pub fn render_inline_ssr(js_code: &str, url: &str) -> Result<SsrResult, AnyError
     dom_shim::load_dom_shim(&mut runtime)?;
     dom_shim::set_ssr_location(&mut runtime, url)?;
 
-    // Initialize SSR tracking
-    runtime.execute_script_void(
-        "[vertz:ssr-init]",
-        "globalThis.__vertz_ssr_queries = {}; globalThis.__vertz_ssr_mode = true;",
-    )?;
-
     // Execute the provided code
     runtime.execute_script_void("[vertz:inline-ssr]", js_code)?;
 
@@ -303,9 +281,6 @@ pub fn render_inline_ssr(js_code: &str, url: &str) -> Result<SsrResult, AnyError
     // Collect CSS
     let css_entries = css_collector::collect_css(&mut runtime)?;
     let css_string = css_collector::format_css_as_style_tags(&css_entries);
-
-    // Collect hydration data
-    let _hydration_data = hydration::collect_hydration_data(&mut runtime, url)?;
 
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -385,24 +360,6 @@ mod tests {
 
         assert!(!result.css.is_empty());
         assert!(result.css.contains(".btn { color: red; }"));
-    }
-
-    #[test]
-    fn test_render_inline_with_hydration_data() {
-        let result = render_inline_ssr(
-            r#"
-            globalThis.__vertz_ssr_queries = {
-                "tasks": { "items": [{ "id": "1", "title": "Test" }] }
-            };
-
-            const app = document.getElementById('app');
-            app.appendChild(document.createTextNode('Tasks loaded'));
-            "#,
-            "/tasks",
-        )
-        .unwrap();
-
-        assert_eq!(result.content, "Tasks loaded");
     }
 
     #[test]
