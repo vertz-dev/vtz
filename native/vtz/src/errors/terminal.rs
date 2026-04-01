@@ -21,18 +21,27 @@ use super::categories::DevError;
 ///  Suggestion: Check for unclosed quotes or brackets on previous lines
 /// ```
 pub fn format_error(error: &DevError, root_dir: Option<&Path>) -> String {
+    use super::categories::Severity;
+
     let mut out = String::new();
 
+    let is_warning = error.severity == Severity::Warning;
+
     // Header: category badge + file location
-    let badge = match error.category {
-        super::categories::ErrorCategory::Build => " BUILD ERROR ",
-        super::categories::ErrorCategory::Resolve => " RESOLVE ERROR ",
-        super::categories::ErrorCategory::TypeCheck => " TYPECHECK ERROR ",
-        super::categories::ErrorCategory::Ssr => " SSR ERROR ",
-        super::categories::ErrorCategory::Runtime => " RUNTIME ERROR ",
+    let badge = match (&error.category, is_warning) {
+        (super::categories::ErrorCategory::Build, true) => " BUILD WARNING ",
+        (super::categories::ErrorCategory::Build, false) => " BUILD ERROR ",
+        (super::categories::ErrorCategory::Resolve, _) => " RESOLVE ERROR ",
+        (super::categories::ErrorCategory::TypeCheck, _) => " TYPECHECK ERROR ",
+        (super::categories::ErrorCategory::Ssr, _) => " SSR ERROR ",
+        (super::categories::ErrorCategory::Runtime, _) => " RUNTIME ERROR ",
     };
 
-    out.push_str(&format!("\n{}", badge.white().on_red().bold()));
+    if is_warning {
+        out.push_str(&format!("\n{}", badge.black().on_yellow().bold()));
+    } else {
+        out.push_str(&format!("\n{}", badge.white().on_red().bold()));
+    }
 
     if let Some(ref file) = error.file {
         let display_path = make_relative(file, root_dir);
