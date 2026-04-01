@@ -33,6 +33,20 @@ pub fn write_lockfile(path: &Path, lockfile: &Lockfile) -> Result<(), std::io::E
             }
         }
 
+        if !entry.bin.is_empty() {
+            output.push_str("  bin:\n");
+            for (bin_name, bin_path) in &entry.bin {
+                output.push_str(&format!("    \"{}\" \"{}\"\n", bin_name, bin_path));
+            }
+        }
+
+        if !entry.scripts.is_empty() {
+            output.push_str("  scripts:\n");
+            for (script_name, script_cmd) in &entry.scripts {
+                output.push_str(&format!("    \"{}\" \"{}\"\n", script_name, script_cmd));
+            }
+        }
+
         output.push('\n');
     }
 
@@ -56,10 +70,12 @@ pub fn parse_lockfile(content: &str) -> Result<Lockfile, Box<dyn std::error::Err
         resolved: String::new(),
         integrity: String::new(),
         dependencies: BTreeMap::new(),
+        bin: BTreeMap::new(),
+        scripts: BTreeMap::new(),
         optional: false,
         overridden: false,
     };
-    let mut in_dependencies = false;
+    let mut in_section: Option<&'static str> = None;
 
     for line in content.lines() {
         // Skip comments and empty lines
@@ -75,18 +91,23 @@ pub fn parse_lockfile(content: &str) -> Result<Lockfile, Box<dyn std::error::Err
                     resolved: String::new(),
                     integrity: String::new(),
                     dependencies: BTreeMap::new(),
+                    bin: BTreeMap::new(),
+                    scripts: BTreeMap::new(),
                     optional: false,
                     overridden: false,
                 };
-                in_dependencies = false;
+                in_section = None;
             }
             continue;
         }
 
         let trimmed = line.trim();
 
+        // Subsection headers that are NOT top-level entry keys
+        const SECTION_HEADERS: &[&str] = &["dependencies:", "bin:", "scripts:"];
+
         // New entry: "name@range:" at column 0
-        if !line.starts_with(' ') && trimmed.ends_with(':') && trimmed != "dependencies:" {
+        if !line.starts_with(' ') && trimmed.ends_with(':') && !SECTION_HEADERS.contains(&trimmed) {
             // Save previous entry if exists
             if let Some(key) = current_key.take() {
                 lockfile.entries.insert(key, current_entry.clone());
@@ -97,10 +118,12 @@ pub fn parse_lockfile(content: &str) -> Result<Lockfile, Box<dyn std::error::Err
                     resolved: String::new(),
                     integrity: String::new(),
                     dependencies: BTreeMap::new(),
+                    bin: BTreeMap::new(),
+                    scripts: BTreeMap::new(),
                     optional: false,
                     overridden: false,
                 };
-                in_dependencies = false;
+                in_section = None;
             }
 
             let spec = &trimmed[..trimmed.len() - 1]; // Remove trailing ':'
@@ -115,27 +138,51 @@ pub fn parse_lockfile(content: &str) -> Result<Lockfile, Box<dyn std::error::Err
         // Inside an entry
         if current_key.is_some() {
             if trimmed == "dependencies:" {
-                in_dependencies = true;
+                in_section = Some("dependencies");
+                continue;
+            }
+            if trimmed == "bin:" {
+                in_section = Some("bin");
+                continue;
+            }
+            if trimmed == "scripts:" {
+                in_section = Some("scripts");
                 continue;
             }
 
-            if in_dependencies {
-                // Parse dependency line: "dep-name" "dep-range"
-                if let Some((name, range)) = parse_quoted_pair(trimmed) {
-                    current_entry
-                        .dependencies
-                        .insert(name.to_string(), range.to_string());
+            match in_section {
+                Some("dependencies") => {
+                    if let Some((name, range)) = parse_quoted_pair(trimmed) {
+                        current_entry
+                            .dependencies
+                            .insert(name.to_string(), range.to_string());
+                    }
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("version ") {
-                current_entry.version = unquote(rest).to_string();
-            } else if let Some(rest) = trimmed.strip_prefix("resolved ") {
-                current_entry.resolved = unquote(rest).to_string();
-            } else if let Some(rest) = trimmed.strip_prefix("integrity ") {
-                current_entry.integrity = unquote(rest).to_string();
-            } else if trimmed == "optional true" {
-                current_entry.optional = true;
-            } else if trimmed == "overridden true" {
-                current_entry.overridden = true;
+                Some("bin") => {
+                    if let Some((name, path)) = parse_quoted_pair(trimmed) {
+                        current_entry.bin.insert(name.to_string(), path.to_string());
+                    }
+                }
+                Some("scripts") => {
+                    if let Some((name, cmd)) = parse_quoted_pair(trimmed) {
+                        current_entry
+                            .scripts
+                            .insert(name.to_string(), cmd.to_string());
+                    }
+                }
+                _ => {
+                    if let Some(rest) = trimmed.strip_prefix("version ") {
+                        current_entry.version = unquote(rest).to_string();
+                    } else if let Some(rest) = trimmed.strip_prefix("resolved ") {
+                        current_entry.resolved = unquote(rest).to_string();
+                    } else if let Some(rest) = trimmed.strip_prefix("integrity ") {
+                        current_entry.integrity = unquote(rest).to_string();
+                    } else if trimmed == "optional true" {
+                        current_entry.optional = true;
+                    } else if trimmed == "overridden true" {
+                        current_entry.overridden = true;
+                    }
+                }
             }
         }
     }
@@ -196,6 +243,8 @@ mod tests {
                 resolved: "https://registry.npmjs.org/react/-/react-18.3.1.tgz".to_string(),
                 integrity: "sha512-abc123".to_string(),
                 dependencies: deps,
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -210,6 +259,8 @@ mod tests {
                 resolved: "https://registry.npmjs.org/zod/-/zod-3.24.4.tgz".to_string(),
                 integrity: "sha512-def456".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -257,6 +308,8 @@ mod tests {
                 resolved: "url1".to_string(),
                 integrity: "hash1".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -270,6 +323,8 @@ mod tests {
                 resolved: "url2".to_string(),
                 integrity: "hash2".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -298,6 +353,8 @@ mod tests {
                 resolved: "url".to_string(),
                 integrity: "hash".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -311,6 +368,8 @@ mod tests {
                 resolved: "url".to_string(),
                 integrity: "hash".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -381,6 +440,8 @@ mod tests {
                 resolved: "https://registry.npmjs.org/zod/-/zod-3.24.4.tgz".to_string(),
                 integrity: "sha512-abc".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -396,6 +457,8 @@ mod tests {
                 resolved: "link:packages/shared".to_string(),
                 integrity: String::new(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -447,6 +510,8 @@ mod tests {
                 resolved: "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz".to_string(),
                 integrity: "sha512-abc".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: true,
                 overridden: false,
             },
@@ -460,6 +525,8 @@ mod tests {
                 resolved: "https://registry.npmjs.org/zod/-/zod-3.24.4.tgz".to_string(),
                 integrity: "sha512-def".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -512,6 +579,8 @@ fsevents@^2.3.0:
                 resolved: "https://registry.npmjs.org/qs/-/qs-6.11.0.tgz".to_string(),
                 integrity: "sha512-abc".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: true,
             },
@@ -525,6 +594,8 @@ fsevents@^2.3.0:
                 resolved: "https://registry.npmjs.org/zod/-/zod-3.24.4.tgz".to_string(),
                 integrity: "sha512-def".to_string(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
@@ -554,5 +625,121 @@ zod@^3.24.0:
 "#;
         let lockfile = parse_lockfile(content).unwrap();
         assert!(!lockfile.entries["zod@^3.24.0"].overridden);
+    }
+
+    #[test]
+    fn test_write_and_read_bin_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vertz.lock");
+
+        let mut lockfile = Lockfile::default();
+        let mut bin = BTreeMap::new();
+        bin.insert("esbuild".to_string(), "bin/esbuild".to_string());
+
+        lockfile.entries.insert(
+            "esbuild@^0.20.0".to_string(),
+            LockfileEntry {
+                name: "esbuild".to_string(),
+                range: "^0.20.0".to_string(),
+                version: "0.20.2".to_string(),
+                resolved: "https://registry.npmjs.org/esbuild/-/esbuild-0.20.2.tgz".to_string(),
+                integrity: "sha512-abc".to_string(),
+                dependencies: BTreeMap::new(),
+                bin,
+                scripts: BTreeMap::new(),
+                optional: false,
+                overridden: false,
+            },
+        );
+
+        write_lockfile(&path, &lockfile).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("bin:"));
+        assert!(content.contains("\"esbuild\" \"bin/esbuild\""));
+
+        let parsed = read_lockfile(&path).unwrap();
+        let entry = &parsed.entries["esbuild@^0.20.0"];
+        assert_eq!(entry.bin.len(), 1);
+        assert_eq!(entry.bin["esbuild"], "bin/esbuild");
+    }
+
+    #[test]
+    fn test_write_and_read_scripts_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vertz.lock");
+
+        let mut lockfile = Lockfile::default();
+        let mut scripts = BTreeMap::new();
+        scripts.insert(
+            "postinstall".to_string(),
+            "node scripts/build.js".to_string(),
+        );
+
+        lockfile.entries.insert(
+            "esbuild@^0.20.0".to_string(),
+            LockfileEntry {
+                name: "esbuild".to_string(),
+                range: "^0.20.0".to_string(),
+                version: "0.20.2".to_string(),
+                resolved: "https://registry.npmjs.org/esbuild/-/esbuild-0.20.2.tgz".to_string(),
+                integrity: "sha512-abc".to_string(),
+                dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts,
+                optional: false,
+                overridden: false,
+            },
+        );
+
+        write_lockfile(&path, &lockfile).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("scripts:"));
+        assert!(content.contains("\"postinstall\" \"node scripts/build.js\""));
+
+        let parsed = read_lockfile(&path).unwrap();
+        let entry = &parsed.entries["esbuild@^0.20.0"];
+        assert_eq!(entry.scripts.len(), 1);
+        assert_eq!(entry.scripts["postinstall"], "node scripts/build.js");
+    }
+
+    #[test]
+    fn test_parse_lockfile_with_bin_and_scripts() {
+        let content = r#"# vertz.lock v1 — DO NOT EDIT
+# Run "vertz install" to regenerate
+
+esbuild@^0.20.0:
+  version "0.20.2"
+  resolved "https://registry.npmjs.org/esbuild/-/esbuild-0.20.2.tgz"
+  integrity "sha512-abc"
+  bin:
+    "esbuild" "bin/esbuild"
+  scripts:
+    "postinstall" "node scripts/build.js"
+
+"#;
+        let lockfile = parse_lockfile(content).unwrap();
+        let entry = &lockfile.entries["esbuild@^0.20.0"];
+        assert_eq!(entry.version, "0.20.2");
+        assert_eq!(entry.bin["esbuild"], "bin/esbuild");
+        assert_eq!(entry.scripts["postinstall"], "node scripts/build.js");
+    }
+
+    #[test]
+    fn test_lockfile_without_bin_scripts_defaults_empty() {
+        let content = r#"# vertz.lock v1 — DO NOT EDIT
+# Run "vertz install" to regenerate
+
+zod@^3.24.0:
+  version "3.24.4"
+  resolved "url"
+  integrity "hash"
+
+"#;
+        let lockfile = parse_lockfile(content).unwrap();
+        let entry = &lockfile.entries["zod@^3.24.0"];
+        assert!(entry.bin.is_empty());
+        assert!(entry.scripts.is_empty());
     }
 }

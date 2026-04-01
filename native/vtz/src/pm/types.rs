@@ -141,6 +141,11 @@ pub struct LockfileEntry {
     pub resolved: String,
     pub integrity: String,
     pub dependencies: BTreeMap<String, String>,
+    /// Binary executables exposed by this package (name → relative path)
+    pub bin: BTreeMap<String, String>,
+    /// Package scripts (e.g., postinstall). Stored so lockfile-only resolution
+    /// can detect packages that need script execution without fetching metadata.
+    pub scripts: BTreeMap<String, String>,
     pub optional: bool,
     /// Whether this version was forced by an override
     pub overridden: bool,
