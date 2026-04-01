@@ -4,8 +4,7 @@
 /// - Standard HTML5 boilerplate (DOCTYPE, charset, viewport)
 /// - Inline CSS (theme + component CSS) in `<head>`
 /// - Pre-rendered HTML in `<div id="app">`
-/// - Hydration data script
-/// - Module script for client hydration
+/// - Module script for client entry
 /// - Module preload hints
 /// - HMR scripts (in dev mode)
 use std::path::Path;
@@ -32,8 +31,6 @@ pub struct SsrHtmlOptions<'a> {
     pub inline_css: &'a str,
     /// Theme CSS from the project.
     pub theme_css: Option<&'a str>,
-    /// Hydration data script tag (already formatted).
-    pub hydration_script: &'a str,
     /// Path to the entry file (relative to root).
     pub entry_url: &'a str,
     /// Module preload hints.
@@ -58,7 +55,6 @@ pub struct SsrHtmlOptions<'a> {
 /// </head>
 /// <body>
 ///   <div id="app"><!-- SSR content --></div>
-///   <script>window.__VERTZ_SSR_DATA__ = {...};</script>
 ///   <!-- HMR scripts (dev only) -->
 ///   <script type="module" src="..."></script>
 /// </body>
@@ -112,11 +108,6 @@ pub fn assemble_ssr_document(options: &SsrHtmlOptions<'_>) -> String {
         "  <div id=\"app\">{}</div>\n",
         options.ssr_content
     ));
-
-    // Hydration data (before app script so it's available on load)
-    if !options.hydration_script.is_empty() {
-        html.push_str(options.hydration_script);
-    }
 
     // HMR scripts (dev mode only, before app module)
     if options.enable_hmr {
@@ -175,7 +166,6 @@ mod tests {
             ssr_content: "<div>Hello World</div>",
             inline_css: "",
             theme_css: None,
-            hydration_script: "",
             entry_url: "/src/app.tsx",
             preload_hints: &[],
             enable_hmr: false,
@@ -271,22 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hydration_script_before_app_module() {
-        let opts = SsrHtmlOptions {
-            hydration_script: "  <script>window.__VERTZ_SSR_DATA__ = {};</script>\n",
-            ..default_options()
-        };
-        let html = assemble_ssr_document(&opts);
-
-        let hydration_pos = html.find("__VERTZ_SSR_DATA__").unwrap();
-        let module_pos = html.find("<script type=\"module\" src=").unwrap();
-        assert!(
-            hydration_pos < module_pos,
-            "Hydration data should come before the app module"
-        );
-    }
-
-    #[test]
     fn test_hmr_scripts_included_when_enabled() {
         let opts = SsrHtmlOptions {
             enable_hmr: true,
@@ -366,8 +340,6 @@ mod tests {
             ssr_content: "<h1>Tasks</h1><ul><li>Task 1</li></ul>",
             inline_css: "  <style data-vertz-ssr>.task { color: blue; }</style>\n",
             theme_css: Some("body { margin: 0; font-family: sans-serif; }"),
-            hydration_script:
-                "  <script>window.__VERTZ_SSR_DATA__ = {\"queryCache\":{}};</script>\n",
             entry_url: "/src/app.tsx",
             preload_hints: &hints,
             enable_hmr: true,
@@ -381,7 +353,6 @@ mod tests {
         let component_css_pos = html.find("data-vertz-ssr").unwrap();
         let body_pos = html.find("<body>").unwrap();
         let app_pos = html.find("<div id=\"app\">").unwrap();
-        let hydration_pos = html.find("__VERTZ_SSR_DATA__").unwrap();
         let hmr_pos = html.find("__vertz_hmr").unwrap();
         let module_pos = html.find("<script type=\"module\"").unwrap();
 
@@ -390,8 +361,7 @@ mod tests {
         assert!(theme_pos < component_css_pos);
         assert!(component_css_pos < body_pos);
         assert!(body_pos < app_pos);
-        assert!(app_pos < hydration_pos);
-        assert!(hydration_pos < hmr_pos);
+        assert!(app_pos < hmr_pos);
         assert!(hmr_pos < module_pos);
 
         // Verify content
