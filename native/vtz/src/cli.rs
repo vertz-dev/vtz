@@ -108,6 +108,21 @@ pub struct DevArgs {
     /// Custom name for proxy subdomain override (e.g., --name dashboard → https://dashboard.localhost)
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Open the app in a native desktop window instead of a browser tab (requires desktop feature)
+    #[cfg(feature = "desktop")]
+    #[arg(long)]
+    pub desktop: bool,
+
+    /// Initial window width in pixels (only with --desktop)
+    #[cfg(feature = "desktop")]
+    #[arg(long, default_value_t = 1024, requires = "desktop")]
+    pub width: u32,
+
+    /// Initial window height in pixels (only with --desktop)
+    #[cfg(feature = "desktop")]
+    #[arg(long, default_value_t = 768, requires = "desktop")]
+    pub height: u32,
 }
 
 #[derive(Parser, Debug)]

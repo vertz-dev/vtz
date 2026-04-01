@@ -60,11 +60,16 @@ pub struct WebviewApp {
     event_loop: EventLoop<UserEvent>,
     window: Window,
     opts: WebviewOptions,
+    /// Fires when the window is closed (signals background threads to shut down).
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl WebviewApp {
     /// Create a new webview app. Must be called on the main thread.
-    pub fn new(opts: WebviewOptions) -> Result<Self, WebviewError> {
+    ///
+    /// Returns the app and a receiver that fires when the window is closed.
+    /// Use this receiver to trigger graceful shutdown of background services.
+    pub fn new(opts: WebviewOptions) -> Result<(Self, oneshot::Receiver<()>), WebviewError> {
         let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
 
         let window = WindowBuilder::new()
@@ -74,11 +79,17 @@ impl WebviewApp {
             .build(&event_loop)
             .map_err(|e| WebviewError::WindowCreation(e.to_string()))?;
 
-        Ok(Self {
-            event_loop,
-            window,
-            opts,
-        })
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        Ok((
+            Self {
+                event_loop,
+                window,
+                opts,
+                shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            },
+            shutdown_rx,
+        ))
     }
 
     /// Get a cloneable, Send-able proxy for sending events from background threads.
@@ -93,12 +104,13 @@ impl WebviewApp {
             .with_url("about:blank")
             .with_devtools(self.opts.devtools)
             .with_ipc_handler(|req| {
-                // IPC handler for future use — currently logs messages
                 let body = req.body();
                 eprintln!("[vtz webview ipc] {}", body);
             })
             .build(&self.window)
             .expect("failed to build webview");
+
+        let shutdown_tx = self.shutdown_tx;
 
         self.event_loop
             .run(move |event, _event_loop, control_flow| {
@@ -109,6 +121,10 @@ impl WebviewApp {
                         event: WindowEvent::CloseRequested,
                         ..
                     } => {
+                        // Signal background threads to shut down
+                        if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
                         *control_flow = ControlFlow::Exit;
                     }
 
@@ -140,6 +156,10 @@ impl WebviewApp {
                             }
                         }
                         UserEvent::Quit => {
+                            // Signal background threads to shut down
+                            if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
                             *control_flow = ControlFlow::Exit;
                         }
                     },
@@ -222,7 +242,6 @@ mod tests {
         match &evt {
             UserEvent::EvalScript { js, tx } => {
                 assert_eq!(js, "document.title");
-                // The sender should be present
                 assert!(tx.lock().unwrap().is_some());
             }
             _ => panic!("expected EvalScript variant"),
@@ -236,9 +255,7 @@ mod tests {
         if let UserEvent::EvalScript { tx, .. } = evt {
             let sender = tx.lock().unwrap().take();
             assert!(sender.is_some());
-            // After taking, it should be None
             assert!(tx.lock().unwrap().is_none());
-            // Send a value and verify it arrives
             sender.unwrap().send("result".to_string()).unwrap();
             assert_eq!(rx.blocking_recv().unwrap(), "result");
         }

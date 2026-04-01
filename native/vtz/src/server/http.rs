@@ -874,7 +874,22 @@ pub fn mime_type_for_path(path: &str) -> &'static str {
 /// This function binds to the configured port (with auto-increment on conflict),
 /// prints the startup banner, starts the file watcher, and serves until a
 /// shutdown signal is received.
+/// Optional channels for external lifecycle control (used by desktop mode).
+pub struct ServerLifecycle {
+    /// Sends the actual bound port when the server is ready to accept connections.
+    pub ready_tx: tokio::sync::oneshot::Sender<u16>,
+    /// Receives a signal to shut down the server (e.g., when the webview window closes).
+    pub shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
 pub async fn start_server(config: ServerConfig) -> io::Result<()> {
+    start_server_with_lifecycle(config, None).await
+}
+
+pub async fn start_server_with_lifecycle(
+    config: ServerConfig,
+    lifecycle: Option<ServerLifecycle>,
+) -> io::Result<()> {
     let start = Instant::now();
 
     let bind = try_bind(&config).await?;
@@ -882,6 +897,17 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
 
     let mut actual_config = config.clone();
     actual_config.port = actual_port;
+
+    // Split lifecycle channels
+    let (ready_tx, shutdown_rx) = match lifecycle {
+        Some(lc) => (Some(lc.ready_tx), Some(lc.shutdown_rx)),
+        None => (None, None),
+    };
+
+    // Notify the caller that the server is ready (desktop mode uses this)
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(actual_port);
+    }
 
     // Discover upstream deps early so the banner can show them
     let upstream_package_names: Vec<String> = if config.watch_deps {
@@ -1350,8 +1376,20 @@ pub async fn start_server(config: ServerConfig) -> io::Result<()> {
         }
     }
 
+    let shutdown_future = async move {
+        if let Some(rx) = shutdown_rx {
+            // Desktop mode: wait for either external shutdown or OS signal
+            tokio::select! {
+                _ = shutdown_signal() => {},
+                _ = rx => {},
+            }
+        } else {
+            shutdown_signal().await;
+        }
+    };
+
     let result = axum::serve(bind.listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_future)
         .await
         .map_err(io::Error::other);
 

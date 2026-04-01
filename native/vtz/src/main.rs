@@ -8,38 +8,115 @@ use vertz_runtime::config::{resolve_auto_install, ServerConfig};
 use vertz_runtime::pm;
 use vertz_runtime::pm::output::{error_code_from_message, JsonOutput, PmOutput, TextOutput};
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
+    // Desktop mode: webview event loop on main thread, tokio on background
+    #[cfg(feature = "desktop")]
+    if let Command::Dev(ref args) = cli.command {
+        if args.desktop {
+            run_desktop_mode(cli);
+            return;
+        }
+    }
+
+    // Normal mode: tokio runtime on main thread
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async_main(cli));
+}
+
+/// Build a ServerConfig from DevArgs (shared between normal and desktop mode).
+fn build_dev_config(args: &cli::DevArgs) -> ServerConfig {
+    let mut config = ServerConfig::new(args.port, args.host.clone(), args.public_dir.clone());
+    config.enable_typecheck = !args.no_typecheck;
+    config.open_browser = args.open;
+    config.tsconfig_path = args.tsconfig.clone();
+    config.typecheck_binary = args.typecheck_binary.clone();
+    config.auto_install =
+        resolve_auto_install(args.no_auto_install, args.auto_install, &config.root_dir);
+    config.watch_deps = !args.no_watch_deps;
+
+    let vertzrc = vertz_runtime::pm::vertzrc::load_vertzrc(&config.root_dir).unwrap_or_default();
+    config.plugin = vertz_runtime::config::resolve_plugin_choice(
+        args.plugin.as_deref(),
+        vertzrc.plugin.as_deref(),
+        &config.root_dir,
+    );
+    config.extra_watch_paths = vertzrc.extra_watch_paths;
+    config.proxy_name = args.name.clone();
+    config
+}
+
+#[cfg(feature = "desktop")]
+fn run_desktop_mode(cli: Cli) {
+    use vertz_runtime::server::http::{start_server_with_lifecycle, ServerLifecycle};
+    use vertz_runtime::webview::{UserEvent, WebviewApp, WebviewOptions};
+
+    let Command::Dev(args) = cli.command else {
+        unreachable!()
+    };
+
+    let config = build_dev_config(&args);
+
+    // Derive window title from project name or directory
+    let title = config
+        .root_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "VTZ".to_string());
+
+    let (app, shutdown_rx) = WebviewApp::new(WebviewOptions {
+        title,
+        width: args.width,
+        height: args.height,
+        hidden: false,
+        devtools: cfg!(debug_assertions),
+    })
+    .expect("failed to create webview");
+
+    let proxy = app.proxy();
+
+    // Background thread: tokio runtime + dev server
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(async move {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
+
+            // Forward ready notification to webview
+            let proxy_for_ready = proxy.clone();
+            tokio::spawn(async move {
+                if let Ok(port) = ready_rx.await {
+                    let _ = proxy_for_ready.send_event(UserEvent::ServerReady { port });
+                }
+            });
+
+            // Forward webview close to server shutdown
+            tokio::spawn(async move {
+                let _ = shutdown_rx.await;
+                let _ = shutdown_tx.send(());
+            });
+
+            let lifecycle = ServerLifecycle {
+                ready_tx,
+                shutdown_rx: server_shutdown_rx,
+            };
+
+            if let Err(e) = start_server_with_lifecycle(config, Some(lifecycle)).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        });
+    });
+
+    // Main thread: run the native event loop (blocks forever)
+    app.run();
+}
+
+async fn async_main(cli: Cli) {
     match cli.command {
         Command::Dev(args) => {
-            let mut config = ServerConfig::new(args.port, args.host, args.public_dir);
-            config.enable_typecheck = !args.no_typecheck;
-            config.open_browser = args.open;
-            config.tsconfig_path = args.tsconfig;
-            config.typecheck_binary = args.typecheck_binary;
-
-            // Resolve auto_install: CLI flag > .vertzrc > CI guard > default
-            config.auto_install =
-                resolve_auto_install(args.no_auto_install, args.auto_install, &config.root_dir);
-
-            // Wire --no-watch-deps flag
-            config.watch_deps = !args.no_watch_deps;
-
-            // Load .vertzrc once and extract all fields from it
-            let vertzrc =
-                vertz_runtime::pm::vertzrc::load_vertzrc(&config.root_dir).unwrap_or_default();
-
-            // Resolve plugin choice: CLI flag > .vertzrc > auto-detect > default
-            config.plugin = vertz_runtime::config::resolve_plugin_choice(
-                args.plugin.as_deref(),
-                vertzrc.plugin.as_deref(),
-                &config.root_dir,
-            );
-
-            config.extra_watch_paths = vertzrc.extra_watch_paths;
-            config.proxy_name = args.name;
+            let config = build_dev_config(&args);
 
             if let Err(e) = vertz_runtime::server::http::start_server(config).await {
                 eprintln!("Error: {}", e);

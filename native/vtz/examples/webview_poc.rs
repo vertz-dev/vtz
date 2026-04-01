@@ -20,7 +20,7 @@ fn main() {
     let start = Instant::now();
 
     // 1. Create WebviewApp on main thread (hidden mode for POC)
-    let app = WebviewApp::new(WebviewOptions {
+    let (app, _shutdown_rx) = WebviewApp::new(WebviewOptions {
         title: "VTZ POC".to_string(),
         hidden: true,
         devtools: false,
