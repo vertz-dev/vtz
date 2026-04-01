@@ -128,13 +128,24 @@ pub fn build_router(
         }
     }
 
-    let pipeline = CompilationPipeline::new(
+    let css_transform =
+        crate::compiler::postcss::find_postcss_config(&config.root_dir).map(|config_path| {
+            std::sync::Arc::new(crate::compiler::postcss::PostCssCssTransform::new(
+                config_path,
+            )) as std::sync::Arc<dyn crate::compiler::css_transform::CssTransform>
+        });
+
+    let mut pipeline = CompilationPipeline::new(
         config.root_dir.clone(),
         config.src_dir.clone(),
         plugin.clone(),
     )
     .with_tsconfig_paths(tsconfig_paths)
     .with_env(public_env);
+
+    if let Some(transform) = css_transform {
+        pipeline = pipeline.with_css_transform(transform);
+    }
 
     // Load theme CSS from the project (if available)
     let theme_css = theme_css::load_theme_css(&config.root_dir);

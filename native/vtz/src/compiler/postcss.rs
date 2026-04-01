@@ -158,6 +158,36 @@ struct RunnerError {
     column: Option<u32>,
 }
 
+/// A [`CssTransform`] implementation that processes CSS through PostCSS.
+///
+/// Created when a PostCSS config file is detected in the project root.
+/// Use [`find_postcss_config`] to detect config, then construct this transform.
+pub struct PostCssCssTransform {
+    config_path: PathBuf,
+}
+
+impl PostCssCssTransform {
+    pub fn new(config_path: PathBuf) -> Self {
+        Self { config_path }
+    }
+}
+
+impl crate::compiler::css_transform::CssTransform for PostCssCssTransform {
+    fn process(
+        &self,
+        file_path: &Path,
+        root_dir: &Path,
+    ) -> Result<String, Vec<crate::compiler::pipeline::CompileError>> {
+        process_css(root_dir, file_path, &self.config_path).map_err(|err| {
+            vec![crate::compiler::pipeline::CompileError {
+                message: err.message,
+                line: err.line,
+                column: err.column,
+            }]
+        })
+    }
+}
+
 pub fn find_postcss_config(root_dir: &Path) -> Option<PathBuf> {
     POSTCSS_CONFIG_FILES
         .iter()

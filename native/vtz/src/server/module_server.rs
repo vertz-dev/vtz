@@ -2143,16 +2143,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_source_file_css_runs_postcss_when_config_exists() {
+        use crate::compiler::postcss::{find_postcss_config, PostCssCssTransform};
+
         let tmp = tempfile::tempdir().unwrap();
-        let state = create_test_state(tmp.path());
         let node_modules = tmp.path().join("node_modules");
+        let src_dir = tmp.path().join("src");
+        let deps_dir = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&deps_dir).unwrap();
         std::fs::create_dir_all(node_modules.join("postcss")).unwrap();
         std::fs::create_dir_all(node_modules.join("fake-prefixer")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/styles.css"),
-            "body { display: flex; }\n",
-        )
-        .unwrap();
+        std::fs::write(src_dir.join("styles.css"), "body { display: flex; }\n").unwrap();
         std::fs::write(
             tmp.path().join("postcss.config.js"),
             "module.exports = { plugins: { 'fake-prefixer': {} } };",
@@ -2191,6 +2192,37 @@ mod tests {
         )
         .unwrap();
 
+        let config_path = find_postcss_config(tmp.path()).expect("config should exist");
+        let transform = Arc::new(PostCssCssTransform::new(config_path));
+        let pipeline =
+            CompilationPipeline::new(tmp.path().to_path_buf(), src_dir.clone(), test_plugin())
+                .with_css_transform(transform);
+
+        let state = Arc::new(DevServerState {
+            plugin: test_plugin(),
+            pipeline,
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src_dir.clone(),
+            entry_file: src_dir.join("app.tsx"),
+            deps_dir,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: crate::server::mcp_events::McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
+
         let req = Request::builder()
             .uri("/src/styles.css")
             .body(Body::empty())
@@ -2208,12 +2240,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_source_file_css_postcss_error_reports_overlay_error() {
+        use crate::compiler::postcss::{find_postcss_config, PostCssCssTransform};
+
         let tmp = tempfile::tempdir().unwrap();
-        let state = create_test_state(tmp.path());
         let node_modules = tmp.path().join("node_modules");
+        let src_dir = tmp.path().join("src");
+        let deps_dir = tmp.path().join(".vertz/deps");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&deps_dir).unwrap();
         std::fs::create_dir_all(node_modules.join("postcss")).unwrap();
         std::fs::create_dir_all(node_modules.join("broken-plugin")).unwrap();
-        std::fs::write(tmp.path().join("src/styles.css"), "@broken;\n").unwrap();
+        std::fs::write(src_dir.join("styles.css"), "@broken;\n").unwrap();
         std::fs::write(
             tmp.path().join("postcss.config.js"),
             "module.exports = { plugins: { 'broken-plugin': {} } };",
@@ -2256,6 +2293,37 @@ mod tests {
 };"#,
         )
         .unwrap();
+
+        let config_path = find_postcss_config(tmp.path()).expect("config should exist");
+        let transform = Arc::new(PostCssCssTransform::new(config_path));
+        let pipeline =
+            CompilationPipeline::new(tmp.path().to_path_buf(), src_dir.clone(), test_plugin())
+                .with_css_transform(transform);
+
+        let state = Arc::new(DevServerState {
+            plugin: test_plugin(),
+            pipeline,
+            root_dir: tmp.path().to_path_buf(),
+            src_dir: src_dir.clone(),
+            entry_file: src_dir.join("app.tsx"),
+            deps_dir,
+            theme_css: None,
+            hmr_hub: HmrHub::new(),
+            module_graph: crate::watcher::new_shared_module_graph(),
+            error_broadcaster: ErrorBroadcaster::new(),
+            console_log: ConsoleLog::new(),
+            mcp_sessions: McpSessions::new(),
+            mcp_event_hub: crate::server::mcp_events::McpEventHub::new(),
+            start_time: std::time::Instant::now(),
+            enable_ssr: false,
+            port: 3000,
+            typecheck_enabled: false,
+            api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            auto_install: false,
+            auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            auto_install_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
 
         let req = Request::builder()
             .uri("/src/styles.css")
