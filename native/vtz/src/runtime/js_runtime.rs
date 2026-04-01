@@ -17,6 +17,7 @@ use super::ops::clone;
 use super::ops::console;
 use super::ops::crypto;
 use super::ops::crypto_subtle;
+use super::ops::e2e;
 use super::ops::encoding;
 use super::ops::env;
 use super::ops::fetch;
@@ -80,6 +81,7 @@ impl VertzJsRuntime {
         ops.extend(os::op_decls());
         ops.extend(fs::op_decls());
         ops.extend(sqlite::op_decls());
+        ops.extend(e2e::op_decls());
         ops
     }
 
