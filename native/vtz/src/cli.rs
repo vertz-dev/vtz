@@ -174,6 +174,21 @@ pub struct TestArgs {
     /// Skip compilation cache (compile everything fresh)
     #[arg(long)]
     pub no_cache: bool,
+
+    /// Run e2e tests (requires desktop feature: discovers *.e2e.ts files, starts dev server + webview)
+    #[cfg(feature = "desktop")]
+    #[arg(long)]
+    pub e2e: bool,
+
+    /// Show the webview window during e2e tests (only valid with --e2e)
+    #[cfg(feature = "desktop")]
+    #[arg(long, requires = "e2e")]
+    pub headed: bool,
+
+    /// Open devtools in the webview during e2e tests (implies --headed, only valid with --e2e)
+    #[cfg(feature = "desktop")]
+    #[arg(long, requires = "e2e")]
+    pub devtools: bool,
 }
 
 #[derive(Parser, Debug)]

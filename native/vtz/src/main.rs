@@ -20,6 +20,15 @@ fn main() {
         }
     }
 
+    // E2E test mode: webview event loop on main thread, tokio on background
+    #[cfg(feature = "desktop")]
+    if let Command::Test(ref args) = cli.command {
+        if args.e2e {
+            run_e2e_test_mode(cli);
+            return;
+        }
+    }
+
     // Normal mode: tokio runtime on main thread
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async_main(cli));
@@ -110,6 +119,97 @@ fn run_desktop_mode(cli: Cli) {
     });
 
     // Main thread: run the native event loop (blocks forever)
+    app.run();
+}
+
+/// E2E test mode: hidden webview on main thread, tokio + test runner on background thread.
+#[cfg(feature = "desktop")]
+fn run_e2e_test_mode(cli: Cli) {
+    use vertz_runtime::test::e2e_runner::run_e2e_tests;
+    use vertz_runtime::webview::{UserEvent, WebviewApp, WebviewOptions};
+
+    let Command::Test(args) = cli.command else {
+        unreachable!()
+    };
+
+    let root_dir = args.root_dir.unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+
+    let headed = args.headed || args.devtools;
+
+    let (app, _shutdown_rx) = WebviewApp::new(WebviewOptions {
+        title: "VTZ E2E".to_string(),
+        width: 1024,
+        height: 768,
+        hidden: !headed,
+        devtools: args.devtools,
+    })
+    .expect("failed to create webview");
+
+    let proxy = app.proxy();
+    // Load config file (if present)
+    let file_config = vertz_runtime::test::config::load_test_config(&root_dir).unwrap_or_default();
+
+    let reporter_str = args
+        .reporter
+        .as_deref()
+        .or(file_config.reporter.as_deref())
+        .unwrap_or("terminal");
+    let reporter = match reporter_str {
+        "json" => vertz_runtime::test::runner::ReporterFormat::Json,
+        "junit" => vertz_runtime::test::runner::ReporterFormat::Junit,
+        _ => vertz_runtime::test::runner::ReporterFormat::Terminal,
+    };
+
+    let test_config = vertz_runtime::test::runner::TestRunConfig {
+        root_dir: root_dir.clone(),
+        paths: args.paths,
+        include: file_config.include,
+        exclude: file_config.exclude,
+        concurrency: args.concurrency.or(file_config.concurrency),
+        filter: args.filter,
+        bail: args.bail,
+        timeout_ms: args.timeout.or(file_config.timeout_ms).unwrap_or(30_000),
+        reporter,
+        coverage: false,
+        coverage_threshold: 0.0,
+        preload: if args.no_preload {
+            vec![]
+        } else {
+            file_config.preload
+        },
+        no_cache: args.no_cache,
+    };
+
+    // Build a server config for the e2e dev server (port 0 = OS-assigned)
+    let mut server_config = ServerConfig::new(0, "127.0.0.1".to_string(), None);
+    server_config.root_dir = root_dir;
+
+    let proxy_for_quit = proxy.clone();
+
+    // Background thread: tokio runtime + e2e test runner
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
+
+        rt.block_on(async move {
+            let (result, output) = run_e2e_tests(test_config, server_config, proxy).await;
+            print!("{}", output);
+
+            let code = if result.success() { 0 } else { 1 };
+
+            // Signal the webview to close, then exit with the test result code
+            let _ = proxy_for_quit.send_event(UserEvent::Quit);
+            // Give the event loop a moment to process Quit before forcing exit
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::process::exit(code);
+        });
+    });
+
+    // Main thread: run the native event loop (blocks until Quit event)
     app.run();
 }
 

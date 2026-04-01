@@ -7,7 +7,7 @@ use crate::watcher::file_watcher::{
 };
 use crate::watcher::module_graph::ModuleGraph;
 
-use super::collector::discover_test_files;
+use super::collector::{discover_test_files, DiscoveryMode};
 use super::executor::{execute_test_file_with_options, ExecuteOptions};
 use super::reporter::terminal::format_results;
 use super::runner::{TestRunConfig, TestRunResult};
@@ -103,7 +103,13 @@ pub async fn run_watch_mode(config: TestRunConfig) -> Result<(), String> {
     });
 
     // Initial run
-    let all_test_files = discover_test_files(&config.root_dir, &paths, &include, &exclude);
+    let all_test_files = discover_test_files(
+        &config.root_dir,
+        &paths,
+        &include,
+        &exclude,
+        DiscoveryMode::Unit,
+    );
 
     if all_test_files.is_empty() {
         eprintln!("\nNo test files found.\n");
@@ -160,6 +166,7 @@ pub async fn run_watch_mode(config: TestRunConfig) -> Result<(), String> {
                         &paths,
                         &include,
                         &exclude,
+                        DiscoveryMode::Unit,
                     );
 
                     let files_to_run = affected_test_files(&changes, &current_test_files, &graph);
