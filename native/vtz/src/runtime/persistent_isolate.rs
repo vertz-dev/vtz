@@ -64,6 +64,8 @@ pub struct SsrRequest {
     pub url: String,
     /// JSON-serialized session data.
     pub session_json: Option<String>,
+    /// Raw Cookie header from the HTTP request.
+    pub cookies: Option<String>,
 }
 
 /// An SSR render response from the V8 thread.
@@ -710,9 +712,20 @@ const SSR_RESET_JS: &str = r#"
 const SSR_RENDER_FRAMEWORK_JS: &str = r#"
 (async function() {
     const url = (globalThis.location.pathname || '/') + (globalThis.location.search || '');
+
+    // Build options for ssrRenderSinglePass
+    const options = {};
+    if (globalThis.__vertz_session) {
+        options.ssrAuth = globalThis.__vertz_session;
+    }
+    if (globalThis.__vertz_cookies) {
+        options.cookies = globalThis.__vertz_cookies;
+    }
+
     const result = await globalThis.__vertz_ssr_render_fn(
         globalThis.__vertz_app_module,
-        url
+        url,
+        options
     );
     globalThis.__vertz_last_ssr_result = JSON.stringify({
         content: result.html || '',
@@ -801,6 +814,20 @@ async fn dispatch_ssr_request(
         runtime
             .execute_script_void("<ssr-session>", &js)
             .map_err(|e| format!("Session install error: {}", e))?;
+    }
+
+    // 3b. Install cookies for document.cookie during SSR
+    if let Some(ref cookies) = request.cookies {
+        let safe =
+            serde_json::to_string(cookies).map_err(|e| format!("Cookie serialize: {}", e))?;
+        let js = format!("globalThis.__vertz_cookies = {};", safe);
+        runtime
+            .execute_script_void("<ssr-cookies>", &js)
+            .map_err(|e| format!("Cookie install error: {}", e))?;
+    } else {
+        runtime
+            .execute_script_void("<ssr-cookies>", "delete globalThis.__vertz_cookies;")
+            .map_err(|e| format!("Cookie clear error: {}", e))?;
     }
 
     // 4. Check if framework render function is available
@@ -1248,6 +1275,7 @@ mod tests {
         let ssr_req = SsrRequest {
             url: "/tasks".to_string(),
             session_json: None,
+            cookies: None,
         };
 
         let result = isolate.handle_ssr(ssr_req).await;
@@ -1295,6 +1323,7 @@ mod tests {
         // First request
         let resp1 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/page-1".to_string(),
                 session_json: None,
             })
@@ -1305,6 +1334,7 @@ mod tests {
         // Second request — should have clean DOM, no leaked content from first request
         let resp2 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/page-2".to_string(),
                 session_json: None,
             })
@@ -1346,6 +1376,7 @@ mod tests {
         // First request
         let resp1 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/a".to_string(),
                 session_json: None,
             })
@@ -1357,6 +1388,7 @@ mod tests {
         // Second request — CSS should be fresh (not accumulated from first request)
         let resp2 = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/b".to_string(),
                 session_json: None,
             })
@@ -1398,6 +1430,7 @@ mod tests {
         // Request that throws
         let err_result = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/error".to_string(),
                 session_json: None,
             })
@@ -1407,6 +1440,7 @@ mod tests {
         // Next SSR request should still work
         let ok_result = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/ok".to_string(),
                 session_json: None,
             })
@@ -1479,6 +1513,7 @@ mod tests {
         // Test SSR request
         let ssr_resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/home".to_string(),
                 session_json: None,
             })
@@ -1528,6 +1563,7 @@ mod tests {
 
         let resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/profile".to_string(),
                 session_json: Some(r#"{"userId":"user-123"}"#.to_string()),
             })
@@ -1581,6 +1617,7 @@ mod tests {
         // Verify via SSR render that interceptor globals are present
         let resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/check".to_string(),
                 session_json: None,
             })
@@ -1749,6 +1786,7 @@ mod tests {
         // SSR render verifies interceptor is installed
         let resp = isolate
             .handle_ssr(SsrRequest {
+                cookies: None,
                 url: "/test".to_string(),
                 session_json: None,
             })

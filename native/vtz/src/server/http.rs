@@ -555,6 +555,7 @@ async fn dev_server_handler(
                     let ssr_req = crate::runtime::persistent_isolate::SsrRequest {
                         url: path.clone(),
                         session_json,
+                        cookies: cookie_header.clone(),
                     };
 
                     match isolate.handle_ssr(ssr_req).await {

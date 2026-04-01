@@ -494,6 +494,7 @@ async fn persistent_isolate_renders_via_framework_engine() {
     let ssr_req = SsrRequest {
         url: "/".to_string(),
         session_json: None,
+        cookies: None,
     };
 
     let result = isolate.handle_ssr(ssr_req).await;
@@ -548,6 +549,7 @@ async fn isolate_stores_ssr_module_as_app_module_global() {
     let ssr_req = SsrRequest {
         url: "/".to_string(),
         session_json: None,
+        cookies: None,
     };
 
     let result = isolate.handle_ssr(ssr_req).await;
