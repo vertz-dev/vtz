@@ -329,4 +329,114 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(find_postcss_config(tmp.path()), None);
     }
+
+    /// Helper: run `npm install` in a temp dir. Returns None if npm/node unavailable.
+    fn npm_install(dir: &Path, packages: &[&str]) -> Option<()> {
+        use std::process::Command;
+
+        // Write a minimal package.json (npm init -y fails on dirs starting with '.')
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"postcss-test","private":true}"#,
+        )
+        .ok()?;
+
+        // npm install packages
+        let mut args = vec!["install", "--save-dev"];
+        args.extend_from_slice(packages);
+        let output = Command::new("npm")
+            .args(&args)
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            eprintln!(
+                "npm install failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        Some(())
+    }
+
+    #[test]
+    #[ignore] // requires npm + network; run with: cargo test -p vtz -- postcss --ignored
+    fn test_autoprefixer_real_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Install real postcss + autoprefixer
+        npm_install(root, &["postcss", "autoprefixer"])
+            .expect("npm install failed — is Node.js available?");
+
+        // browserslist config to force vendor prefixes
+        std::fs::write(root.join(".browserslistrc"), "last 4 versions\n").unwrap();
+
+        // PostCSS config using autoprefixer
+        std::fs::write(
+            root.join("postcss.config.js"),
+            "module.exports = { plugins: { autoprefixer: {} } };",
+        )
+        .unwrap();
+
+        // CSS that needs prefixing
+        std::fs::write(
+            root.join("test.css"),
+            ".app { user-select: none; display: flex; }\n",
+        )
+        .unwrap();
+
+        let config_path = find_postcss_config(root).expect("config should exist");
+        let result = process_css(root, &root.join("test.css"), &config_path);
+
+        let css = result.expect("PostCSS processing should succeed");
+        assert!(
+            css.contains("-webkit-user-select: none"),
+            "autoprefixer should add -webkit- prefix, got: {css}"
+        );
+        assert!(
+            css.contains("user-select: none"),
+            "original property should be preserved, got: {css}"
+        );
+    }
+
+    #[test]
+    #[ignore] // requires npm + network; run with: cargo test -p vtz -- postcss --ignored
+    fn test_tailwind_v4_real_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Install Tailwind v4 + PostCSS plugin
+        npm_install(root, &["postcss", "@tailwindcss/postcss", "tailwindcss"])
+            .expect("npm install failed — is Node.js available?");
+
+        // PostCSS config using Tailwind v4's PostCSS plugin
+        std::fs::write(
+            root.join("postcss.config.js"),
+            "module.exports = { plugins: { '@tailwindcss/postcss': {} } };",
+        )
+        .unwrap();
+
+        // CSS with Tailwind v4 import directive
+        std::fs::write(root.join("test.css"), "@import 'tailwindcss';\n").unwrap();
+
+        let config_path = find_postcss_config(root).expect("config should exist");
+        let result = process_css(root, &root.join("test.css"), &config_path);
+
+        let css = result.expect("Tailwind v4 PostCSS processing should succeed");
+
+        // Tailwind v4 resolves the import into actual CSS (reset, utilities, etc.)
+        assert!(
+            !css.contains("@import 'tailwindcss'"),
+            "@import should be resolved, got: {css}"
+        );
+        // Tailwind's base layer includes box-sizing resets
+        assert!(
+            css.contains("box-sizing"),
+            "Tailwind base should include box-sizing reset, got first 500 chars: {}",
+            &css[..css.len().min(500)]
+        );
+    }
 }
