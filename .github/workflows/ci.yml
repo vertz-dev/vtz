@@ -25,12 +25,6 @@ jobs:
         with:
           workspaces: native
 
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install test fixture dependencies
-        working-directory: native/vtz/tests/fixtures/ssr-app
-        run: bun install --frozen-lockfile
-
       - name: Check formatting
         working-directory: native
         run: cargo fmt --all -- --check

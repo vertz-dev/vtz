@@ -10,7 +10,12 @@
 /// 7. SSR render with fixture apps
 /// 8. Graceful fallback when SSR fails
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use tokio::sync::OnceCell;
+use vertz_runtime::pm;
+use vertz_runtime::pm::output::DevPmOutput;
+use vertz_runtime::pm::vertzrc::ScriptPolicy;
 use vertz_runtime::ssr::css_collector;
 use vertz_runtime::ssr::dom_shim;
 use vertz_runtime::ssr::html_document::{assemble_ssr_document, SsrHtmlOptions};
@@ -22,6 +27,31 @@ fn ssr_app_path() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("ssr-app")
+}
+
+static FIXTURE_DEPS_INSTALLED: OnceCell<()> = OnceCell::const_new();
+
+/// Ensure the ssr-app fixture has its node_modules installed using vtz's own
+/// package manager. This makes framework SSR tests self-contained — no external
+/// tool (bun/npm) required. Runs at most once across all tests.
+async fn ensure_fixture_deps() {
+    FIXTURE_DEPS_INSTALLED
+        .get_or_init(|| async {
+            let root = ssr_app_path();
+            if root.join("node_modules").exists() {
+                return;
+            }
+            pm::install(
+                &root,
+                false,
+                ScriptPolicy::IgnoreAll,
+                false,
+                Arc::new(DevPmOutput),
+            )
+            .await
+            .expect("vtz pm::install should install fixture deps");
+        })
+        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -472,7 +502,9 @@ async fn persistent_isolate_renders_via_framework_engine() {
         PersistentIsolate, PersistentIsolateOptions, SsrRequest,
     };
 
+    ensure_fixture_deps().await;
     let root = ssr_app_path();
+
     let opts = PersistentIsolateOptions {
         root_dir: root.clone(),
         ssr_entry: root.join("src/app-ssr.js"),
@@ -569,6 +601,7 @@ async fn poc_ssr_render_single_pass_in_v8() {
     use vertz_runtime::runtime::async_context::load_async_context;
     use vertz_runtime::runtime::js_runtime::{VertzJsRuntime, VertzRuntimeOptions};
 
+    ensure_fixture_deps().await;
     let root = ssr_app_path();
 
     let mut rt = VertzJsRuntime::new(VertzRuntimeOptions {
