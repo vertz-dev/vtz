@@ -974,7 +974,6 @@ pub async fn start_server_with_lifecycle(
                 let watcher_state = state.clone();
                 let entry_file = config.entry_file.clone();
                 let root_dir = config.root_dir.clone();
-                let server_entry = config.server_entry.clone();
 
                 // Spawn file watcher task with error broadcasting
                 tokio::spawn(async move {
@@ -995,6 +994,50 @@ pub async fn start_server_with_lifecycle(
                                 // Clear auto-install failed blacklist on any file change.
                                 // Developer may have fixed a typo in an import.
                                 watcher_state.auto_install_failed.lock().unwrap().clear();
+
+                                // Restart the persistent isolate once per batch.
+                                // Any source file change can affect SSR (app.tsx
+                                // imports components transitively) or API routes,
+                                // so we restart on every change using the zero-
+                                // downtime create-then-swap pattern.
+                                {
+                                    let opts = {
+                                        let guard = watcher_state
+                                            .api_isolate
+                                            .read()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        guard.as_ref().map(|iso| iso.options().clone())
+                                    };
+                                    if let Some(opts) = opts {
+                                        match PersistentIsolate::new(opts) {
+                                            Ok(new_isolate) => {
+                                                let old = {
+                                                    let mut guard = watcher_state
+                                                        .api_isolate
+                                                        .write()
+                                                        .unwrap_or_else(|e| e.into_inner());
+                                                    guard.replace(Arc::new(new_isolate))
+                                                };
+                                                if let Some(old_arc) = old {
+                                                    let refs = Arc::strong_count(&old_arc);
+                                                    if refs > 1 {
+                                                        eprintln!(
+                                                            "[Server] Old isolate still draining ({} refs)",
+                                                            refs - 1
+                                                        );
+                                                    }
+                                                }
+                                                eprintln!("[Server] Isolate restarted (source change)");
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[Server] Failed to restart isolate: {} (old isolate still serving)",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
 
                                 for change in &changes {
                                     let change_msg = format!("File changed: {}", change.path.display());
@@ -1050,61 +1093,6 @@ pub async fn start_server_with_lifecycle(
                                         // Clear compilation cache for full rebuild
                                         watcher_state.pipeline.cache().clear();
                                         continue;
-                                    }
-
-                                    // Check if a server module changed — restart the persistent isolate.
-                                    // Strategy: create new isolate FIRST while old one still serves
-                                    // requests, then atomically swap. This avoids a None window where
-                                    // requests would get 404s, and preserves the old isolate on failure.
-                                    if let Some(ref se) = server_entry {
-                                        if change.path == *se {
-                                            eprintln!(
-                                                "[Server] Server module changed: {}",
-                                                change.path.display()
-                                            );
-                                            // Read options from current isolate (read lock — no contention)
-                                            let opts = {
-                                                let guard = watcher_state
-                                                    .api_isolate
-                                                    .read()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                guard.as_ref().map(|iso| iso.options().clone())
-                                            };
-                                            if let Some(opts) = opts {
-                                                // Create new isolate while old one continues serving
-                                                match PersistentIsolate::new(opts) {
-                                                    Ok(new_isolate) => {
-                                                        // Atomically swap old → new
-                                                        let old = {
-                                                            let mut guard = watcher_state
-                                                                .api_isolate
-                                                                .write()
-                                                                .unwrap_or_else(|e| e.into_inner());
-                                                            guard.replace(Arc::new(new_isolate))
-                                                        };
-                                                        // Log if old isolate still has in-flight refs
-                                                        if let Some(old_arc) = old {
-                                                            let refs = Arc::strong_count(&old_arc);
-                                                            if refs > 1 {
-                                                                eprintln!(
-                                                                    "[Server] Old isolate still draining ({} refs)",
-                                                                    refs - 1
-                                                                );
-                                                            }
-                                                        }
-                                                        eprintln!("[Server] Isolate restarted successfully");
-                                                    }
-                                                    Err(e) => {
-                                                        // Old isolate is still in place — no downtime
-                                                        eprintln!(
-                                                            "[Server] Failed to create new isolate: {} (old isolate still serving)",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            // Don't continue — still need to compile for client HMR
-                                        }
                                     }
 
                                     // Clear any previous errors for this file
