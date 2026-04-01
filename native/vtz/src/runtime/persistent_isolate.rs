@@ -9,9 +9,21 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use deno_core::error::AnyError;
 use tokio::sync::{mpsc, oneshot};
+
+/// Maximum time to wait for a single API/SSR request before timing out.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum time to wait for the V8 event loop during request dispatch.
+/// Slightly shorter than REQUEST_TIMEOUT so the V8 thread recovers before
+/// the caller gives up.
+const EVENT_LOOP_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Maximum time to wait for the V8 event loop during module initialization.
+const INIT_EVENT_LOOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Options for creating a persistent V8 isolate.
 #[derive(Debug, Clone)]
@@ -198,6 +210,9 @@ impl PersistentIsolate {
     }
 
     /// Send an API request to the persistent isolate and await the response.
+    ///
+    /// Times out after [`REQUEST_TIMEOUT`] to prevent the HTTP handler from
+    /// hanging when the V8 event loop is stuck.
     pub async fn handle_request(
         &self,
         request: IsolateRequest,
@@ -211,17 +226,21 @@ impl PersistentIsolate {
                 deno_core::error::generic_error("Persistent isolate thread has stopped")
             })?;
 
-        response_rx
-            .await
-            .map_err(|_| {
-                deno_core::error::generic_error(
-                    "Persistent isolate dropped response channel unexpectedly",
-                )
-            })?
-            .map_err(deno_core::error::generic_error)
+        match tokio::time::timeout(REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(result)) => result.map_err(deno_core::error::generic_error),
+            Ok(Err(_)) => Err(deno_core::error::generic_error(
+                "Persistent isolate dropped response channel unexpectedly",
+            )),
+            Err(_) => Err(deno_core::error::generic_error(
+                "API request timed out (V8 event loop may be stuck — save a file to restart the isolate)",
+            )),
+        }
     }
 
     /// Send an SSR render request to the persistent isolate and await the response.
+    ///
+    /// Times out after [`REQUEST_TIMEOUT`] to prevent the HTTP handler from
+    /// hanging when the V8 event loop is stuck.
     pub async fn handle_ssr(&self, request: SsrRequest) -> Result<SsrResponse, AnyError> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -232,14 +251,15 @@ impl PersistentIsolate {
                 deno_core::error::generic_error("Persistent isolate thread has stopped")
             })?;
 
-        response_rx
-            .await
-            .map_err(|_| {
-                deno_core::error::generic_error(
-                    "Persistent isolate dropped response channel unexpectedly",
-                )
-            })?
-            .map_err(deno_core::error::generic_error)
+        match tokio::time::timeout(REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(result)) => result.map_err(deno_core::error::generic_error),
+            Ok(Err(_)) => Err(deno_core::error::generic_error(
+                "Persistent isolate dropped response channel unexpectedly",
+            )),
+            Err(_) => Err(deno_core::error::generic_error(
+                "SSR request timed out (V8 event loop may be stuck — save a file to restart the isolate)",
+            )),
+        }
     }
 }
 
@@ -318,8 +338,10 @@ async fn isolate_event_loop(
             if let Err(e) = runtime.execute_script_void("<capture-ssr-module>", &capture_js) {
                 eprintln!("[Server] Failed to capture SSR module exports: {}", e);
             }
-            if let Err(e) = runtime.run_event_loop().await {
-                eprintln!("[Server] Event loop error during SSR module capture: {}", e);
+            match tokio::time::timeout(INIT_EVENT_LOOP_TIMEOUT, runtime.run_event_loop()).await {
+                Ok(Err(e)) => eprintln!("[Server] Event loop error during SSR module capture: {}", e),
+                Err(_) => eprintln!("[Server] SSR module capture timed out after {}s — continuing with partial init", INIT_EVENT_LOOP_TIMEOUT.as_secs()),
+                Ok(Ok(())) => {}
             }
 
             eprintln!(
@@ -346,8 +368,10 @@ async fn isolate_event_loop(
                 {
                     match runtime.load_side_module(&init_specifier).await {
                         Ok(_) => {
-                            if let Err(e) = runtime.run_event_loop().await {
-                                eprintln!("[Server] Event loop error during SSR init: {}", e);
+                            match tokio::time::timeout(INIT_EVENT_LOOP_TIMEOUT, runtime.run_event_loop()).await {
+                                Ok(Err(e)) => eprintln!("[Server] Event loop error during SSR init: {}", e),
+                                Err(_) => eprintln!("[Server] SSR init timed out after {}s — continuing without ssrRenderSinglePass", INIT_EVENT_LOOP_TIMEOUT.as_secs()),
+                                Ok(Ok(())) => {}
                             }
                             eprintln!(
                                 "[Server] ssrRenderSinglePass loaded from @vertz/ui-server/ssr"
@@ -415,8 +439,10 @@ async fn isolate_event_loop(
                 {
                     eprintln!("[Server] Failed to capture server exports: {}", e);
                 }
-                if let Err(e) = runtime.run_event_loop().await {
-                    eprintln!("[Server] Event loop error during export capture: {}", e);
+                match tokio::time::timeout(INIT_EVENT_LOOP_TIMEOUT, runtime.run_event_loop()).await {
+                    Ok(Err(e)) => eprintln!("[Server] Event loop error during export capture: {}", e),
+                    Err(_) => eprintln!("[Server] Server module capture timed out after {}s — continuing without API handler", INIT_EVENT_LOOP_TIMEOUT.as_secs()),
+                    Ok(Ok(())) => {}
                 }
 
                 // Extract the handler function from the module
@@ -602,10 +628,20 @@ async fn dispatch_api_request(
         .execute_script_void("<api-dispatch>", API_DISPATCH_JS)
         .map_err(|e| format!("JS execution error: {}", e))?;
 
-    runtime
-        .run_event_loop()
-        .await
-        .map_err(|e| format!("Event loop error: {}", e))?;
+    match tokio::time::timeout(EVENT_LOOP_TIMEOUT, runtime.run_event_loop()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("Event loop error: {}", e)),
+        Err(_) => {
+            eprintln!(
+                "[Server] API event loop timed out after {}s — handler may be stuck",
+                EVENT_LOOP_TIMEOUT.as_secs()
+            );
+            return Err(format!(
+                "API handler timed out after {}s (possible infinite await or slow external call)",
+                EVENT_LOOP_TIMEOUT.as_secs()
+            ));
+        }
+    }
 
     let result = runtime
         .execute_script(
@@ -845,10 +881,20 @@ async fn dispatch_ssr_request(
             .execute_script_void("<ssr-render-framework>", SSR_RENDER_FRAMEWORK_JS)
             .map_err(|e| format!("SSR framework render error: {}", e))?;
 
-        runtime
-            .run_event_loop()
-            .await
-            .map_err(|e| format!("SSR event loop error: {}", e))?;
+        match tokio::time::timeout(EVENT_LOOP_TIMEOUT, runtime.run_event_loop()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("SSR event loop error: {}", e)),
+            Err(_) => {
+                eprintln!(
+                    "[Server] SSR event loop timed out after {}s",
+                    EVENT_LOOP_TIMEOUT.as_secs()
+                );
+                return Err(format!(
+                    "SSR render timed out after {}s (possible stuck promise in component tree)",
+                    EVENT_LOOP_TIMEOUT.as_secs()
+                ));
+            }
+        }
 
         let result = runtime
             .execute_script(
