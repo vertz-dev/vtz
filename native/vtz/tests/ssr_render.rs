@@ -242,6 +242,8 @@ fn test_full_ssr_document_structure() {
         entry_url: "/src/app.tsx",
         preload_hints: &hints,
         enable_hmr: false,
+        ssr_data: None,
+        head_tags: None,
     });
 
     // Document is valid HTML5
@@ -458,6 +460,58 @@ fn test_ssr_render_performance() {
         "SSR render took too long: {:.2}ms",
         result.render_time_ms
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 2: Framework SSR Rendering (ssrRenderSinglePass)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn persistent_isolate_renders_via_framework_engine() {
+    use vertz_runtime::runtime::persistent_isolate::{
+        PersistentIsolate, PersistentIsolateOptions, SsrRequest,
+    };
+
+    let root = ssr_app_path();
+    let opts = PersistentIsolateOptions {
+        root_dir: root.clone(),
+        ssr_entry: root.join("src/app-ssr.js"),
+        server_entry: None,
+        channel_capacity: 16,
+    };
+
+    let isolate = PersistentIsolate::new(opts).unwrap();
+
+    // Wait for initialization
+    for _ in 0..100 {
+        if isolate.is_initialized() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(isolate.is_initialized(), "Isolate should be initialized");
+
+    let ssr_req = SsrRequest {
+        url: "/".to_string(),
+        session_json: None,
+    };
+
+    let result = isolate.handle_ssr(ssr_req).await;
+    assert!(
+        result.is_ok(),
+        "SSR request should succeed: {:?}",
+        result.err()
+    );
+
+    let response = result.unwrap();
+    // Framework engine (ssrRenderSinglePass) renders the App component
+    // which returns a div with <h1>Hello SSR</h1>
+    assert!(
+        response.content.contains("Hello SSR"),
+        "Content should be rendered by ssrRenderSinglePass. Got: {}",
+        response.content
+    );
+    assert!(response.is_ssr, "Should be SSR rendered");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

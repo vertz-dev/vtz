@@ -79,6 +79,12 @@ pub struct SsrResponse {
     pub error: Option<String>,
     /// Render time in milliseconds.
     pub render_time_ms: f64,
+    /// JSON-serialized SSR data for hydration (e.g., prefetched query results).
+    pub ssr_data: Option<String>,
+    /// HTML tags to inject into `<head>` (e.g., font preload links).
+    pub head_tags: Option<String>,
+    /// Redirect URL set by ProtectedRoute during SSR (server should return 302).
+    pub redirect: Option<String>,
 }
 
 /// Messages dispatched to the persistent isolate's V8 thread.
@@ -318,6 +324,43 @@ async fn isolate_event_loop(
                 "[Server] SSR entry loaded: {} (stored as globalThis.__vertz_app_module)",
                 ssr_entry.display()
             );
+
+            // Import ssrRenderSinglePass from @vertz/ui-server/ssr and store as global.
+            // We write a temp module file so bare specifiers resolve from node_modules.
+            let ssr_init_path = ssr_entry
+                .parent()
+                .unwrap_or(root_dir.as_ref())
+                .join("__vertz_ssr_init.mjs");
+            let wrote_init = std::fs::write(
+                &ssr_init_path,
+                "import { ssrRenderSinglePass } from '@vertz/ui-server/ssr';\n\
+                 globalThis.__vertz_ssr_render_fn = ssrRenderSinglePass;\n",
+            )
+            .is_ok();
+
+            if wrote_init {
+                if let Ok(init_specifier) =
+                    deno_core::ModuleSpecifier::from_file_path(&ssr_init_path)
+                {
+                    match runtime.load_side_module(&init_specifier).await {
+                        Ok(_) => {
+                            if let Err(e) = runtime.run_event_loop().await {
+                                eprintln!("[Server] Event loop error during SSR init: {}", e);
+                            }
+                            eprintln!(
+                                "[Server] ssrRenderSinglePass loaded from @vertz/ui-server/ssr"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[Server] @vertz/ui-server/ssr not available ({}), using legacy render",
+                                e
+                            );
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&ssr_init_path);
+            }
         }
     }
 
@@ -460,7 +503,7 @@ async fn process_messages(
             }
             IsolateMessage::Ssr(request, response_tx) => {
                 if ssr_enabled {
-                    let result = dispatch_ssr_request(runtime, &request);
+                    let result = dispatch_ssr_request(runtime, &request).await;
                     let _ = response_tx.send(result);
                 } else {
                     let _ = response_tx.send(Err(
@@ -659,10 +702,34 @@ const SSR_RESET_JS: &str = r#"
 })()
 "#;
 
-/// JavaScript to execute the SSR render and collect results.
-const SSR_RENDER_JS: &str = r#"
+/// JavaScript to execute SSR render via the framework's ssrRenderSinglePass.
+///
+/// Stores the result in `globalThis.__vertz_last_ssr_result` as a JSON string.
+/// Requires `globalThis.__vertz_ssr_render_fn` (ssrRenderSinglePass) and
+/// `globalThis.__vertz_app_module` to be set during isolate init.
+const SSR_RENDER_FRAMEWORK_JS: &str = r#"
+(async function() {
+    const url = (globalThis.location.pathname || '/') + (globalThis.location.search || '');
+    const result = await globalThis.__vertz_ssr_render_fn(
+        globalThis.__vertz_app_module,
+        url
+    );
+    globalThis.__vertz_last_ssr_result = JSON.stringify({
+        content: result.html || '',
+        css: result.css || '',
+        ssrData: result.ssrData || [],
+        headTags: result.headTags || '',
+        redirect: result.redirect ? result.redirect.to : null,
+        isSsr: (result.html || '').length > 0,
+    });
+})()
+"#;
+
+/// Legacy JavaScript to execute SSR render via DOM scraping.
+///
+/// Used when `ssrRenderSinglePass` is not available (e.g., apps without @vertz/ui-server).
+const SSR_RENDER_LEGACY_JS: &str = r#"
 (function() {
-    // Attempt to render via SSR render function or DOM content
     let content = '';
 
     if (typeof globalThis.__vertz_ssr_render === 'function') {
@@ -684,7 +751,6 @@ const SSR_RENDER_JS: &str = r#"
         }
     }
 
-    // Collect CSS entries
     let cssEntries = [];
     if (typeof __vertz_get_collected_css === 'function') {
         cssEntries = __vertz_get_collected_css().map(e => ({ css: e.css, id: e.id || null }));
@@ -700,12 +766,15 @@ const SSR_RENDER_JS: &str = r#"
 
 /// Dispatch a single SSR render request in the V8 isolate.
 ///
+/// When `ssrRenderSinglePass` is available (stored as `globalThis.__vertz_ssr_render_fn`
+/// during init), uses the framework engine. Otherwise falls back to legacy DOM scraping.
+///
 /// 1. Resets DOM state (clean slate)
 /// 2. Sets location to the requested URL
 /// 3. Installs session data
-/// 4. Renders app content
-/// 5. Collects CSS
-fn dispatch_ssr_request(
+/// 4. Renders via framework engine or legacy path
+/// 5. Parses result
+async fn dispatch_ssr_request(
     runtime: &mut crate::runtime::js_runtime::VertzJsRuntime,
     request: &SsrRequest,
 ) -> Result<SsrResponse, String> {
@@ -734,49 +803,137 @@ fn dispatch_ssr_request(
             .map_err(|e| format!("Session install error: {}", e))?;
     }
 
-    // 4. Render and collect results
-    let result = runtime
-        .execute_script("<ssr-render>", SSR_RENDER_JS)
-        .map_err(|e| format!("SSR render error: {}", e))?;
-
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-
-    let result_str = result.as_str().unwrap_or("{}");
-    let parsed: serde_json::Value =
-        serde_json::from_str(result_str).map_err(|e| format!("Parse SSR result: {}", e))?;
-
-    let content = parsed
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let css_entries: Vec<(String, Option<String>)> = parsed
-        .get("cssEntries")
-        .and_then(|arr| arr.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|e| {
-                    let css = e["css"].as_str().unwrap_or("").to_string();
-                    let id = e["id"].as_str().map(|s| s.to_string());
-                    (css, id)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let is_ssr = parsed
-        .get("isSsr")
-        .and_then(|v| v.as_bool())
+    // 4. Check if framework render function is available
+    let has_framework = runtime
+        .execute_script(
+            "<ssr-check>",
+            "typeof globalThis.__vertz_ssr_render_fn === 'function'",
+        )
+        .map(|v| v.as_bool().unwrap_or(false))
         .unwrap_or(false);
 
-    Ok(SsrResponse {
-        content,
-        css_entries,
-        is_ssr,
-        error: None,
-        render_time_ms: elapsed,
-    })
+    if has_framework {
+        // Framework path: ssrRenderSinglePass (async)
+        runtime
+            .execute_script_void("<ssr-render-framework>", SSR_RENDER_FRAMEWORK_JS)
+            .map_err(|e| format!("SSR framework render error: {}", e))?;
+
+        runtime
+            .run_event_loop()
+            .await
+            .map_err(|e| format!("SSR event loop error: {}", e))?;
+
+        let result = runtime
+            .execute_script(
+                "<ssr-read-result>",
+                "globalThis.__vertz_last_ssr_result || '{}'",
+            )
+            .map_err(|e| format!("Read SSR result error: {}", e))?;
+
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let result_str = result.as_str().unwrap_or("{}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(result_str).map_err(|e| format!("Parse SSR result: {}", e))?;
+
+        let content = parsed
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let css = parsed
+            .get("css")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let css_entries = if css.is_empty() {
+            vec![]
+        } else {
+            vec![(css, None)]
+        };
+
+        let ssr_data = parsed.get("ssrData").and_then(|d| {
+            if d.is_array() && !d.as_array().unwrap().is_empty() {
+                Some(serde_json::to_string(d).unwrap_or_default())
+            } else {
+                None
+            }
+        });
+
+        let head_tags = parsed
+            .get("headTags")
+            .and_then(|h| h.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let redirect = parsed
+            .get("redirect")
+            .and_then(|r| r.as_str())
+            .map(|s| s.to_string());
+
+        let is_ssr = parsed
+            .get("isSsr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(SsrResponse {
+            content,
+            css_entries,
+            is_ssr,
+            error: None,
+            render_time_ms: elapsed,
+            ssr_data,
+            head_tags,
+            redirect,
+        })
+    } else {
+        // Legacy path: DOM scraping (sync)
+        let result = runtime
+            .execute_script("<ssr-render-legacy>", SSR_RENDER_LEGACY_JS)
+            .map_err(|e| format!("SSR render error: {}", e))?;
+
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let result_str = result.as_str().unwrap_or("{}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(result_str).map_err(|e| format!("Parse SSR result: {}", e))?;
+
+        let content = parsed
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let css_entries: Vec<(String, Option<String>)> = parsed
+            .get("cssEntries")
+            .and_then(|arr| arr.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let css = e["css"].as_str().unwrap_or("").to_string();
+                        let id = e["id"].as_str().map(|s| s.to_string());
+                        (css, id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let is_ssr = parsed
+            .get("isSsr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(SsrResponse {
+            content,
+            css_entries,
+            is_ssr,
+            error: None,
+            render_time_ms: elapsed,
+            ssr_data: None,
+            head_tags: None,
+            redirect: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -813,6 +970,29 @@ mod tests {
         };
         assert_eq!(res.status, 200);
         assert_eq!(res.body, b"{}");
+    }
+
+    #[test]
+    fn test_ssr_response_has_hydration_fields() {
+        let resp = SsrResponse {
+            content: "<h1>Hello</h1>".to_string(),
+            css_entries: vec![],
+            is_ssr: true,
+            error: None,
+            render_time_ms: 1.5,
+            ssr_data: Some(r#"[{"key":"tasks","data":[]}]"#.to_string()),
+            head_tags: Some(r#"<link rel="preload" href="/font.woff2" />"#.to_string()),
+            redirect: None,
+        };
+        assert_eq!(
+            resp.ssr_data,
+            Some(r#"[{"key":"tasks","data":[]}]"#.to_string())
+        );
+        assert_eq!(
+            resp.head_tags,
+            Some(r#"<link rel="preload" href="/font.woff2" />"#.to_string())
+        );
+        assert!(resp.redirect.is_none());
     }
 
     /// Helper: create an isolate with only a server entry (API-only mode).

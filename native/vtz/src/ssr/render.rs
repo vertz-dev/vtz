@@ -169,6 +169,8 @@ fn render_ssr(options: &SsrOptions) -> Result<SsrResult, AnyError> {
         entry_url: &entry_url,
         preload_hints: &options.preload_hints,
         enable_hmr: options.enable_hmr,
+        ssr_data: None,
+        head_tags: None,
     });
 
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -243,6 +245,8 @@ fn fallback_client_shell(
         entry_url: &entry_url,
         preload_hints: &options.preload_hints,
         enable_hmr: options.enable_hmr,
+        ssr_data: None,
+        head_tags: None,
     });
 
     SsrResult {

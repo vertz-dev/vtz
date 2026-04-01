@@ -576,6 +576,15 @@ async fn dev_server_handler(
                                     .push(LogLevel::Info, render_msg, Some("ssr"));
                             }
 
+                            // Handle redirect from ProtectedRoute during SSR
+                            if let Some(ref redirect_to) = ssr_resp.redirect {
+                                return axum::response::Response::builder()
+                                    .status(StatusCode::FOUND)
+                                    .header(header::LOCATION, redirect_to.as_str())
+                                    .body(Body::empty())
+                                    .unwrap();
+                            }
+
                             // Assemble the full HTML document from SSR response
                             let css_string = format_ssr_css(&ssr_resp.css_entries);
                             let entry_url = crate::ssr::html_document::entry_path_to_url(
@@ -591,6 +600,8 @@ async fn dev_server_handler(
                                     entry_url: &entry_url,
                                     preload_hints: &[],
                                     enable_hmr: true,
+                                    ssr_data: ssr_resp.ssr_data.as_deref(),
+                                    head_tags: ssr_resp.head_tags.as_deref(),
                                 },
                             );
 
@@ -603,68 +614,21 @@ async fn dev_server_handler(
                         }
                         Err(e) => {
                             let error_msg = format!("Persistent SSR error: {}", e);
-                            eprintln!("[SSR] {} — falling back to per-request SSR", error_msg);
+                            eprintln!(
+                                "[SSR] {} — serving client shell (no per-request fallback)",
+                                error_msg
+                            );
                             state
                                 .console_log
                                 .push(LogLevel::Error, error_msg, Some("ssr"));
-                            // Fall through to legacy per-request SSR
+                            // Fall through to client-only shell
                         }
                     }
                 }
             }
 
-            // Legacy fallback: per-request SSR (spawn_blocking + fresh V8)
-            let ssr_options = crate::ssr::render::SsrOptions {
-                root_dir: state.root_dir.clone(),
-                entry_file: state.entry_file.clone(),
-                url: path.clone(),
-                title: "Vertz App".to_string(),
-                theme_css: state.theme_css.clone(),
-                session,
-                preload_hints: vec![],
-                enable_hmr: true,
-            };
-
-            let result = crate::ssr::render::render_to_html(&ssr_options).await;
-
-            if result.render_time_ms > 0.0 {
-                let render_msg = format!(
-                    "{} rendered in {:.1}ms ({})",
-                    path,
-                    result.render_time_ms,
-                    if result.is_ssr { "ssr" } else { "client-only" }
-                );
-                eprintln!("[SSR] {}", render_msg);
-                state
-                    .console_log
-                    .push(LogLevel::Info, render_msg, Some("ssr"));
-            }
-
-            // Report SSR errors with actionable suggestions
-            if let Some(ref error_msg) = result.error {
-                state.console_log.push(
-                    LogLevel::Error,
-                    format!("SSR error: {}", error_msg),
-                    Some("ssr"),
-                );
-                let suggestion = crate::errors::suggestions::suggest_ssr_fix(error_msg);
-                let mut error = DevError::ssr(error_msg)
-                    .with_file(state.entry_file.to_string_lossy().to_string());
-                if let Some(s) = suggestion {
-                    error = error.with_suggestion(s);
-                }
-                let broadcaster = state.error_broadcaster.clone();
-                tokio::spawn(async move {
-                    broadcaster.report_error(error).await;
-                });
-            }
-
-            return axum::response::Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from(result.html))
-                .unwrap();
+            // Persistent isolate not ready or failed — serve client-only shell.
+            // The client will hydrate and render in the browser.
         }
 
         // Fallback: client-only HTML shell (when SSR is disabled)

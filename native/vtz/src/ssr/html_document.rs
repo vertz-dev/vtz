@@ -37,6 +37,10 @@ pub struct SsrHtmlOptions<'a> {
     pub preload_hints: &'a [String],
     /// Whether to include HMR scripts (dev mode).
     pub enable_hmr: bool,
+    /// JSON-serialized SSR data for hydration (injected as `window.__VERTZ_SSR_DATA__`).
+    pub ssr_data: Option<&'a str>,
+    /// Additional HTML tags to inject into `<head>` (e.g., font preload links from SSR).
+    pub head_tags: Option<&'a str>,
 }
 
 /// Assemble a complete SSR HTML document.
@@ -100,6 +104,13 @@ pub fn assemble_ssr_document(options: &SsrHtmlOptions<'_>) -> String {
         html.push_str(options.inline_css);
     }
 
+    // Head tags from SSR (e.g., font preload links)
+    if let Some(head_tags) = options.head_tags {
+        if !head_tags.is_empty() {
+            html.push_str(&format!("  {}\n", head_tags));
+        }
+    }
+
     html.push_str("</head>\n");
     html.push_str("<body>\n");
 
@@ -108,6 +119,16 @@ pub fn assemble_ssr_document(options: &SsrHtmlOptions<'_>) -> String {
         "  <div id=\"app\">{}</div>\n",
         options.ssr_content
     ));
+
+    // SSR data hydration script (before HMR/app scripts)
+    if let Some(ssr_data) = options.ssr_data {
+        if !ssr_data.is_empty() {
+            html.push_str(&format!(
+                "  <script>window.__VERTZ_SSR_DATA__={}</script>\n",
+                ssr_data
+            ));
+        }
+    }
 
     // HMR scripts (dev mode only, before app module)
     if options.enable_hmr {
@@ -169,6 +190,8 @@ mod tests {
             entry_url: "/src/app.tsx",
             preload_hints: &[],
             enable_hmr: false,
+            ssr_data: None,
+            head_tags: None,
         }
     }
 
@@ -343,6 +366,8 @@ mod tests {
             entry_url: "/src/app.tsx",
             preload_hints: &hints,
             enable_hmr: true,
+            ssr_data: None,
+            head_tags: None,
         };
         let html = assemble_ssr_document(&opts);
 
@@ -367,5 +392,77 @@ mod tests {
         // Verify content
         assert!(html.contains("<h1>Tasks</h1>"));
         assert!(html.contains("<li>Task 1</li>"));
+    }
+
+    #[test]
+    fn test_html_document_includes_ssr_data_script() {
+        let opts = SsrHtmlOptions {
+            ssr_data: Some(r#"[{"key":"tasks","data":[{"id":1}]}]"#),
+            ..default_options()
+        };
+        let html = assemble_ssr_document(&opts);
+        assert!(
+            html.contains(
+                r#"<script>window.__VERTZ_SSR_DATA__=[{"key":"tasks","data":[{"id":1}]}]</script>"#
+            ),
+            "Should contain SSR data script. HTML: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn test_html_document_omits_ssr_data_when_none() {
+        let opts = SsrHtmlOptions {
+            ssr_data: None,
+            ..default_options()
+        };
+        let html = assemble_ssr_document(&opts);
+        assert!(
+            !html.contains("__VERTZ_SSR_DATA__"),
+            "Should NOT contain SSR data when None"
+        );
+    }
+
+    #[test]
+    fn test_html_document_includes_head_tags() {
+        let opts = SsrHtmlOptions {
+            head_tags: Some(r#"<link rel="preload" href="/font.woff2" as="font" crossorigin />"#),
+            ..default_options()
+        };
+        let html = assemble_ssr_document(&opts);
+        assert!(
+            html.contains(r#"<link rel="preload" href="/font.woff2" as="font" crossorigin />"#),
+            "Should contain head tags"
+        );
+        let head_end = html.find("</head>").unwrap();
+        let tag_pos = html.find("font.woff2").unwrap();
+        assert!(tag_pos < head_end, "Head tags should be in <head>");
+    }
+
+    #[test]
+    fn test_html_document_omits_head_tags_when_none() {
+        let opts = SsrHtmlOptions {
+            head_tags: None,
+            ..default_options()
+        };
+        let html = assemble_ssr_document(&opts);
+        assert!(
+            !html.contains("font.woff2"),
+            "Should NOT contain head tags when None"
+        );
+    }
+
+    #[test]
+    fn test_ssr_data_before_closing_body() {
+        let opts = SsrHtmlOptions {
+            ssr_data: Some(r#"[{"key":"k","data":"v"}]"#),
+            ..default_options()
+        };
+        let html = assemble_ssr_document(&opts);
+        let data_pos = html.find("__VERTZ_SSR_DATA__").unwrap();
+        let body_end = html.find("</body>").unwrap();
+        let app_pos = html.find("<div id=\"app\">").unwrap();
+        assert!(data_pos > app_pos, "SSR data should be after app content");
+        assert!(data_pos < body_end, "SSR data should be before </body>");
     }
 }
