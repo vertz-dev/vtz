@@ -162,7 +162,7 @@ pub fn build_router(
     let api_isolate = if config.enable_ssr || config.server_entry.is_some() {
         let opts = PersistentIsolateOptions {
             root_dir: config.root_dir.clone(),
-            entry_file: config.entry_file.clone(),
+            ssr_entry: config.ssr_entry.clone(),
             server_entry: config.server_entry.clone(),
             channel_capacity: 256,
         };

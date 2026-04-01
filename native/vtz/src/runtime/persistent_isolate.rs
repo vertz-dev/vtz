@@ -18,8 +18,10 @@ use tokio::sync::{mpsc, oneshot};
 pub struct PersistentIsolateOptions {
     /// Root directory of the project.
     pub root_dir: PathBuf,
-    /// App entry file for SSR rendering (e.g., `src/app.tsx`).
-    pub entry_file: PathBuf,
+    /// SSR entry file (e.g., `src/app.tsx`).
+    /// This module is loaded and its exports stored as `globalThis.__vertz_app_module`
+    /// for use by the framework's SSR rendering engine.
+    pub ssr_entry: PathBuf,
     /// Optional server entry file for API routes (e.g., `src/server.ts`).
     /// When `None`, the isolate only supports SSR rendering.
     pub server_entry: Option<PathBuf>,
@@ -31,7 +33,7 @@ impl Default for PersistentIsolateOptions {
     fn default() -> Self {
         Self {
             root_dir: PathBuf::from("."),
-            entry_file: PathBuf::from("src/app.tsx"),
+            ssr_entry: PathBuf::from("src/app.tsx"),
             server_entry: None,
             channel_capacity: 256,
         }
@@ -117,7 +119,7 @@ impl PersistentIsolate {
         let has_api_clone = Arc::clone(&has_api_handler);
 
         let root_dir = options.root_dir.clone();
-        let entry_file = options.entry_file.clone();
+        let ssr_entry = options.ssr_entry.clone();
         let server_entry = options.server_entry.clone();
 
         let runtime_thread = std::thread::spawn(move || {
@@ -129,7 +131,7 @@ impl PersistentIsolate {
             rt.block_on(async move {
                 isolate_event_loop(
                     root_dir,
-                    entry_file,
+                    ssr_entry,
                     server_entry,
                     message_rx,
                     initialized_clone,
@@ -242,7 +244,7 @@ impl PersistentIsolate {
 /// 5. Processes incoming messages (API or SSR)
 async fn isolate_event_loop(
     root_dir: PathBuf,
-    entry_file: PathBuf,
+    ssr_entry: PathBuf,
     server_entry: Option<PathBuf>,
     mut message_rx: mpsc::Receiver<IsolateMessage>,
     initialized: Arc<std::sync::atomic::AtomicBool>,
@@ -274,12 +276,12 @@ async fn isolate_event_loop(
         return;
     }
 
-    // 3. Load app entry module (for SSR rendering)
-    if entry_file.exists() {
-        let entry_specifier = match deno_core::ModuleSpecifier::from_file_path(&entry_file) {
+    // 3. Load SSR entry module (app.tsx) and store as globalThis.__vertz_app_module
+    if ssr_entry.exists() {
+        let entry_specifier = match deno_core::ModuleSpecifier::from_file_path(&ssr_entry) {
             Ok(s) => s,
             Err(_) => {
-                eprintln!("[Server] Invalid app entry path: {}", entry_file.display());
+                eprintln!("[Server] Invalid SSR entry path: {}", ssr_entry.display());
                 // Continue without SSR — API routes may still work
                 initialized.store(true, std::sync::atomic::Ordering::Release);
                 process_messages(&mut runtime, &mut message_rx, false).await;
@@ -289,15 +291,32 @@ async fn isolate_event_loop(
 
         if let Err(e) = runtime.load_main_module(&entry_specifier).await {
             eprintln!(
-                "[Server] Failed to load app entry module ({}): {}",
-                entry_file.display(),
+                "[Server] Failed to load SSR entry module ({}): {}",
+                ssr_entry.display(),
                 e
             );
-            // Continue anyway — app entry failing doesn't prevent API routes
+            // Continue anyway — SSR entry failing doesn't prevent API routes
         } else {
+            // Capture module exports as globalThis.__vertz_app_module
+            let safe_url = serde_json::to_string(entry_specifier.as_str())
+                .unwrap_or_else(|_| format!("\"{}\"", entry_specifier.as_str()));
+            let capture_js = format!(
+                r#"(async function() {{
+                    const mod = await import({});
+                    globalThis.__vertz_app_module = mod;
+                }})()"#,
+                safe_url
+            );
+            if let Err(e) = runtime.execute_script_void("<capture-ssr-module>", &capture_js) {
+                eprintln!("[Server] Failed to capture SSR module exports: {}", e);
+            }
+            if let Err(e) = runtime.run_event_loop().await {
+                eprintln!("[Server] Event loop error during SSR module capture: {}", e);
+            }
+
             eprintln!(
-                "[Server] App entry loaded for SSR: {}",
-                entry_file.display()
+                "[Server] SSR entry loaded: {} (stored as globalThis.__vertz_app_module)",
+                ssr_entry.display()
             );
         }
     }
@@ -324,7 +343,7 @@ async fn isolate_event_loop(
         };
 
         // Step a: Load the server module directly
-        let load_result = if entry_file.exists() {
+        let load_result = if ssr_entry.exists() {
             runtime.load_side_module(&entry_specifier).await
         } else {
             runtime.load_main_module(&entry_specifier).await
@@ -768,7 +787,7 @@ mod tests {
     fn test_default_options() {
         let opts = PersistentIsolateOptions::default();
         assert_eq!(opts.channel_capacity, 256);
-        assert_eq!(opts.entry_file, PathBuf::from("src/app.tsx"));
+        assert_eq!(opts.ssr_entry, PathBuf::from("src/app.tsx"));
         assert!(opts.server_entry.is_none());
     }
 
@@ -802,7 +821,7 @@ mod tests {
         std::fs::write(&server_path, server_js).unwrap();
         PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: temp_dir.path().join("nonexistent-app.tsx"),
+            ssr_entry: temp_dir.path().join("nonexistent-app.tsx"),
             server_entry: Some(server_path),
             channel_capacity: 16,
         }
@@ -823,7 +842,7 @@ mod tests {
     async fn test_create_persistent_isolate() {
         let opts = PersistentIsolateOptions {
             root_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            entry_file: PathBuf::from("/nonexistent/app.tsx"),
+            ssr_entry: PathBuf::from("/nonexistent/app.tsx"),
             server_entry: None,
             channel_capacity: 16,
         };
@@ -842,7 +861,7 @@ mod tests {
     async fn test_handle_request_without_api_handler() {
         let opts = PersistentIsolateOptions {
             root_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            entry_file: PathBuf::from("/nonexistent/app.tsx"),
+            ssr_entry: PathBuf::from("/nonexistent/app.tsx"),
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1038,7 +1057,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1085,7 +1104,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1136,7 +1155,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1188,7 +1207,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1254,7 +1273,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1319,7 +1338,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1370,7 +1389,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1440,7 +1459,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1491,7 +1510,7 @@ mod tests {
         // No server entry — SSR only
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: None,
             channel_capacity: 16,
         };
@@ -1538,7 +1557,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: app_path,
+            ssr_entry: app_path,
             server_entry: Some(server_path),
             channel_capacity: 16,
         };
@@ -1586,7 +1605,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: temp_dir.path().join("nonexistent-app.tsx"),
+            ssr_entry: temp_dir.path().join("nonexistent-app.tsx"),
             server_entry: Some(server_path.clone()),
             channel_capacity: 16,
         };
@@ -1681,7 +1700,7 @@ mod tests {
 
         let opts = PersistentIsolateOptions {
             root_dir: temp_dir.path().to_path_buf(),
-            entry_file: temp_dir.path().join("nonexistent-app.tsx"),
+            ssr_entry: temp_dir.path().join("nonexistent-app.tsx"),
             server_entry: Some(server_path.clone()),
             channel_capacity: 16,
         };

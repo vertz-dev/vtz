@@ -461,6 +461,131 @@ fn test_ssr_render_performance() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SSR Entry Module Loading (globalThis.__vertz_app_module)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn isolate_stores_ssr_module_as_app_module_global() {
+    use vertz_runtime::runtime::persistent_isolate::{
+        PersistentIsolate, PersistentIsolateOptions, SsrRequest,
+    };
+
+    let root = ssr_app_path();
+    let opts = PersistentIsolateOptions {
+        root_dir: root.clone(),
+        ssr_entry: root.join("src/app.tsx"),
+        server_entry: None,
+        channel_capacity: 16,
+    };
+
+    let isolate = PersistentIsolate::new(opts).unwrap();
+
+    // Wait for initialization
+    for _ in 0..100 {
+        if isolate.is_initialized() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(isolate.is_initialized(), "Isolate should be initialized");
+
+    // Verify the module was stored as globalThis.__vertz_app_module
+    // We can check this indirectly via an SSR request that reads the global
+    let ssr_req = SsrRequest {
+        url: "/".to_string(),
+        session_json: None,
+    };
+
+    let result = isolate.handle_ssr(ssr_req).await;
+    assert!(
+        result.is_ok(),
+        "SSR request should succeed: {:?}",
+        result.err()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POC: ssrRenderSinglePass in deno_core V8
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn poc_ssr_render_single_pass_in_v8() {
+    use vertz_runtime::runtime::async_context::load_async_context;
+    use vertz_runtime::runtime::js_runtime::{VertzJsRuntime, VertzRuntimeOptions};
+
+    let root = ssr_app_path();
+
+    let mut rt = VertzJsRuntime::new(VertzRuntimeOptions {
+        root_dir: Some(root.to_string_lossy().to_string()),
+        capture_output: false,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Load polyfills (AsyncLocalStorage, DOM shim)
+    load_async_context(&mut rt).unwrap();
+    dom_shim::load_dom_shim(&mut rt).unwrap();
+
+    // Load the app module and store as globalThis.__vertz_app_module
+    let app_path = root.join("src/app-ssr.js");
+    let specifier = deno_core::ModuleSpecifier::from_file_path(&app_path).unwrap();
+    rt.load_main_module(&specifier).await.unwrap();
+
+    let safe_url = serde_json::to_string(specifier.as_str()).unwrap();
+    let capture_js = format!(
+        r#"(async function() {{
+            const mod = await import({});
+            globalThis.__vertz_app_module = mod;
+        }})()"#,
+        safe_url
+    );
+    rt.execute_script_void("<capture>", &capture_js).unwrap();
+    rt.run_event_loop().await.unwrap();
+
+    // Call ssrRenderSinglePass from @vertz/ui-server/ssr.
+    // We load a temp module file so the module loader can resolve bare specifiers
+    // from the correct directory (node_modules next to the app).
+    let render_module = root.join("src/_ssr_render_poc.js");
+    std::fs::write(
+        &render_module,
+        r#"
+        import { ssrRenderSinglePass } from '@vertz/ui-server/ssr';
+        const appModule = globalThis.__vertz_app_module;
+        const result = await ssrRenderSinglePass(appModule, '/');
+        globalThis.__ssr_poc_result = JSON.stringify({
+            html: result.html,
+            css: result.css,
+            hasData: Array.isArray(result.ssrData),
+        });
+        "#,
+    )
+    .unwrap();
+
+    let render_specifier = deno_core::ModuleSpecifier::from_file_path(&render_module).unwrap();
+    let load_result = rt.load_side_module(&render_specifier).await;
+
+    // Clean up temp file regardless of result
+    let _ = std::fs::remove_file(&render_module);
+
+    load_result.expect("Failed to load SSR render module");
+    rt.run_event_loop().await.unwrap();
+
+    // Read the result
+    let result = rt
+        .execute_script("<read-result>", "globalThis.__ssr_poc_result || '{}'")
+        .unwrap();
+
+    let result_str = result.as_str().unwrap_or("{}");
+    let parsed: serde_json::Value = serde_json::from_str(result_str).unwrap();
+
+    assert!(
+        parsed["html"].as_str().unwrap_or("").contains("Hello SSR"),
+        "SSR should render the App component. Got: {}",
+        parsed["html"]
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // AsyncLocalStorage Integration Tests
 // ═══════════════════════════════════════════════════════════════════════════
 

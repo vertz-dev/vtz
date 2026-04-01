@@ -19,8 +19,12 @@ pub struct ServerConfig {
     pub root_dir: PathBuf,
     /// Source directory for application code (e.g., "src").
     pub src_dir: PathBuf,
-    /// Entry file for the application (e.g., "src/app.tsx").
+    /// Entry file for the application (e.g., "src/entry-client.ts").
+    /// This is the client-side hydration entry used in the HTML `<script>` tag.
     pub entry_file: PathBuf,
+    /// SSR entry file (e.g., "src/app.tsx").
+    /// This is the server-side module loaded by the persistent V8 isolate for SSR.
+    pub ssr_entry: PathBuf,
     /// Whether SSR is enabled for page routes (default: true).
     pub enable_ssr: bool,
     /// Whether to run type checking (tsc/tsgo) (default: true).
@@ -174,6 +178,7 @@ impl ServerConfig {
         let root_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let src_dir = root_dir.join("src");
         let entry_file = detect_entry_file(&src_dir);
+        let ssr_entry = detect_ssr_entry(&src_dir);
         let server_entry = detect_server_entry(&src_dir);
         Self {
             port,
@@ -182,6 +187,7 @@ impl ServerConfig {
             root_dir,
             src_dir,
             entry_file,
+            ssr_entry,
             enable_ssr: true,
             enable_typecheck: true,
             tsconfig_path: None,
@@ -200,6 +206,7 @@ impl ServerConfig {
     pub fn with_root(port: u16, host: String, public_dir: PathBuf, root_dir: PathBuf) -> Self {
         let src_dir = root_dir.join("src");
         let entry_file = detect_entry_file(&src_dir);
+        let ssr_entry = detect_ssr_entry(&src_dir);
         let server_entry = detect_server_entry(&src_dir);
         Self {
             port,
@@ -208,6 +215,7 @@ impl ServerConfig {
             root_dir,
             src_dir,
             entry_file,
+            ssr_entry,
             enable_ssr: true,
             enable_typecheck: true,
             tsconfig_path: None,
@@ -258,6 +266,23 @@ fn detect_entry_file(src_dir: &Path) -> PathBuf {
         }
     }
 
+    // Default fallback
+    src_dir.join("app.tsx")
+}
+
+/// Detect the SSR entry file (e.g., app.tsx) for server-side rendering.
+///
+/// This is the module loaded by the persistent V8 isolate. It exports
+/// `App`, `theme`, `styles`, and `getInjectedCSS` matching the SSRModule
+/// interface from `@vertz/ui-server`.
+pub fn detect_ssr_entry(src_dir: &Path) -> PathBuf {
+    let candidates = ["app.tsx", "app.ts", "app.jsx", "app.js"];
+    for candidate in &candidates {
+        let path = src_dir.join(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
     // Default fallback
     src_dir.join("app.tsx")
 }
@@ -596,6 +621,58 @@ mod tests {
         .unwrap();
         let result = resolve_plugin_choice(None, Some("vue"), dir.path());
         assert_eq!(result, PluginChoice::React);
+    }
+
+    // --- detect_ssr_entry tests ---
+
+    #[test]
+    fn detect_ssr_entry_finds_app_tsx() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.tsx"), "").unwrap();
+        let result = detect_ssr_entry(dir.path());
+        assert_eq!(result, dir.path().join("app.tsx"));
+    }
+
+    #[test]
+    fn detect_ssr_entry_finds_app_ts_when_no_tsx() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.ts"), "").unwrap();
+        let result = detect_ssr_entry(dir.path());
+        assert_eq!(result, dir.path().join("app.ts"));
+    }
+
+    #[test]
+    fn detect_ssr_entry_prefers_tsx_over_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.tsx"), "").unwrap();
+        std::fs::write(dir.path().join("app.ts"), "").unwrap();
+        let result = detect_ssr_entry(dir.path());
+        assert_eq!(result, dir.path().join("app.tsx"));
+    }
+
+    #[test]
+    fn detect_ssr_entry_falls_back_to_app_tsx() {
+        let dir = tempfile::tempdir().unwrap();
+        // No app.* files at all
+        let result = detect_ssr_entry(dir.path());
+        assert_eq!(result, dir.path().join("app.tsx"));
+    }
+
+    #[test]
+    fn config_has_separate_ssr_and_client_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.tsx"), "").unwrap();
+        std::fs::write(src.join("entry-client.ts"), "").unwrap();
+        let config = ServerConfig::with_root(
+            3000,
+            "localhost".to_string(),
+            dir.path().join("public"),
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(config.ssr_entry, src.join("app.tsx"));
+        assert_eq!(config.entry_file, src.join("entry-client.ts"));
     }
 
     #[test]
