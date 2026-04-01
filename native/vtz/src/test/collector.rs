@@ -4,7 +4,19 @@ use walkdir::WalkDir;
 
 /// Default test file patterns.
 const DEFAULT_INCLUDE: &[&str] = &["**/*.test.ts", "**/*.test.tsx"];
+/// Default e2e test file patterns.
+const DEFAULT_E2E_INCLUDE: &[&str] = &["**/*.e2e.ts", "**/*.e2e.tsx"];
 const DEFAULT_EXCLUDE_DIRS: &[&str] = &["node_modules", "dist", ".vertz", ".git"];
+
+/// Controls which file patterns the test collector uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscoveryMode {
+    /// Standard unit/integration tests: `*.test.{ts,tsx}`
+    #[default]
+    Unit,
+    /// E2E tests: `*.e2e.{ts,tsx}`
+    E2e,
+}
 
 /// Discover test files matching the given patterns.
 ///
@@ -18,9 +30,14 @@ pub fn discover_test_files(
     paths: &[PathBuf],
     include: &[String],
     exclude: &[String],
+    mode: DiscoveryMode,
 ) -> Vec<PathBuf> {
+    let default_patterns = match mode {
+        DiscoveryMode::Unit => DEFAULT_INCLUDE,
+        DiscoveryMode::E2e => DEFAULT_E2E_INCLUDE,
+    };
     let include_patterns: Vec<&str> = if include.is_empty() {
-        DEFAULT_INCLUDE.to_vec()
+        default_patterns.to_vec()
     } else {
         include.iter().map(|s| s.as_str()).collect()
     };
@@ -195,7 +212,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_project(tmp.path());
 
-        let files = discover_test_files(tmp.path(), &[], &[], &[]);
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::Unit);
 
         assert_eq!(files.len(), 4);
         // Should be sorted
@@ -214,7 +231,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_project(tmp.path());
 
-        let files = discover_test_files(tmp.path(), &[], &[], &[]);
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::Unit);
 
         let paths_str: Vec<String> = files
             .iter()
@@ -235,7 +252,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_project(tmp.path());
 
-        let files = discover_test_files(tmp.path(), &[PathBuf::from("src/entities")], &[], &[]);
+        let files = discover_test_files(
+            tmp.path(),
+            &[PathBuf::from("src/entities")],
+            &[],
+            &[],
+            DiscoveryMode::Unit,
+        );
 
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().unwrap().to_str().unwrap() == "task.test.ts");
@@ -251,6 +274,7 @@ mod tests {
             &[PathBuf::from("src/__tests__/math.test.ts")],
             &[],
             &[],
+            DiscoveryMode::Unit,
         );
 
         assert_eq!(files.len(), 1);
@@ -262,7 +286,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_project(tmp.path());
 
-        let files = discover_test_files(tmp.path(), &[], &["**/*.test.tsx".to_string()], &[]);
+        let files = discover_test_files(
+            tmp.path(),
+            &[],
+            &["**/*.test.tsx".to_string()],
+            &[],
+            DiscoveryMode::Unit,
+        );
 
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().unwrap().to_str().unwrap() == "card.test.tsx");
@@ -273,7 +303,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_project(tmp.path());
 
-        let files = discover_test_files(tmp.path(), &[], &[], &["__tests__".to_string()]);
+        let files = discover_test_files(
+            tmp.path(),
+            &[],
+            &[],
+            &["__tests__".to_string()],
+            DiscoveryMode::Unit,
+        );
 
         // Should exclude files in __tests__ directory
         let names: Vec<&str> = files
@@ -291,7 +327,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_project(tmp.path());
 
-        let files = discover_test_files(tmp.path(), &[], &[], &[]);
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::Unit);
 
         // Files should be sorted by full path
         let is_sorted = files.windows(2).all(|w| w[0] <= w[1]);
@@ -302,7 +338,7 @@ mod tests {
     fn test_discover_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();
 
-        let files = discover_test_files(tmp.path(), &[], &[], &[]);
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::Unit);
 
         assert!(files.is_empty());
     }
@@ -316,6 +352,7 @@ mod tests {
             &[PathBuf::from("nonexistent.test.ts")],
             &[],
             &[],
+            DiscoveryMode::Unit,
         );
 
         assert!(files.is_empty());
@@ -326,11 +363,124 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("source.ts"), "// source").unwrap();
 
-        let files = discover_test_files(tmp.path(), &[PathBuf::from("source.ts")], &[], &[]);
+        let files = discover_test_files(
+            tmp.path(),
+            &[PathBuf::from("source.ts")],
+            &[],
+            &[],
+            DiscoveryMode::Unit,
+        );
 
         assert!(
             files.is_empty(),
             "Non-test files should not match include patterns"
         );
+    }
+
+    fn create_e2e_test_project(dir: &Path) {
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("tests")).unwrap();
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+
+        // E2E test files
+        fs::write(dir.join("src/login.e2e.ts"), "// e2e").unwrap();
+        fs::write(dir.join("src/signup.e2e.tsx"), "// e2e").unwrap();
+        fs::write(dir.join("tests/checkout.e2e.ts"), "// e2e").unwrap();
+
+        // Regular test files (should be ignored in e2e mode)
+        fs::write(dir.join("src/math.test.ts"), "// unit test").unwrap();
+        fs::write(dir.join("src/card.test.tsx"), "// unit test").unwrap();
+
+        // Non-test files
+        fs::write(dir.join("src/app.ts"), "// source").unwrap();
+
+        // Excluded directory
+        fs::write(dir.join("node_modules/pkg/index.e2e.ts"), "// excluded").unwrap();
+    }
+
+    #[test]
+    fn test_e2e_mode_discovers_e2e_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_e2e_test_project(tmp.path());
+
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::E2e);
+
+        assert_eq!(files.len(), 3);
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(names.contains(&"login.e2e.ts"));
+        assert!(names.contains(&"signup.e2e.tsx"));
+        assert!(names.contains(&"checkout.e2e.ts"));
+    }
+
+    #[test]
+    fn test_e2e_mode_ignores_unit_test_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_e2e_test_project(tmp.path());
+
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::E2e);
+
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"math.test.ts"));
+        assert!(!names.contains(&"card.test.tsx"));
+    }
+
+    #[test]
+    fn test_unit_mode_ignores_e2e_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_e2e_test_project(tmp.path());
+
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::Unit);
+
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"login.e2e.ts"));
+        assert!(!names.contains(&"signup.e2e.tsx"));
+        assert!(names.contains(&"math.test.ts"));
+        assert!(names.contains(&"card.test.tsx"));
+    }
+
+    #[test]
+    fn test_e2e_mode_excludes_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_e2e_test_project(tmp.path());
+
+        let files = discover_test_files(tmp.path(), &[], &[], &[], DiscoveryMode::E2e);
+
+        for f in &files {
+            assert!(
+                !f.to_string_lossy().contains("node_modules"),
+                "Should exclude node_modules: {:?}",
+                f
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_mode_respects_custom_exclude() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_e2e_test_project(tmp.path());
+
+        let files = discover_test_files(
+            tmp.path(),
+            &[],
+            &[],
+            &["tests".to_string()],
+            DiscoveryMode::E2e,
+        );
+
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"checkout.e2e.ts"));
+        assert!(names.contains(&"login.e2e.ts"));
     }
 }

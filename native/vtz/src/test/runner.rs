@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use super::collector::discover_test_files;
+use super::collector::{discover_test_files, DiscoveryMode};
 use super::executor::{execute_test_file_with_options, ExecuteOptions, TestFileResult};
 use super::reporter::json::format_json;
 use super::reporter::junit::format_junit;
@@ -78,6 +78,7 @@ pub fn run_tests(config: TestRunConfig) -> (TestRunResult, String) {
         &config.paths,
         &config.include,
         &config.exclude,
+        DiscoveryMode::Unit,
     );
 
     // Also check for type test files (skip when specific paths are provided)

@@ -16,3 +16,5 @@ pub mod test;
 pub mod tsconfig;
 pub mod typecheck;
 pub mod watcher;
+#[cfg(feature = "desktop")]
+pub mod webview;

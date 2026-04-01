@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use deno_core::error::AnyError;
 
-use super::collector::discover_test_files;
+use super::collector::{discover_test_files, DiscoveryMode};
 
 /// Result of migrating a single file.
 #[derive(Debug)]
@@ -22,7 +22,7 @@ pub struct MigrateResult {
 
 /// Run the migration codemod on a directory.
 pub fn migrate_tests(root_dir: &Path, dry_run: bool) -> Result<MigrateResult, AnyError> {
-    let test_files = discover_test_files(root_dir, &[], &[], &[]);
+    let test_files = discover_test_files(root_dir, &[], &[], &[], DiscoveryMode::Unit);
 
     let mut results = Vec::new();
     let mut files_changed = 0;

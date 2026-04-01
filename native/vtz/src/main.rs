@@ -8,38 +8,215 @@ use vertz_runtime::config::{resolve_auto_install, ServerConfig};
 use vertz_runtime::pm;
 use vertz_runtime::pm::output::{error_code_from_message, JsonOutput, PmOutput, TextOutput};
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
+    // Desktop mode: webview event loop on main thread, tokio on background
+    #[cfg(feature = "desktop")]
+    if let Command::Dev(ref args) = cli.command {
+        if args.desktop {
+            run_desktop_mode(cli);
+            return;
+        }
+    }
+
+    // E2E test mode: webview event loop on main thread, tokio on background
+    #[cfg(feature = "desktop")]
+    if let Command::Test(ref args) = cli.command {
+        if args.e2e {
+            run_e2e_test_mode(cli);
+            return;
+        }
+    }
+
+    // Normal mode: tokio runtime on main thread
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async_main(cli));
+}
+
+/// Build a ServerConfig from DevArgs (shared between normal and desktop mode).
+fn build_dev_config(args: &cli::DevArgs) -> ServerConfig {
+    let mut config = ServerConfig::new(args.port, args.host.clone(), args.public_dir.clone());
+    config.enable_typecheck = !args.no_typecheck;
+    config.open_browser = args.open;
+    config.tsconfig_path = args.tsconfig.clone();
+    config.typecheck_binary = args.typecheck_binary.clone();
+    config.auto_install =
+        resolve_auto_install(args.no_auto_install, args.auto_install, &config.root_dir);
+    config.watch_deps = !args.no_watch_deps;
+
+    let vertzrc = vertz_runtime::pm::vertzrc::load_vertzrc(&config.root_dir).unwrap_or_default();
+    config.plugin = vertz_runtime::config::resolve_plugin_choice(
+        args.plugin.as_deref(),
+        vertzrc.plugin.as_deref(),
+        &config.root_dir,
+    );
+    config.extra_watch_paths = vertzrc.extra_watch_paths;
+    config.proxy_name = args.name.clone();
+    config
+}
+
+#[cfg(feature = "desktop")]
+fn run_desktop_mode(cli: Cli) {
+    use vertz_runtime::server::http::{start_server_with_lifecycle, ServerLifecycle};
+    use vertz_runtime::webview::{UserEvent, WebviewApp, WebviewOptions};
+
+    let Command::Dev(args) = cli.command else {
+        unreachable!()
+    };
+
+    let config = build_dev_config(&args);
+
+    // Derive window title from project name or directory
+    let title = config
+        .root_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "VTZ".to_string());
+
+    let (app, shutdown_rx) = WebviewApp::new(WebviewOptions {
+        title,
+        width: args.width,
+        height: args.height,
+        hidden: false,
+        devtools: cfg!(debug_assertions),
+    })
+    .expect("failed to create webview");
+
+    let proxy = app.proxy();
+
+    // Background thread: tokio runtime + dev server
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(async move {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
+
+            // Forward ready notification to webview
+            let proxy_for_ready = proxy.clone();
+            tokio::spawn(async move {
+                if let Ok(port) = ready_rx.await {
+                    let _ = proxy_for_ready.send_event(UserEvent::ServerReady { port });
+                }
+            });
+
+            // Forward webview close to server shutdown
+            tokio::spawn(async move {
+                let _ = shutdown_rx.await;
+                let _ = shutdown_tx.send(());
+            });
+
+            let lifecycle = ServerLifecycle {
+                ready_tx,
+                shutdown_rx: server_shutdown_rx,
+            };
+
+            if let Err(e) = start_server_with_lifecycle(config, Some(lifecycle)).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        });
+    });
+
+    // Main thread: run the native event loop (blocks forever)
+    app.run();
+}
+
+/// E2E test mode: hidden webview on main thread, tokio + test runner on background thread.
+#[cfg(feature = "desktop")]
+fn run_e2e_test_mode(cli: Cli) {
+    use vertz_runtime::test::e2e_runner::run_e2e_tests;
+    use vertz_runtime::webview::{UserEvent, WebviewApp, WebviewOptions};
+
+    let Command::Test(args) = cli.command else {
+        unreachable!()
+    };
+
+    let root_dir = args.root_dir.unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+
+    let headed = args.headed || args.devtools;
+
+    let (app, _shutdown_rx) = WebviewApp::new(WebviewOptions {
+        title: "VTZ E2E".to_string(),
+        width: 1024,
+        height: 768,
+        hidden: !headed,
+        devtools: args.devtools,
+    })
+    .expect("failed to create webview");
+
+    let proxy = app.proxy();
+    // Load config file (if present)
+    let file_config = vertz_runtime::test::config::load_test_config(&root_dir).unwrap_or_default();
+
+    let reporter_str = args
+        .reporter
+        .as_deref()
+        .or(file_config.reporter.as_deref())
+        .unwrap_or("terminal");
+    let reporter = match reporter_str {
+        "json" => vertz_runtime::test::runner::ReporterFormat::Json,
+        "junit" => vertz_runtime::test::runner::ReporterFormat::Junit,
+        _ => vertz_runtime::test::runner::ReporterFormat::Terminal,
+    };
+
+    let test_config = vertz_runtime::test::runner::TestRunConfig {
+        root_dir: root_dir.clone(),
+        paths: args.paths,
+        include: file_config.include,
+        exclude: file_config.exclude,
+        concurrency: args.concurrency.or(file_config.concurrency),
+        filter: args.filter,
+        bail: args.bail,
+        timeout_ms: args.timeout.or(file_config.timeout_ms).unwrap_or(30_000),
+        reporter,
+        coverage: false,
+        coverage_threshold: 0.0,
+        preload: if args.no_preload {
+            vec![]
+        } else {
+            file_config.preload
+        },
+        no_cache: args.no_cache,
+    };
+
+    // Build a server config for the e2e dev server (port 0 = OS-assigned)
+    let mut server_config = ServerConfig::new(0, "127.0.0.1".to_string(), None);
+    server_config.root_dir = root_dir;
+
+    let proxy_for_quit = proxy.clone();
+
+    // Background thread: tokio runtime + e2e test runner
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
+
+        rt.block_on(async move {
+            let (result, output) = run_e2e_tests(test_config, server_config, proxy).await;
+            print!("{}", output);
+
+            let code = if result.success() { 0 } else { 1 };
+
+            // Signal the webview to close, then exit with the test result code
+            let _ = proxy_for_quit.send_event(UserEvent::Quit);
+            // Give the event loop a moment to process Quit before forcing exit
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::process::exit(code);
+        });
+    });
+
+    // Main thread: run the native event loop (blocks until Quit event)
+    app.run();
+}
+
+async fn async_main(cli: Cli) {
     match cli.command {
         Command::Dev(args) => {
-            let mut config = ServerConfig::new(args.port, args.host, args.public_dir);
-            config.enable_typecheck = !args.no_typecheck;
-            config.open_browser = args.open;
-            config.tsconfig_path = args.tsconfig;
-            config.typecheck_binary = args.typecheck_binary;
-
-            // Resolve auto_install: CLI flag > .vertzrc > CI guard > default
-            config.auto_install =
-                resolve_auto_install(args.no_auto_install, args.auto_install, &config.root_dir);
-
-            // Wire --no-watch-deps flag
-            config.watch_deps = !args.no_watch_deps;
-
-            // Load .vertzrc once and extract all fields from it
-            let vertzrc =
-                vertz_runtime::pm::vertzrc::load_vertzrc(&config.root_dir).unwrap_or_default();
-
-            // Resolve plugin choice: CLI flag > .vertzrc > auto-detect > default
-            config.plugin = vertz_runtime::config::resolve_plugin_choice(
-                args.plugin.as_deref(),
-                vertzrc.plugin.as_deref(),
-                &config.root_dir,
-            );
-
-            config.extra_watch_paths = vertzrc.extra_watch_paths;
-            config.proxy_name = args.name;
+            let config = build_dev_config(&args);
 
             if let Err(e) = vertz_runtime::server::http::start_server(config).await {
                 eprintln!("Error: {}", e);

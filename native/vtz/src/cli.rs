@@ -108,6 +108,21 @@ pub struct DevArgs {
     /// Custom name for proxy subdomain override (e.g., --name dashboard → https://dashboard.localhost)
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Open the app in a native desktop window instead of a browser tab (requires desktop feature)
+    #[cfg(feature = "desktop")]
+    #[arg(long)]
+    pub desktop: bool,
+
+    /// Initial window width in pixels (only with --desktop)
+    #[cfg(feature = "desktop")]
+    #[arg(long, default_value_t = 1024, requires = "desktop")]
+    pub width: u32,
+
+    /// Initial window height in pixels (only with --desktop)
+    #[cfg(feature = "desktop")]
+    #[arg(long, default_value_t = 768, requires = "desktop")]
+    pub height: u32,
 }
 
 #[derive(Parser, Debug)]
@@ -159,6 +174,21 @@ pub struct TestArgs {
     /// Skip compilation cache (compile everything fresh)
     #[arg(long)]
     pub no_cache: bool,
+
+    /// Run e2e tests (requires desktop feature: discovers *.e2e.ts files, starts dev server + webview)
+    #[cfg(feature = "desktop")]
+    #[arg(long)]
+    pub e2e: bool,
+
+    /// Show the webview window during e2e tests (only valid with --e2e)
+    #[cfg(feature = "desktop")]
+    #[arg(long, requires = "e2e")]
+    pub headed: bool,
+
+    /// Open devtools in the webview during e2e tests (implies --headed, only valid with --e2e)
+    #[cfg(feature = "desktop")]
+    #[arg(long, requires = "e2e")]
+    pub devtools: bool,
 }
 
 #[derive(Parser, Debug)]

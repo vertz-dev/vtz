@@ -361,7 +361,7 @@ fn inspector_post_message_sync<T: serde::Serialize>(
     }
 }
 
-fn parse_test_results(value: &serde_json::Value) -> Result<Vec<TestResult>, AnyError> {
+pub(crate) fn parse_test_results(value: &serde_json::Value) -> Result<Vec<TestResult>, AnyError> {
     let arr = value
         .as_array()
         .ok_or_else(|| deno_core::anyhow::anyhow!("Expected array of test results"))?;
