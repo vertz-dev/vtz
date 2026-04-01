@@ -204,37 +204,35 @@ async fn resolve_recursive(
                 return Ok(());
             }
 
-            // Use lockfile version — still need metadata for transitive deps
-            let metadata =
-                get_or_fetch_metadata(name, state.registry, &mut state.metadata_cache).await?;
-            if let Some(version_meta) = metadata.versions.get(&entry.version) {
-                let resolved = ResolvedPackage {
-                    name: name.to_string(),
-                    version: entry.version.clone(),
-                    tarball_url: version_meta.dist.tarball.clone(),
-                    integrity: version_meta.dist.integrity.clone(),
-                    dependencies: version_meta.dependencies.clone(),
-                    bin: version_meta.bin.to_map(name),
-                    nest_path: vec![],
-                };
-                if !version_meta.scripts.is_empty() {
-                    state
-                        .graph
-                        .scripts
-                        .insert(graph_key.clone(), version_meta.scripts.clone());
-                }
-                state.graph.packages.insert(graph_key, resolved);
-
-                // Resolve transitive deps (skip transitive devDeps)
-                state.parent_chain.push(name.to_string());
-                let deps: Vec<_> = version_meta.dependencies.clone().into_iter().collect();
-                for (dep_name, dep_range) in &deps {
-                    resolve_recursive(dep_name, dep_range, state).await?;
-                }
-                state.parent_chain.pop();
-
-                return Ok(());
+            // Use lockfile data directly — no registry fetch needed.
+            // The lockfile stores version, tarball URL, integrity, dependencies,
+            // bin, and scripts, which is everything we need.
+            let resolved = ResolvedPackage {
+                name: name.to_string(),
+                version: entry.version.clone(),
+                tarball_url: entry.resolved.clone(),
+                integrity: entry.integrity.clone(),
+                dependencies: entry.dependencies.clone(),
+                bin: entry.bin.clone(),
+                nest_path: vec![],
+            };
+            if !entry.scripts.is_empty() {
+                state
+                    .graph
+                    .scripts
+                    .insert(graph_key.clone(), entry.scripts.clone());
             }
+            state.graph.packages.insert(graph_key, resolved);
+
+            // Resolve transitive deps from lockfile entry
+            state.parent_chain.push(name.to_string());
+            let deps: Vec<_> = entry.dependencies.clone().into_iter().collect();
+            for (dep_name, dep_range) in &deps {
+                resolve_recursive(dep_name, dep_range, state).await?;
+            }
+            state.parent_chain.pop();
+
+            return Ok(());
         }
     }
 
@@ -414,6 +412,8 @@ pub fn graph_to_lockfile(
             .values()
             .find(|p| p.name == *name && p.nest_path.is_empty())
         {
+            let graph_key = ResolvedGraph::key(name, &pkg.version);
+            let scripts = graph.scripts.get(&graph_key).cloned().unwrap_or_default();
             lockfile.entries.insert(
                 key,
                 LockfileEntry {
@@ -423,6 +423,8 @@ pub fn graph_to_lockfile(
                     resolved: pkg.tarball_url.clone(),
                     integrity: pkg.integrity.clone(),
                     dependencies: pkg.dependencies.clone(),
+                    bin: pkg.bin.clone(),
+                    scripts,
                     optional: optional_names.contains(name),
                     overridden: false,
                 },
@@ -454,6 +456,12 @@ pub fn graph_to_lockfile(
                 };
 
                 if let Some(dep_pkg) = dep_pkg {
+                    let dep_graph_key = ResolvedGraph::key(&dep_pkg.name, &dep_pkg.version);
+                    let dep_scripts = graph
+                        .scripts
+                        .get(&dep_graph_key)
+                        .cloned()
+                        .unwrap_or_default();
                     entry.insert(LockfileEntry {
                         name: dep_name.clone(),
                         range: dep_range.clone(),
@@ -461,6 +469,8 @@ pub fn graph_to_lockfile(
                         resolved: dep_pkg.tarball_url.clone(),
                         integrity: dep_pkg.integrity.clone(),
                         dependencies: dep_pkg.dependencies.clone(),
+                        bin: dep_pkg.bin.clone(),
+                        scripts: dep_scripts,
                         optional: false,
                         overridden: false,
                     });
@@ -481,6 +491,8 @@ pub fn graph_to_lockfile(
                 resolved: format!("link:{}", ws.path),
                 integrity: String::new(),
                 dependencies: BTreeMap::new(),
+                bin: BTreeMap::new(),
+                scripts: BTreeMap::new(),
                 optional: false,
                 overridden: false,
             },
