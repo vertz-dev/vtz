@@ -47,6 +47,34 @@
       return Deno.core.ops.op_e2e_url();
     },
 
+    async click(selector, opts = {}) {
+      return Deno.core.ops.op_e2e_click(selector, opts.timeout ?? 5000);
+    },
+
+    async fill(selector, value, opts = {}) {
+      return Deno.core.ops.op_e2e_fill(selector, value, opts.timeout ?? 5000);
+    },
+
+    async type(selector, text, opts = {}) {
+      return Deno.core.ops.op_e2e_type(selector, text, opts.timeout ?? 5000);
+    },
+
+    async press(key, opts = {}) {
+      return Deno.core.ops.op_e2e_press(key, opts.timeout ?? 5000);
+    },
+
+    async check(selector, opts = {}) {
+      return Deno.core.ops.op_e2e_check(selector, opts.timeout ?? 5000);
+    },
+
+    async uncheck(selector, opts = {}) {
+      return Deno.core.ops.op_e2e_uncheck(selector, opts.timeout ?? 5000);
+    },
+
+    async selectOption(selector, value, opts = {}) {
+      return Deno.core.ops.op_e2e_select_option(selector, value, opts.timeout ?? 5000);
+    },
+
     async query(selector) {
       const id = await Deno.core.ops.op_e2e_query(selector);
       return id != null ? new ElementHandle(id) : null;

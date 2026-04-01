@@ -314,6 +314,251 @@ pub async fn op_e2e_evaluate(
     Ok(strip_json_quotes(&result))
 }
 
+/// Click an element: dispatches mousedown, mouseup, click event sequence.
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_click(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] selector: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let js = format!(
+        r#"(() => {{
+            const el = {};
+            if (!el) throw new Error('Element not found: {}');
+            if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded();
+            el.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true, composed:true}}));
+            el.dispatchEvent(new MouseEvent('mouseup', {{bubbles:true, composed:true}}));
+            el.dispatchEvent(new MouseEvent('click', {{bubbles:true, composed:true}}));
+            return 'ok';
+        }})()"#,
+        resolve_element_js(&selector),
+        escape_selector(&selector)
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
+/// Fill an input/textarea: clears value, sets new value, dispatches input + change.
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_fill(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] selector: String,
+    #[string] value: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let escaped_value = value
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n");
+    let js = format!(
+        r#"(() => {{
+            const el = {};
+            if (!el) throw new Error('Element not found: {}');
+            el.focus();
+            el.value = '';
+            el.value = '{}';
+            el.dispatchEvent(new Event('input', {{bubbles:true}}));
+            el.dispatchEvent(new Event('change', {{bubbles:true}}));
+            return 'ok';
+        }})()"#,
+        resolve_element_js(&selector),
+        escape_selector(&selector),
+        escaped_value
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
+/// Type text character by character: dispatches keydown/keypress/input/keyup per char.
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_type(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] selector: String,
+    #[string] text: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let js = format!(
+        r#"(() => {{
+            const el = {};
+            if (!el) throw new Error('Element not found: {}');
+            el.focus();
+            const text = '{}';
+            for (const ch of text) {{
+                el.dispatchEvent(new KeyboardEvent('keydown', {{key:ch, bubbles:true}}));
+                el.dispatchEvent(new KeyboardEvent('keypress', {{key:ch, bubbles:true}}));
+                el.value = (el.value || '') + ch;
+                el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {{key:ch, bubbles:true}}));
+            }}
+            return 'ok';
+        }})()"#,
+        resolve_element_js(&selector),
+        escape_selector(&selector),
+        escaped_text
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
+/// Press a key on the currently focused element.
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_press(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] key: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+    let js = format!(
+        r#"(() => {{
+            const el = document.activeElement || document.body;
+            const key = '{}';
+            const opts = {{key, bubbles:true, composed:true}};
+            el.dispatchEvent(new KeyboardEvent('keydown', opts));
+            el.dispatchEvent(new KeyboardEvent('keypress', opts));
+            el.dispatchEvent(new KeyboardEvent('keyup', opts));
+            return 'ok';
+        }})()"#,
+        escaped_key
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
+/// Check a checkbox (click if not already checked).
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_check(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] selector: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let js = format!(
+        r#"(() => {{
+            const el = {};
+            if (!el) throw new Error('Element not found: {}');
+            if (!el.checked) {{
+                el.dispatchEvent(new MouseEvent('click', {{bubbles:true, composed:true}}));
+            }}
+            return 'ok';
+        }})()"#,
+        resolve_element_js(&selector),
+        escape_selector(&selector)
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
+/// Uncheck a checkbox (click if currently checked).
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_uncheck(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] selector: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let js = format!(
+        r#"(() => {{
+            const el = {};
+            if (!el) throw new Error('Element not found: {}');
+            if (el.checked) {{
+                el.dispatchEvent(new MouseEvent('click', {{bubbles:true, composed:true}}));
+            }}
+            return 'ok';
+        }})()"#,
+        resolve_element_js(&selector),
+        escape_selector(&selector)
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
+/// Select an option in a <select> element.
+#[cfg(feature = "desktop")]
+#[op2(async)]
+#[string]
+pub async fn op_e2e_select_option(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] selector: String,
+    #[string] value: String,
+    #[bigint] timeout_ms: u64,
+) -> Result<String, AnyError> {
+    let bridge = {
+        let state = state.borrow();
+        state.borrow::<WebviewBridge>().clone()
+    };
+    let escaped_value = value.replace('\\', "\\\\").replace('\'', "\\'");
+    let js = format!(
+        r#"(() => {{
+            const el = {};
+            if (!el) throw new Error('Element not found: {}');
+            el.value = '{}';
+            el.dispatchEvent(new Event('change', {{bubbles:true}}));
+            return 'ok';
+        }})()"#,
+        resolve_element_js(&selector),
+        escape_selector(&selector),
+        escaped_value
+    );
+    bridge
+        .eval(&js, timeout_ms)
+        .await
+        .map_err(|e| deno_core::anyhow::anyhow!("{}", e))?;
+    Ok("ok".to_string())
+}
+
 /// Get op declarations for e2e ops (only used in e2e test mode).
 #[cfg(feature = "desktop")]
 pub fn op_decls() -> Vec<OpDecl> {
@@ -328,6 +573,13 @@ pub fn op_decls() -> Vec<OpDecl> {
         op_e2e_is_visible(),
         op_e2e_is_checked(),
         op_e2e_evaluate(),
+        op_e2e_click(),
+        op_e2e_fill(),
+        op_e2e_type(),
+        op_e2e_press(),
+        op_e2e_check(),
+        op_e2e_uncheck(),
+        op_e2e_select_option(),
     ]
 }
 
@@ -427,7 +679,7 @@ mod tests {
         #[cfg(not(feature = "desktop"))]
         assert!(decls.is_empty());
         #[cfg(feature = "desktop")]
-        assert_eq!(decls.len(), 10);
+        assert_eq!(decls.len(), 17);
     }
 
     #[test]
@@ -436,6 +688,14 @@ mod tests {
         assert!(E2E_BOOTSTRAP_JS.contains("ElementHandle"));
         assert!(E2E_BOOTSTRAP_JS.contains("navigate"));
         assert!(E2E_BOOTSTRAP_JS.contains("waitForSelector"));
+        // Phase 4 interaction methods
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_click"));
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_fill"));
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_type"));
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_press"));
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_check"));
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_uncheck"));
+        assert!(E2E_BOOTSTRAP_JS.contains("op_e2e_select_option"));
     }
 
     #[test]
