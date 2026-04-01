@@ -167,13 +167,51 @@ pub async fn handle_source_file(
             }
         }
 
-        // Clear any previous errors for this file
-        let broadcaster = state.error_broadcaster.clone();
-        tokio::spawn(async move {
-            broadcaster
-                .clear_file(ErrorCategory::Build, &file_str)
-                .await;
-        });
+        if result.warnings.is_empty() {
+            // No errors and no warnings — clear any previous errors for this file
+            let broadcaster = state.error_broadcaster.clone();
+            tokio::spawn(async move {
+                broadcaster
+                    .clear_file(ErrorCategory::Build, &file_str)
+                    .await;
+            });
+        } else {
+            // Warnings present — broadcast them to the error overlay so the
+            // developer sees CSS diagnostics, unknown tokens, etc.
+            let source = std::fs::read_to_string(&file_path).unwrap_or_default();
+            let primary = &result.warnings[0];
+            let warning_msg = &primary.message;
+
+            let suggestion = suggestions::suggest_build_fix(warning_msg);
+            let mut error = DevError::build(warning_msg).with_file(&file_str);
+
+            if let (Some(line), Some(col)) = (primary.line, primary.column) {
+                error = error.with_location(line, col);
+                if !source.is_empty() {
+                    error = error.with_snippet(extract_snippet(&source, line, 3));
+                }
+            } else if !source.is_empty() {
+                let (parsed_line, parsed_col) = parse_location_from_message(warning_msg);
+                if let Some(line) = parsed_line {
+                    error = error.with_location(line, parsed_col.unwrap_or(1));
+                    error = error.with_snippet(extract_snippet(&source, line, 3));
+                }
+            }
+
+            if let Some(s) = suggestion {
+                error = error.with_suggestion(s);
+            }
+
+            let broadcaster = state.error_broadcaster.clone();
+            let file_str_clone = file_str.clone();
+            tokio::spawn(async move {
+                // Clear previous errors first, then report the warning
+                broadcaster
+                    .clear_file(ErrorCategory::Build, &file_str_clone)
+                    .await;
+                broadcaster.report_error(error).await;
+            });
+        }
     }
 
     Response::builder()
@@ -2486,5 +2524,112 @@ mod tests {
 
         let resp = handle_source_file(State(state), req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── handle_source_file: CSS warnings reach error overlay ─────
+
+    /// Helper: poll the error broadcaster until a condition is met or timeout.
+    async fn poll_broadcaster(
+        broadcaster: &ErrorBroadcaster,
+        condition: impl Fn(&str) -> bool,
+        timeout_msg: &str,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::task::yield_now().await;
+            let current = broadcaster.current_state().await;
+            let p = current.to_json();
+            if condition(&p) {
+                return p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{}: {}",
+                timeout_msg,
+                p
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_warnings_broadcast_to_error_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Write a file with a css() call that triggers a CSS warning.
+        // 'text:sm' uses 'sm' which is not a valid color token — the compiler
+        // will emit a [css-unknown-color-token] diagnostic classified as a warning.
+        std::fs::write(
+            tmp.path().join("src/sidebar.tsx"),
+            r#"const styles = css({ root: ['text:sm'] });
+export default function Sidebar() { return <div class={styles.root}>Hi</div>; }
+"#,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/sidebar.tsx")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_source_file(State(state.clone()), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The warning should appear in the error broadcaster (via tokio::spawn).
+        let payload = poll_broadcaster(
+            &state.error_broadcaster,
+            |p| p.contains("css-unknown-color-token"),
+            "timed out waiting for CSS warning to appear in error broadcaster",
+        )
+        .await;
+        assert!(payload.contains("css-unknown-color-token"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_source_file_warnings_clear_when_file_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = create_test_state(tmp.path());
+
+        // Step 1: Compile a file with CSS warning
+        std::fs::write(
+            tmp.path().join("src/sidebar.tsx"),
+            r#"const styles = css({ root: ['text:sm'] });
+export default function Sidebar() { return <div class={styles.root}>Hi</div>; }
+"#,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .uri("/src/sidebar.tsx")
+            .body(Body::empty())
+            .unwrap();
+        handle_source_file(State(state.clone()), req).await;
+
+        poll_broadcaster(
+            &state.error_broadcaster,
+            |p| p.contains("css-unknown-color-token"),
+            "timed out waiting for CSS warning",
+        )
+        .await;
+
+        // Step 2: Compile a DIFFERENT clean file (no warnings)
+        std::fs::write(tmp.path().join("src/clean.tsx"), "export const x = 42;\n").unwrap();
+
+        let req = Request::builder()
+            .uri("/src/clean.tsx")
+            .body(Body::empty())
+            .unwrap();
+        handle_source_file(State(state.clone()), req).await;
+
+        // The clean file clears its own build errors, but the sidebar warning
+        // should still be present (it's for a different file)
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let current = state.error_broadcaster.current_state().await;
+        assert!(
+            current.to_json().contains("css-unknown-color-token"),
+            "warning for sidebar.tsx should still be present after compiling a different file"
+        );
     }
 }

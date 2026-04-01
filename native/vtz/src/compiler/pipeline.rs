@@ -32,6 +32,8 @@ pub struct BrowserCompileResult {
     pub css: Option<String>,
     /// Structured compilation errors, if any.
     pub errors: Vec<CompileError>,
+    /// Compilation warnings (non-fatal diagnostics).
+    pub warnings: Vec<CompileError>,
 }
 
 /// CSS store: maps a hash-based CSS path to the CSS content.
@@ -117,6 +119,7 @@ impl CompilationPipeline {
                 source_map: cached.source_map,
                 css: cached.css,
                 errors: vec![],
+                warnings: vec![],
             };
         }
 
@@ -141,8 +144,9 @@ impl CompilationPipeline {
         };
         let output = self.plugin.compile(&source, &ctx);
 
-        // Convert plugin diagnostics to compile errors (filtering warnings)
+        // Convert plugin diagnostics to errors and warnings
         let compile_errors = crate::plugin::diagnostics_to_errors(&output.diagnostics);
+        let compile_warnings = crate::plugin::diagnostics_to_warnings(&output.diagnostics);
 
         // Plugin post-processing (framework-specific fixups)
         let processed = self.plugin.post_process(&output.code, &ctx);
@@ -199,6 +203,7 @@ impl CompilationPipeline {
             source_map: output.source_map,
             css,
             errors: compile_errors,
+            warnings: compile_warnings,
         }
     }
 
@@ -214,6 +219,7 @@ impl CompilationPipeline {
                 source_map: cached.source_map,
                 css: cached.css,
                 errors: vec![],
+                warnings: vec![],
             };
         }
 
@@ -231,6 +237,7 @@ impl CompilationPipeline {
                         source_map: None,
                         css: None,
                         errors,
+                        warnings: vec![],
                     };
                 }
             }
@@ -267,6 +274,7 @@ impl CompilationPipeline {
             source_map: None,
             css: None,
             errors: vec![],
+            warnings: vec![],
         }
     }
 
@@ -330,6 +338,7 @@ impl CompilationPipeline {
                 line: None,
                 column: None,
             }],
+            warnings: vec![],
         }
     }
 
