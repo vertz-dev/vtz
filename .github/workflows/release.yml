@@ -19,7 +19,10 @@ jobs:
             os: macos-14
             pkg: runtime-darwin-arm64
             expected_arch: arm64
-          # darwin-x64 deferred (V8 cross-compile issue)
+          - target: x86_64-apple-darwin
+            os: macos-13
+            pkg: runtime-darwin-x64
+            expected_arch: x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             pkg: runtime-linux-x64
@@ -115,6 +118,13 @@ jobs:
         with:
           name: runtime-darwin-arm64
           path: npm/runtime-darwin-arm64/
+        continue-on-error: true
+
+      - name: Download darwin-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-darwin-x64
+          path: npm/runtime-darwin-x64/
         continue-on-error: true
 
       - name: Download linux-x64 binary
