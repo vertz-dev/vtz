@@ -215,6 +215,17 @@ fn run_e2e_test_mode(cli: Cli) {
 
 async fn async_main(cli: Cli) {
     match cli.command {
+        Command::Create(args) => {
+            let output: Arc<dyn pm::output::PmOutput> =
+                Arc::new(TextOutput::new(std::io::stderr().is_terminal()));
+
+            if let Err(e) =
+                pm::create::create(&args.template, args.destination.as_deref(), output).await
+            {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Command::Dev(args) => {
             let config = build_dev_config(&args);
 

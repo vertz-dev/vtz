@@ -192,6 +192,15 @@ impl TarballManager {
     }
 }
 
+/// Verify the integrity hash of downloaded bytes.
+/// Public alias for use by `pm::create`.
+pub fn verify_integrity_public(
+    bytes: &[u8],
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    verify_integrity(bytes, expected)
+}
+
 /// Verify the integrity hash of downloaded bytes
 fn verify_integrity(
     bytes: &[u8],
@@ -254,7 +263,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Extract a gzipped tarball to a destination directory with security mitigations
-fn extract_tarball(
+pub fn extract_tarball(
     bytes: &[u8],
     dest: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
