@@ -172,11 +172,14 @@ fn execute_test_file_inner(
     root_dir: &str,
     options: &ExecuteOptions,
 ) -> Result<(Vec<TestResult>, Option<serde_json::Value>), AnyError> {
+    let plugin: std::sync::Arc<dyn crate::plugin::FrameworkPlugin> =
+        std::sync::Arc::new(crate::plugin::vertz::VertzPlugin);
     let mut runtime = VertzJsRuntime::new_for_test(VertzRuntimeOptions {
         root_dir: Some(root_dir.to_string()),
         capture_output: true,
         enable_inspector: options.coverage,
         compile_cache: !options.no_cache,
+        plugin: plugin.clone(),
     })?;
 
     // NOTE: async context + test harness are pre-baked in the V8 snapshot,
@@ -198,22 +201,22 @@ fn execute_test_file_inner(
                 e
             )
         })?;
-        let filename = preload_path.to_string_lossy().to_string();
         let ext = preload_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
         let code = if ext == "ts" || ext == "tsx" {
-            let result = vertz_compiler_core::compile(
-                &preload_source,
-                vertz_compiler_core::CompileOptions {
-                    filename: Some(filename.clone()),
-                    target: Some("ssr".to_string()),
-                    ..Default::default()
-                },
-            );
-            result.code
+            let root_path = std::path::Path::new(root_dir);
+            let src_dir = root_path.join("src");
+            let ctx = crate::plugin::CompileContext {
+                file_path: preload_path,
+                root_dir: root_path,
+                src_dir: &src_dir,
+                target: "ssr",
+            };
+            let output = plugin.compile(&preload_source, &ctx);
+            output.code
         } else {
             preload_source
         };

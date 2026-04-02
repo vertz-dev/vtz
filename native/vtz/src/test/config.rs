@@ -64,22 +64,23 @@ pub fn load_test_config(root_dir: &Path) -> Result<TestConfig, AnyError> {
 
     // Read and compile the config file
     let source = std::fs::read_to_string(&config_path)?;
-    let filename = config_path.to_string_lossy().to_string();
     let ext = config_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
 
     let compiled = if ext == "ts" || ext == "tsx" {
-        let result = vertz_compiler_core::compile(
-            &source,
-            vertz_compiler_core::CompileOptions {
-                filename: Some(filename.clone()),
-                target: Some("ssr".to_string()),
-                ..Default::default()
-            },
-        );
-        result.code
+        let plugin: std::sync::Arc<dyn crate::plugin::FrameworkPlugin> =
+            std::sync::Arc::new(crate::plugin::vertz::VertzPlugin);
+        let src_dir = root_dir.join("src");
+        let ctx = crate::plugin::CompileContext {
+            file_path: &config_path,
+            root_dir,
+            src_dir: &src_dir,
+            target: "ssr",
+        };
+        let output = plugin.compile(&source, &ctx);
+        output.code
     } else {
         source
     };

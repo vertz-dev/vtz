@@ -74,14 +74,11 @@ impl FrameworkPlugin for VertzPlugin {
     }
 
     fn post_process(&self, code: &str, ctx: &CompileContext) -> String {
-        // Apply Vertz-specific post-processing:
-        // 1. Fix wrong API names (effect → domEffect)
-        // 2. Move internal APIs to @vertz/ui/internals
-        // 3. Strip leftover TypeScript artifacts
-        // 4. Deduplicate imports
-        // 5. Strip import.meta.hot (Bun HMR API)
+        // Vertz-specific post-processing:
+        // 1. Fix wrong API names (effect → domEffect) — Vertz compiler quirk
+        // 2. Move internal APIs to @vertz/ui/internals — Vertz compiler quirk
         let processed = crate::compiler::pipeline::post_process_compiled(code);
-        // 6. Fix module ID to use URL-relative path for Fast Refresh registry
+        // 3. Fix module ID to use URL-relative path for Fast Refresh registry
         crate::compiler::pipeline::fix_module_id(&processed, ctx.file_path, ctx.root_dir)
     }
 

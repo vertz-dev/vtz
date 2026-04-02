@@ -40,7 +40,6 @@ pub struct CapturedOutput {
 }
 
 /// Configuration for creating a VertzJsRuntime.
-#[derive(Default)]
 pub struct VertzRuntimeOptions {
     /// Root directory for module resolution. Defaults to current directory.
     pub root_dir: Option<String>,
@@ -50,6 +49,20 @@ pub struct VertzRuntimeOptions {
     pub enable_inspector: bool,
     /// Whether to enable the disk-backed compilation cache. Defaults to false.
     pub compile_cache: bool,
+    /// Framework plugin for compilation. Defaults to VertzPlugin.
+    pub plugin: Arc<dyn crate::plugin::FrameworkPlugin>,
+}
+
+impl Default for VertzRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            root_dir: None,
+            capture_output: false,
+            enable_inspector: false,
+            compile_cache: false,
+            plugin: Arc::new(crate::plugin::vertz::VertzPlugin),
+        }
+    }
 }
 
 /// Wrapper around deno_core's JsRuntime with Vertz-specific extensions.
@@ -141,7 +154,7 @@ impl VertzJsRuntime {
                 .to_string_lossy()
                 .to_string()
         });
-        let module_loader = Rc::new(VertzModuleLoader::new(&root_dir));
+        let module_loader = Rc::new(VertzModuleLoader::new(&root_dir, options.plugin.clone()));
 
         let mut runtime = JsRuntime::new(RuntimeOptions {
             module_loader: Some(module_loader),
@@ -204,7 +217,11 @@ impl VertzJsRuntime {
                 .to_string_lossy()
                 .to_string()
         });
-        let module_loader = Rc::new(VertzModuleLoader::new_with_cache(&root_dir, cache_enabled));
+        let module_loader = Rc::new(VertzModuleLoader::new_with_cache(
+            &root_dir,
+            cache_enabled,
+            options.plugin.clone(),
+        ));
 
         let snapshot = crate::test::snapshot::get_test_snapshot();
 

@@ -12,9 +12,8 @@ use deno_core::ModuleType;
 use deno_core::RequestedModuleType;
 use deno_core::ResolutionKind;
 
-use crate::compiler::pipeline::post_process_compiled;
+use crate::plugin::{CompileContext, FrameworkPlugin};
 use crate::runtime::compile_cache::{CachedCompilation, CompileCache};
-use vertz_compiler_core::CompileOptions;
 
 /// Source maps collected during module loading.
 pub type SourceMapStore = RefCell<HashMap<String, String>>;
@@ -24,7 +23,7 @@ pub type SourceMapStore = RefCell<HashMap<String, String>>;
 /// Handles:
 /// - File system resolution for relative and absolute paths
 /// - Node.js-style resolution for bare specifiers (node_modules)
-/// - TypeScript/TSX compilation via vertz-compiler-core
+/// - TypeScript/TSX compilation via the framework plugin
 /// - Source map collection for error reporting
 /// - URL canonicalization to ensure same physical file = same module identity
 /// - Compilation caching (disk-backed, content-hash-keyed)
@@ -33,25 +32,32 @@ pub struct VertzModuleLoader {
     source_maps: SourceMapStore,
     canon_cache: RefCell<HashMap<PathBuf, PathBuf>>,
     compile_cache: CompileCache,
+    plugin: std::sync::Arc<dyn FrameworkPlugin>,
 }
 
 impl VertzModuleLoader {
-    pub fn new(root_dir: &str) -> Self {
+    pub fn new(root_dir: &str, plugin: std::sync::Arc<dyn FrameworkPlugin>) -> Self {
         Self {
             root_dir: PathBuf::from(root_dir),
             source_maps: RefCell::new(HashMap::new()),
             canon_cache: RefCell::new(HashMap::new()),
             compile_cache: CompileCache::new(Path::new(root_dir), false),
+            plugin,
         }
     }
 
     /// Create a new module loader with compilation caching enabled.
-    pub fn new_with_cache(root_dir: &str, cache_enabled: bool) -> Self {
+    pub fn new_with_cache(
+        root_dir: &str,
+        cache_enabled: bool,
+        plugin: std::sync::Arc<dyn FrameworkPlugin>,
+    ) -> Self {
         Self {
             root_dir: PathBuf::from(root_dir),
             source_maps: RefCell::new(HashMap::new()),
             canon_cache: RefCell::new(HashMap::new()),
             compile_cache: CompileCache::new(Path::new(root_dir), cache_enabled),
+            plugin,
         }
     }
 
@@ -295,11 +301,11 @@ impl VertzModuleLoader {
         }
     }
 
-    /// Compile TypeScript/TSX source code using vertz-compiler-core.
+    /// Compile TypeScript/TSX source code using the framework plugin.
     ///
     /// Checks the disk-backed compilation cache first. On cache hit, skips
     /// the compiler entirely and returns the cached result. On cache miss,
-    /// compiles, post-processes, caches the result, and returns.
+    /// compiles via the plugin, post-processes, caches the result, and returns.
     fn compile_source(&self, source: &str, filename: &str) -> Result<String, AnyError> {
         let target = "ssr";
 
@@ -318,18 +324,21 @@ impl VertzModuleLoader {
             ));
         }
 
-        let result = vertz_compiler_core::compile(
-            source,
-            CompileOptions {
-                filename: Some(filename.to_string()),
-                target: Some(target.to_string()),
-                ..Default::default()
-            },
-        );
+        let file_path = Path::new(filename);
+        let src_dir = self.root_dir.join("src");
+        let ctx = CompileContext {
+            file_path,
+            root_dir: &self.root_dir,
+            src_dir: &src_dir,
+            target,
+        };
 
-        // Check for compilation errors
-        if let Some(ref diagnostics) = result.diagnostics {
-            let errors: Vec<String> = diagnostics
+        let output = self.plugin.compile(source, &ctx);
+
+        // Check for compilation diagnostics
+        if !output.diagnostics.is_empty() {
+            let errors: Vec<String> = output
+                .diagnostics
                 .iter()
                 .map(|d| {
                     let location = match (d.line, d.column) {
@@ -342,20 +351,19 @@ impl VertzModuleLoader {
 
             if !errors.is_empty() {
                 // Diagnostics are warnings, not hard errors — log but don't fail
-                // (the vertz compiler may emit diagnostics that are informational)
+                // (the compiler may emit diagnostics that are informational)
             }
         }
 
         // Store source map if available
-        if let Some(ref map) = result.map {
+        if let Some(ref map) = output.source_map {
             self.source_maps
                 .borrow_mut()
                 .insert(filename.to_string(), map.clone());
         }
 
-        // Apply the same post-processing as the browser pipeline:
-        // fix API names, split internal imports, strip leftover TS, deduplicate imports
-        let code = post_process_compiled(&result.code);
+        // Apply plugin post-processing (framework-specific fixups)
+        let code = self.plugin.post_process(&output.code, &ctx);
 
         // Cache the compilation result (code + source map + CSS, before CSS injection)
         self.compile_cache.put(
@@ -363,14 +371,14 @@ impl VertzModuleLoader {
             target,
             &CachedCompilation {
                 code: code.clone(),
-                source_map: result.map.clone(),
-                css: result.css.clone(),
+                source_map: output.source_map.clone(),
+                css: output.css.clone(),
             },
         );
 
         Ok(Self::prepend_css_injection(
             code,
-            result.css.as_deref(),
+            output.css.as_deref(),
             filename,
         ))
     }
@@ -1142,8 +1150,13 @@ impl ModuleLoader for VertzModuleLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn create_temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    fn test_plugin() -> std::sync::Arc<dyn FrameworkPlugin> {
+        std::sync::Arc::new(crate::plugin::vertz::VertzPlugin)
     }
 
     /// Canonicalize a path for test assertions.
@@ -1160,7 +1173,7 @@ mod tests {
         std::fs::write(&main_file, "import './utils.js';").unwrap();
         std::fs::write(&util_file, "export const x = 1;").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("./utils.js", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1176,7 +1189,7 @@ mod tests {
         std::fs::write(&main_file, "").unwrap();
         std::fs::write(&util_file, "export const x = 1;").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("./utils", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1194,7 +1207,7 @@ mod tests {
         std::fs::write(&main_file, "").unwrap();
         std::fs::write(&index_file, "export const x = 1;").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("./lib", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1208,7 +1221,7 @@ mod tests {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("./nonexistent", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_err());
@@ -1235,7 +1248,7 @@ mod tests {
         .unwrap();
         std::fs::write(&entry, "export default {};").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("my-pkg", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1249,7 +1262,7 @@ mod tests {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("nonexistent-pkg", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_err());
@@ -1263,7 +1276,7 @@ mod tests {
         let js_file = tmp.path().join("test.js");
         std::fs::write(&js_file, "export const x = 42;").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let specifier = ModuleSpecifier::from_file_path(&js_file).unwrap();
         let response = loader.load(&specifier, None, false, RequestedModuleType::None);
 
@@ -1287,7 +1300,7 @@ mod tests {
         let ts_file = tmp.path().join("test.ts");
         std::fs::write(&ts_file, "const x: number = 42; export { x };").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let specifier = ModuleSpecifier::from_file_path(&ts_file).unwrap();
         let response = loader.load(&specifier, None, false, RequestedModuleType::None);
 
@@ -1328,7 +1341,7 @@ export function Hello() {
         )
         .unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let specifier = ModuleSpecifier::from_file_path(&tsx_file).unwrap();
         let response = loader.load(&specifier, None, false, RequestedModuleType::None);
 
@@ -1373,7 +1386,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("@vertz/test", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1387,7 +1400,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("bun:test", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1398,7 +1411,7 @@ export function Hello() {
     #[test]
     fn test_load_vertz_test_module() {
         let tmp = create_temp_dir();
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let specifier = ModuleSpecifier::parse("vertz:test").unwrap();
         let response = loader.load(&specifier, None, false, RequestedModuleType::None);
 
@@ -1441,7 +1454,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("node:path", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1454,7 +1467,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("node:os", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1467,7 +1480,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("node:url", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1480,7 +1493,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("node:events", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1493,7 +1506,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         let result = loader.resolve("node:process", referrer.as_str(), ResolutionKind::Import);
         assert!(result.is_ok());
@@ -1506,7 +1519,7 @@ export function Hello() {
         let main_file = tmp.path().join("main.js");
         std::fs::write(&main_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
         // bare "path" (without node: prefix) should also resolve
         let result = loader.resolve("path", referrer.as_str(), ResolutionKind::Import);
@@ -1517,7 +1530,7 @@ export function Hello() {
     #[test]
     fn test_load_node_path_module() {
         let tmp = create_temp_dir();
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let specifier = ModuleSpecifier::parse(NODE_PATH_SPECIFIER).unwrap();
         let response = loader.load(&specifier, None, false, RequestedModuleType::None);
 
@@ -1545,7 +1558,7 @@ export function Hello() {
     #[test]
     fn test_load_node_events_module() {
         let tmp = create_temp_dir();
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let specifier = ModuleSpecifier::parse(NODE_EVENTS_SPECIFIER).unwrap();
         let response = loader.load(&specifier, None, false, RequestedModuleType::None);
 
@@ -1586,7 +1599,7 @@ export function Hello() {
         std::fs::write(&main_file, "").unwrap();
         std::fs::write(&utils_file, "export const x = 1;").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&main_file).unwrap();
 
         // Direct path
@@ -1641,7 +1654,7 @@ export function Hello() {
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         std::fs::write(&src_file, "").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
         let referrer = ModuleSpecifier::from_file_path(&src_file).unwrap();
 
         // Import via bare specifier (goes through node_modules symlink)
@@ -1670,7 +1683,7 @@ export function Hello() {
         let file = tmp.path().join("test.js");
         std::fs::write(&file, "export const x = 1;").unwrap();
 
-        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy());
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), test_plugin());
 
         let result1 = loader.canonicalize_cached(&file);
         let result2 = loader.canonicalize_cached(&file);
@@ -1681,5 +1694,59 @@ export function Hello() {
         );
         // On macOS, /tmp -> /private/tmp, so canonical path may differ from input
         assert!(result1.is_absolute(), "Canonical path should be absolute");
+    }
+
+    /// A custom plugin that adds a marker to compiled output, proving
+    /// the module loader delegates compilation to the plugin.
+    struct MarkerPlugin;
+
+    impl FrameworkPlugin for MarkerPlugin {
+        fn name(&self) -> &str {
+            "marker"
+        }
+
+        fn compile(
+            &self,
+            _source: &str,
+            _ctx: &crate::plugin::CompileContext,
+        ) -> crate::plugin::CompileOutput {
+            crate::plugin::CompileOutput {
+                code: "/* MARKER_PLUGIN_OUTPUT */ export const x = 1;".to_string(),
+                css: None,
+                source_map: None,
+                diagnostics: vec![],
+            }
+        }
+
+        fn hmr_client_scripts(&self) -> Vec<crate::plugin::ClientScript> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn test_compile_delegates_to_plugin() {
+        let tmp = create_temp_dir();
+        let ts_file = tmp.path().join("test.ts");
+        std::fs::write(&ts_file, "const x: number = 42; export { x };").unwrap();
+
+        let plugin: std::sync::Arc<dyn FrameworkPlugin> = std::sync::Arc::new(MarkerPlugin);
+        let loader = VertzModuleLoader::new(&tmp.path().to_string_lossy(), plugin);
+        let specifier = ModuleSpecifier::from_file_path(&ts_file).unwrap();
+        let response = loader.load(&specifier, None, false, RequestedModuleType::None);
+
+        match response {
+            ModuleLoadResponse::Sync(Ok(source)) => match &source.code {
+                deno_core::ModuleSourceCode::String(code) => {
+                    assert!(
+                        code.as_str().contains("MARKER_PLUGIN_OUTPUT"),
+                        "Module loader should delegate compilation to the plugin, got: {}",
+                        code.as_str()
+                    );
+                }
+                _ => panic!("Expected string source code"),
+            },
+            ModuleLoadResponse::Sync(Err(e)) => panic!("Module load failed: {}", e),
+            _ => panic!("Expected synchronous module load"),
+        }
     }
 }
