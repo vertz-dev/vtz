@@ -267,6 +267,20 @@ vtz migrate-tests    # Migrate from bun:test to @vertz/test
 
 Both `vtz` and `vertz` work as command names — they are aliases.
 
+## Configuration
+
+VTZ is configured via a `.vertzrc` file at the project root (JSON format). See the full reference: **[docs/configuration.md](docs/configuration.md)**
+
+Key options:
+
+| Option | Description |
+|--------|-------------|
+| `plugin` | Framework plugin: `"vertz"` or `"react"` (auto-detected by default) |
+| `autoInstall` | Auto-install missing packages during dev (default: `true`) |
+| `proxy` | Dev server reverse proxy for API forwarding |
+| `extraWatchPaths` | Additional directories to watch in monorepo setups |
+| `trustScripts` | Packages allowed to run postinstall scripts |
+
 ## Development
 
 ```bash

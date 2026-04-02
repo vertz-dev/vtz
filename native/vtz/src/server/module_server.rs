@@ -57,6 +57,9 @@ pub struct DevServerState {
     /// Wrapped in `Arc<RwLock>` to allow hot-swap on server module changes.
     /// `None` when no `server_entry` is configured.
     pub api_isolate: Arc<std::sync::RwLock<Option<Arc<PersistentIsolate>>>>,
+    /// Per-path API proxy configuration (from `.vertzrc` `proxy` field).
+    /// `None` when no proxy rules are configured.
+    pub api_proxy: Option<Arc<crate::server::api_proxy::ProxyConfig>>,
     /// Whether auto-install of missing packages is enabled.
     pub auto_install: bool,
     /// Serializes all pm::add() calls to prevent package.json write races.
@@ -943,6 +946,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1665,6 +1669,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1821,6 +1826,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1875,6 +1881,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1958,6 +1965,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2009,6 +2017,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2095,6 +2104,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2257,6 +2267,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2359,6 +2370,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),

@@ -886,6 +886,7 @@ mod tests {
             port: 3000,
             typecheck_enabled: false,
             api_isolate: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            api_proxy: None,
             auto_install: false,
             auto_install_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             auto_install_inflight: std::sync::Arc::new(std::sync::Mutex::new(

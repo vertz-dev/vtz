@@ -1,3 +1,4 @@
+pub mod api_proxy;
 pub mod console_log;
 pub mod css_server;
 pub mod diagnostics;

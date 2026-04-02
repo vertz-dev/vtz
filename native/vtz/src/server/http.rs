@@ -186,6 +186,34 @@ pub fn build_router(
         None
     };
 
+    // Load proxy configuration from .vertzrc
+    let api_proxy = {
+        let vertzrc = crate::pm::vertzrc::load_vertzrc(&config.root_dir).unwrap_or_default();
+        vertzrc.proxy.as_ref().and_then(|proxy_json| {
+            match crate::server::api_proxy::ProxyConfig::from_json(proxy_json) {
+                Ok(proxy_config) => {
+                    if !proxy_config.rules.is_empty() {
+                        let prefixes: Vec<&str> = proxy_config
+                            .rules
+                            .iter()
+                            .map(|r| r.prefix.as_str())
+                            .collect();
+                        eprintln!(
+                            "[proxy] Loaded {} rule(s): {}",
+                            prefixes.len(),
+                            prefixes.join(", ")
+                        );
+                    }
+                    Some(Arc::new(proxy_config))
+                }
+                Err(e) => {
+                    eprintln!("[proxy] Failed to parse proxy config: {}", e);
+                    None
+                }
+            }
+        })
+    };
+
     let state = Arc::new(DevServerState {
         plugin,
         pipeline,
@@ -205,6 +233,7 @@ pub fn build_router(
         port: config.port,
         typecheck_enabled: config.enable_typecheck,
         api_isolate: Arc::new(std::sync::RwLock::new(api_isolate)),
+        api_proxy,
         auto_install: config.auto_install,
         auto_install_lock: Arc::new(tokio::sync::Mutex::new(())),
         auto_install_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -555,6 +584,27 @@ async fn dev_server_handler(
     req: Request<Body>,
 ) -> axum::response::Response<Body> {
     let path = req.uri().path().to_string();
+
+    // Per-path API proxy: check before all other path-based dispatch.
+    // Only forward to the proxy when a rule matches, since try_proxy_request
+    // consumes the request and we need it for later handlers.
+    let has_proxy_match = state
+        .api_proxy
+        .as_ref()
+        .and_then(|cfg| crate::server::api_proxy::find_matching_rule(cfg, &path))
+        .is_some();
+    if has_proxy_match {
+        if let Some(ref proxy_config) = state.api_proxy {
+            return crate::server::api_proxy::try_proxy_request(proxy_config, req)
+                .await
+                .unwrap_or_else(|| {
+                    axum::response::Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from("Proxy error"))
+                        .unwrap()
+                });
+        }
+    }
 
     if path.starts_with("/@deps/") {
         return module_server::handle_deps_request(state, req).await;
