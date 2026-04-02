@@ -301,8 +301,9 @@ async fn ai_errors_handler(
 
 /// SSR render endpoint for LLM consumption: `GET /__vertz_ai/render?url=/path`
 ///
-/// Renders the given URL server-side and returns the HTML. Gives LLMs a
-/// "text screenshot" of the page without needing Playwright.
+/// Renders the given URL server-side using the persistent isolate and returns
+/// the HTML. Gives LLMs a "text screenshot" of the page without needing
+/// Playwright.
 async fn ai_render_handler(
     State(state): State<Arc<DevServerState>>,
     req: Request<Body>,
@@ -329,44 +330,110 @@ async fn ai_render_handler(
             .unwrap();
     }
 
-    let ssr_options = crate::ssr::render::SsrOptions {
-        root_dir: state.root_dir.clone(),
-        entry_file: state.entry_file.clone(),
-        url: url.clone(),
-        title: "Vertz App".to_string(),
-        theme_css: state.theme_css.clone(),
-        session: crate::ssr::session::SsrSession::default(),
-        preload_hints: vec![],
-        enable_hmr: false, // No HMR scripts in AI render
-    };
+    // Use the persistent isolate for SSR
+    let isolate = state
+        .api_isolate
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
 
-    let result = crate::ssr::render::render_to_html(&ssr_options).await;
+    if let Some(isolate) = isolate.as_ref() {
+        if isolate.is_initialized() {
+            let ssr_req = crate::runtime::persistent_isolate::SsrRequest {
+                url: url.clone(),
+                session_json: None,
+                cookies: None,
+            };
 
+            match isolate.handle_ssr(ssr_req).await {
+                Ok(ssr_resp) => {
+                    state.console_log.push(
+                        LogLevel::Info,
+                        format!(
+                            "AI render: {} ({:.1}ms, {})",
+                            url,
+                            ssr_resp.render_time_ms,
+                            if ssr_resp.is_ssr {
+                                "ssr"
+                            } else {
+                                "client-only"
+                            }
+                        ),
+                        Some("ai"),
+                    );
+
+                    let css_string = format_ssr_css(&ssr_resp.css_entries);
+                    let entry_url = crate::ssr::html_document::entry_path_to_url(
+                        &state.entry_file,
+                        &state.root_dir,
+                    );
+                    let html = crate::ssr::html_document::assemble_ssr_document(
+                        &crate::ssr::html_document::SsrHtmlOptions {
+                            title: "Vertz App",
+                            ssr_content: &ssr_resp.content,
+                            inline_css: &css_string,
+                            theme_css: state.theme_css.as_deref(),
+                            entry_url: &entry_url,
+                            preload_hints: &[],
+                            enable_hmr: false,
+                            ssr_data: ssr_resp.ssr_data.as_deref(),
+                            head_tags: ssr_resp.head_tags.as_deref(),
+                        },
+                    );
+
+                    return axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .header(
+                            "X-Vertz-Render-Time",
+                            format!("{:.1}ms", ssr_resp.render_time_ms),
+                        )
+                        .header(
+                            "X-Vertz-SSR",
+                            if ssr_resp.is_ssr { "true" } else { "false" },
+                        )
+                        .header(
+                            "X-Vertz-SSR-Error",
+                            ssr_resp.error.as_deref().unwrap_or("none"),
+                        )
+                        .body(Body::from(html))
+                        .unwrap();
+                }
+                Err(e) => {
+                    let error_msg = format!("Persistent SSR error: {}", e);
+                    eprintln!("[SSR] AI render: {}", error_msg);
+                    state
+                        .console_log
+                        .push(LogLevel::Error, error_msg, Some("ai"));
+                }
+            }
+        }
+    }
+
+    // Fallback: client-only HTML shell
     state.console_log.push(
         LogLevel::Info,
-        format!(
-            "AI render: {} ({:.1}ms, {})",
-            url,
-            result.render_time_ms,
-            if result.is_ssr { "ssr" } else { "client-only" }
-        ),
+        format!("AI render: {} (client-only, no persistent isolate)", url),
         Some("ai"),
+    );
+
+    let html = html_shell::generate_html_shell(
+        &state.entry_file,
+        &state.root_dir,
+        &[],
+        state.theme_css.as_deref(),
+        "Vertz App",
+        state.plugin.as_ref(),
     );
 
     axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(
-            "X-Vertz-Render-Time",
-            format!("{:.1}ms", result.render_time_ms),
-        )
-        .header("X-Vertz-SSR", if result.is_ssr { "true" } else { "false" })
-        .header(
-            "X-Vertz-SSR-Error",
-            result.error.as_deref().unwrap_or("none"),
-        )
-        .body(Body::from(result.html))
+        .header("X-Vertz-SSR", "false")
+        .header("X-Vertz-SSR-Error", "persistent isolate not available")
+        .body(Body::from(html))
         .unwrap()
 }
 
@@ -543,7 +610,7 @@ async fn dev_server_handler(
             let session =
                 crate::ssr::session::extract_session_from_cookies(cookie_header.as_deref());
 
-            // Try persistent isolate SSR first (Phase 2: zero per-request overhead)
+            // Use persistent isolate for SSR (the only supported strategy)
             let isolate = state
                 .api_isolate
                 .read()
@@ -615,10 +682,7 @@ async fn dev_server_handler(
                         }
                         Err(e) => {
                             let error_msg = format!("Persistent SSR error: {}", e);
-                            eprintln!(
-                                "[SSR] {} — serving client shell (no per-request fallback)",
-                                error_msg
-                            );
+                            eprintln!("[SSR] {} — serving client shell", error_msg);
                             state
                                 .console_log
                                 .push(LogLevel::Error, error_msg, Some("ssr"));
@@ -658,7 +722,7 @@ async fn dev_server_handler(
 }
 
 /// Format CSS entries from persistent isolate SSR into inline style tags.
-fn format_ssr_css(entries: &[(String, Option<String>)]) -> String {
+pub fn format_ssr_css(entries: &[(String, Option<String>)]) -> String {
     if entries.is_empty() {
         return String::new();
     }
