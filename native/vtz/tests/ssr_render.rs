@@ -7,8 +7,7 @@
 /// 4. Hydration data serialization
 /// 5. Full HTML document assembly
 /// 6. Session/auth resolution
-/// 7. SSR render with fixture apps
-/// 8. Graceful fallback when SSR fails
+/// 7. SSR render with fixture apps (persistent isolate)
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,10 +15,12 @@ use tokio::sync::OnceCell;
 use vertz_runtime::pm;
 use vertz_runtime::pm::output::DevPmOutput;
 use vertz_runtime::pm::vertzrc::ScriptPolicy;
+use vertz_runtime::runtime::persistent_isolate::{
+    PersistentIsolate, PersistentIsolateOptions, SsrRequest,
+};
 use vertz_runtime::ssr::css_collector;
 use vertz_runtime::ssr::dom_shim;
 use vertz_runtime::ssr::html_document::{assemble_ssr_document, SsrHtmlOptions};
-use vertz_runtime::ssr::render::{render_inline_ssr, render_to_html_sync, SsrOptions};
 use vertz_runtime::ssr::session::{extract_session_from_cookies, SsrSession};
 
 fn ssr_app_path() -> PathBuf {
@@ -305,15 +306,25 @@ fn test_full_ssr_document_structure() {
 
 #[test]
 fn test_ssr_render_full_pipeline() {
-    let result = render_inline_ssr(
+    use vertz_runtime::runtime::js_runtime::{VertzJsRuntime, VertzRuntimeOptions};
+
+    let mut rt = VertzJsRuntime::new(VertzRuntimeOptions {
+        capture_output: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    dom_shim::load_dom_shim(&mut rt).unwrap();
+
+    rt.execute_script_void(
+        "<test>",
         r#"
         // Inject CSS
         __vertz_inject_css('.header { background: #1a1a2e; color: white; }', 'header');
         __vertz_inject_css('.task { padding: 12px; border-bottom: 1px solid #eee; }', 'task');
 
         // Render the app
-        const app = document.createElement('div');
-        app.setAttribute('id', 'app');
+        const app = document.getElementById('app');
 
         const header = document.createElement('header');
         header.setAttribute('class', 'header');
@@ -324,49 +335,64 @@ fn test_ssr_render_full_pipeline() {
         list.setAttribute('class', 'task');
         list.appendChild(document.createTextNode('Test Task'));
         app.appendChild(list);
-
-        document.body.appendChild(app);
         "#,
-        "/tasks",
     )
     .unwrap();
 
-    assert!(result.is_ssr);
+    // Read content from #app
+    let content = rt
+        .execute_script("<test>", "document.getElementById('app').innerHTML")
+        .unwrap();
+    let content_str: String = serde_json::from_value(content).unwrap();
 
-    // Content was rendered
     assert!(
-        result.content.contains("Task Manager"),
+        content_str.contains("Task Manager"),
         "Should contain header text"
     );
     assert!(
-        result.content.contains("Test Task"),
+        content_str.contains("Test Task"),
         "Should contain task text"
     );
 
     // CSS was collected
-    assert!(result.css.contains(".header"), "Should collect header CSS");
-    assert!(result.css.contains(".task"), "Should collect task CSS");
+    let css_entries = css_collector::collect_css(&mut rt).unwrap();
+    let css = css_collector::format_css_as_style_tags(&css_entries);
+    assert!(css.contains(".header"), "Should collect header CSS");
+    assert!(css.contains(".task"), "Should collect task CSS");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SSR with Fixture App (End-to-End)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn test_ssr_render_fixture_app() {
+#[tokio::test]
+async fn test_ssr_render_fixture_app() {
+    ensure_fixture_deps().await;
     let root = ssr_app_path();
-    let options = SsrOptions {
+    let opts = PersistentIsolateOptions {
         root_dir: root.clone(),
-        entry_file: root.join("src/app.js"),
-        url: "/".to_string(),
-        title: "SSR Test".to_string(),
-        theme_css: None,
-        session: SsrSession::default(),
-        preload_hints: vec![],
-        enable_hmr: false,
+        ssr_entry: root.join("src/app.js"),
+        server_entry: None,
+        channel_capacity: 16,
     };
 
-    let result = render_to_html_sync(&options);
+    let isolate = PersistentIsolate::new(opts).unwrap();
+
+    for _ in 0..100 {
+        if isolate.is_initialized() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(isolate.is_initialized(), "Isolate should be initialized");
+
+    let ssr_req = SsrRequest {
+        url: "/".to_string(),
+        session_json: None,
+        cookies: None,
+    };
+
+    let result = isolate.handle_ssr(ssr_req).await.unwrap();
 
     assert!(result.is_ssr, "Should successfully SSR the fixture app");
 
@@ -386,19 +412,29 @@ fn test_ssr_render_fixture_app() {
         "Should contain footer. Content: {}",
         result.content
     );
-
-    // Verify full HTML document
-    assert!(result.html.contains("<!DOCTYPE html>"));
-    assert!(result.html.contains("<div id=\"app\">"));
-    assert!(result.html.contains("SSR Test App"));
-    assert!(result
-        .html
-        .contains("<script type=\"module\" src=\"/src/app.js\">"));
 }
 
-#[test]
-fn test_ssr_render_fixture_app_with_session() {
+#[tokio::test]
+async fn test_ssr_render_fixture_app_with_session() {
+    ensure_fixture_deps().await;
     let root = ssr_app_path();
+    let opts = PersistentIsolateOptions {
+        root_dir: root.clone(),
+        ssr_entry: root.join("src/app.js"),
+        server_entry: None,
+        channel_capacity: 16,
+    };
+
+    let isolate = PersistentIsolate::new(opts).unwrap();
+
+    for _ in 0..100 {
+        if isolate.is_initialized() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(isolate.is_initialized(), "Isolate should be initialized");
+
     let session = SsrSession {
         token: Some("test-token".to_string()),
         authenticated: true,
@@ -406,82 +442,44 @@ fn test_ssr_render_fixture_app_with_session() {
         data: Default::default(),
     };
 
-    let options = SsrOptions {
-        root_dir: root.clone(),
-        entry_file: root.join("src/app.js"),
+    let ssr_req = SsrRequest {
         url: "/tasks".to_string(),
-        title: "SSR Test".to_string(),
-        theme_css: Some("body { margin: 0; }".to_string()),
-        session,
-        preload_hints: vec!["/@deps/@vertz/ui".to_string()],
-        enable_hmr: true,
+        session_json: serde_json::to_string(&session).ok(),
+        cookies: None,
     };
 
-    let result = render_to_html_sync(&options);
-    assert!(result.is_ssr);
-
-    // Theme CSS should be in the document
-    assert!(
-        result.html.contains("body { margin: 0; }"),
-        "Should include theme CSS"
-    );
-
-    // Preload hints
-    assert!(
-        result.html.contains("/@deps/@vertz/ui"),
-        "Should include preload hints"
-    );
-
-    // HMR scripts
-    assert!(
-        result.html.contains("__vertz_hmr"),
-        "Should include HMR scripts in dev mode"
-    );
+    let result = isolate.handle_ssr(ssr_req).await.unwrap();
+    assert!(result.is_ssr, "Should successfully SSR with session");
 }
 
-#[test]
-fn test_ssr_fallback_on_invalid_entry() {
-    let options = SsrOptions {
-        root_dir: PathBuf::from("/tmp/nonexistent-project"),
-        entry_file: PathBuf::from("/tmp/nonexistent-project/src/app.tsx"),
-        url: "/".to_string(),
-        title: "Fallback Test".to_string(),
-        theme_css: None,
-        session: SsrSession::default(),
-        preload_hints: vec![],
-        enable_hmr: false,
-    };
-
-    let result = render_to_html_sync(&options);
-
-    // Should gracefully fall back to client-only shell
-    assert!(!result.is_ssr, "Should fall back to client-only");
-    assert!(result.content.is_empty());
-    assert!(
-        result.html.contains("<div id=\"app\"></div>"),
-        "Should have empty app div"
-    );
-    assert!(
-        result.html.contains("<script type=\"module\""),
-        "Should still include module script for client render"
-    );
-}
-
-#[test]
-fn test_ssr_render_performance() {
+#[tokio::test]
+async fn test_ssr_render_performance() {
+    ensure_fixture_deps().await;
     let root = ssr_app_path();
-    let options = SsrOptions {
+    let opts = PersistentIsolateOptions {
         root_dir: root.clone(),
-        entry_file: root.join("src/app.js"),
-        url: "/".to_string(),
-        title: "Perf Test".to_string(),
-        theme_css: None,
-        session: SsrSession::default(),
-        preload_hints: vec![],
-        enable_hmr: false,
+        ssr_entry: root.join("src/app.js"),
+        server_entry: None,
+        channel_capacity: 16,
     };
 
-    let result = render_to_html_sync(&options);
+    let isolate = PersistentIsolate::new(opts).unwrap();
+
+    for _ in 0..100 {
+        if isolate.is_initialized() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(isolate.is_initialized(), "Isolate should be initialized");
+
+    let ssr_req = SsrRequest {
+        url: "/".to_string(),
+        session_json: None,
+        cookies: None,
+    };
+
+    let result = isolate.handle_ssr(ssr_req).await.unwrap();
     assert!(result.is_ssr);
 
     // SSR should complete in reasonable time (< 5000ms for test environment)

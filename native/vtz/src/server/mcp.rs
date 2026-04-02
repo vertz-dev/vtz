@@ -267,37 +267,95 @@ async fn execute_tool(
                 }));
             }
 
-            let ssr_options = crate::ssr::render::SsrOptions {
-                root_dir: state.root_dir.clone(),
-                entry_file: state.entry_file.clone(),
-                url: url.clone(),
-                title: "Vertz App".to_string(),
-                theme_css: state.theme_css.clone(),
-                session: crate::ssr::session::SsrSession::default(),
-                preload_hints: vec![],
-                enable_hmr: false,
-            };
+            // Use the persistent isolate for SSR
+            let isolate = state
+                .api_isolate
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
 
-            let result = crate::ssr::render::render_to_html(&ssr_options).await;
+            if let Some(isolate) = isolate.as_ref() {
+                if isolate.is_initialized() {
+                    let ssr_req = crate::runtime::persistent_isolate::SsrRequest {
+                        url: url.clone(),
+                        session_json: None,
+                        cookies: None,
+                    };
 
+                    match isolate.handle_ssr(ssr_req).await {
+                        Ok(ssr_resp) => {
+                            state.console_log.push(
+                                LogLevel::Info,
+                                format!(
+                                    "MCP render: {} ({:.1}ms, {})",
+                                    url,
+                                    ssr_resp.render_time_ms,
+                                    if ssr_resp.is_ssr {
+                                        "ssr"
+                                    } else {
+                                        "client-only"
+                                    }
+                                ),
+                                Some("mcp"),
+                            );
+
+                            let css_string =
+                                crate::server::http::format_ssr_css(&ssr_resp.css_entries);
+                            let entry_url = crate::ssr::html_document::entry_path_to_url(
+                                &state.entry_file,
+                                &state.root_dir,
+                            );
+                            let html = crate::ssr::html_document::assemble_ssr_document(
+                                &crate::ssr::html_document::SsrHtmlOptions {
+                                    title: "Vertz App",
+                                    ssr_content: &ssr_resp.content,
+                                    inline_css: &css_string,
+                                    theme_css: state.theme_css.as_deref(),
+                                    entry_url: &entry_url,
+                                    preload_hints: &[],
+                                    enable_hmr: false,
+                                    ssr_data: ssr_resp.ssr_data.as_deref(),
+                                    head_tags: ssr_resp.head_tags.as_deref(),
+                                },
+                            );
+
+                            return Ok(serde_json::json!({
+                                "content": [{ "type": "text", "text": html }],
+                                "_meta": {
+                                    "url": url,
+                                    "renderTimeMs": ssr_resp.render_time_ms,
+                                    "isSsr": ssr_resp.is_ssr,
+                                    "error": ssr_resp.error,
+                                }
+                            }));
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Persistent SSR error: {}", e);
+                            eprintln!("[SSR] MCP render: {}", error_msg);
+                            state
+                                .console_log
+                                .push(LogLevel::Error, error_msg, Some("mcp"));
+                        }
+                    }
+                }
+            }
+
+            // Fallback: persistent isolate not available
             state.console_log.push(
                 LogLevel::Info,
-                format!(
-                    "MCP render: {} ({:.1}ms, {})",
-                    url,
-                    result.render_time_ms,
-                    if result.is_ssr { "ssr" } else { "client-only" }
-                ),
+                format!("MCP render: {} (client-only, no persistent isolate)", url),
                 Some("mcp"),
             );
 
             Ok(serde_json::json!({
-                "content": [{ "type": "text", "text": result.html }],
+                "content": [{
+                    "type": "text",
+                    "text": "SSR not available: persistent isolate is not initialized."
+                }],
                 "_meta": {
                     "url": url,
-                    "renderTimeMs": result.render_time_ms,
-                    "isSsr": result.is_ssr,
-                    "error": result.error,
+                    "isSsr": false,
+                    "error": "persistent isolate not available",
                 }
             }))
         }

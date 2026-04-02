@@ -1,7 +1,7 @@
 //! POC Benchmark: Rust-Native CRUD vs V8-Mediated CRUD
 //!
-//! Compares three execution paths for a CRUD list operation:
-//! - Path A: V8 per-request isolate (new isolate per request — current model)
+//! Compares execution paths for a CRUD list operation:
+//! - Path A: V8 isolate (new isolate per benchmark iteration)
 //! - Path B: V8 persistent isolate (reuse isolate, call handler function)
 //! - Path C: Rust-native (no V8 — all Rust)
 //!

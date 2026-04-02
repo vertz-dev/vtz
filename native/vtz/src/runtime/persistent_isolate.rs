@@ -1,8 +1,8 @@
 //! Persistent V8 isolate for API route delegation and SSR rendering.
 //!
-//! Unlike the per-request SSR model (which creates a fresh V8 runtime per render),
-//! the persistent isolate loads modules once and caches them. Both API requests
-//! and SSR renders are dispatched via a channel to a dedicated V8 thread.
+//! Loads modules once and caches them. Both API requests and SSR renders are
+//! dispatched via a channel to a dedicated V8 thread. This is the only SSR
+//! strategy — there is no per-request fallback.
 //!
 //! This matches Cloudflare Workers' execution model: one isolate, modules loaded
 //! once, all requests go through the same runtime.
