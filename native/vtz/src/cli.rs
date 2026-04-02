@@ -17,6 +17,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Create a new project from a template
+    Create(CreateArgs),
     /// Start the development server
     Dev(DevArgs),
     /// Run tests
@@ -57,6 +59,16 @@ pub enum Command {
     Patch(PatchArgs),
     /// Manage the local development proxy
     Proxy(ProxyArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct CreateArgs {
+    /// Template: short name (react), owner/repo, or https://github.com/owner/repo
+    #[arg(required = true)]
+    pub template: String,
+
+    /// Destination directory (defaults to repo name)
+    pub destination: Option<String>,
 }
 
 #[derive(Parser, Debug)]

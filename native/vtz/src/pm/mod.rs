@@ -1,6 +1,7 @@
 pub mod bin;
 pub mod cache;
 pub mod config;
+pub mod create;
 pub mod github;
 pub mod linker;
 pub mod lockfile;
