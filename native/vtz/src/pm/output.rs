@@ -5,6 +5,7 @@ use std::sync::Mutex;
 /// Output handler for PM operations — either human-readable or NDJSON
 pub trait PmOutput: Send + Sync {
     fn resolve_started(&self);
+    fn resolve_progress(&self, resolved: usize);
     fn resolve_complete(&self, count: usize);
     fn download_started(&self, total: usize);
     fn download_tick(&self);
@@ -66,6 +67,12 @@ impl PmOutput for TextOutput {
             *self.resolve_spinner.lock().unwrap() = Some(sp);
         } else {
             eprintln!("Resolving dependencies...");
+        }
+    }
+
+    fn resolve_progress(&self, resolved: usize) {
+        if let Some(sp) = self.resolve_spinner.lock().unwrap().as_ref() {
+            sp.set_message(format!("Resolving dependencies... ({} resolved)", resolved));
         }
     }
 
@@ -247,6 +254,7 @@ impl JsonOutput {
 
 impl PmOutput for JsonOutput {
     fn resolve_started(&self) {}
+    fn resolve_progress(&self, _resolved: usize) {}
 
     fn resolve_complete(&self, count: usize) {
         println!("{}", json!({"event": "resolve", "packages": count}));
@@ -428,6 +436,7 @@ pub struct DevPmOutput;
 
 impl PmOutput for DevPmOutput {
     fn resolve_started(&self) {}
+    fn resolve_progress(&self, _resolved: usize) {}
     fn resolve_complete(&self, _count: usize) {}
     fn download_started(&self, _total: usize) {}
     fn download_tick(&self) {}

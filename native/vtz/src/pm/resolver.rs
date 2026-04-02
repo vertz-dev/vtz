@@ -3,8 +3,9 @@ use crate::pm::registry::RegistryClient;
 use crate::pm::types::{
     Lockfile, LockfileEntry, PackageMetadata, ResolvedPackage, VersionMetadata,
 };
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use node_semver::{Range, Version};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Resolve the best matching version for a range from available versions
 pub fn resolve_version<'a>(
@@ -70,22 +71,33 @@ pub struct OverrideApplication {
     pub pattern: String,
 }
 
-/// Mutable state shared across recursive resolution calls
-struct ResolveState<'a> {
-    registry: &'a RegistryClient,
-    lockfile: &'a Lockfile,
-    overrides: &'a OverrideMap,
-    graph: ResolvedGraph,
-    visited: HashSet<String>,
-    metadata_cache: HashMap<String, PackageMetadata>,
+/// A unit of work for the concurrent BFS resolver
+struct ResolveTask {
+    name: String,
+    range: String,
     parent_chain: Vec<String>,
-    override_applications: Vec<OverrideApplication>,
 }
 
-/// Recursively resolve all dependencies starting from root deps.
+/// Shared mutable state for concurrent resolution, protected by individual locks.
+/// Each field uses the narrowest lock scope to maximize parallelism.
+struct SharedResolveState {
+    graph: tokio::sync::Mutex<ResolvedGraph>,
+    visited: std::sync::Mutex<HashSet<String>>,
+    metadata_cache: tokio::sync::Mutex<HashMap<String, PackageMetadata>>,
+    override_apps: std::sync::Mutex<Vec<OverrideApplication>>,
+}
+
+/// Resolve all dependencies concurrently using breadth-first traversal.
+///
+/// Instead of sequential depth-first recursion, this uses `FuturesUnordered`
+/// to resolve multiple packages in parallel. When a package's metadata returns,
+/// its transitive deps are immediately queued for parallel fetching.
+///
 /// `pre_resolved` contains packages already resolved externally (e.g., GitHub packages)
-/// that should be inserted into the graph before recursive resolution begins.
+/// that should be inserted into the graph before resolution begins.
 /// Their transitive npm deps will be resolved normally.
+///
+/// `on_progress` is called with the number of resolved packages each time one completes.
 pub async fn resolve_all(
     root_deps: &BTreeMap<String, String>,
     root_dev_deps: &BTreeMap<String, String>,
@@ -93,120 +105,163 @@ pub async fn resolve_all(
     lockfile: &Lockfile,
     overrides: &OverrideMap,
     pre_resolved: Vec<ResolvedPackage>,
+    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
 ) -> Result<(ResolvedGraph, Vec<OverrideApplication>), Box<dyn std::error::Error + Send + Sync>> {
-    let mut state = ResolveState {
-        registry,
-        lockfile,
-        overrides,
-        graph: ResolvedGraph::default(),
-        visited: HashSet::new(),
-        metadata_cache: HashMap::new(),
-        parent_chain: Vec::new(),
-        override_applications: Vec::new(),
+    let state = SharedResolveState {
+        graph: tokio::sync::Mutex::new(ResolvedGraph::default()),
+        visited: std::sync::Mutex::new(HashSet::new()),
+        metadata_cache: tokio::sync::Mutex::new(HashMap::new()),
+        override_apps: std::sync::Mutex::new(Vec::new()),
     };
 
     // Insert pre-resolved packages (e.g., GitHub deps) into graph
-    for pkg in pre_resolved {
-        let key = ResolvedGraph::key(&pkg.name, &pkg.version);
-        state.graph.packages.insert(key, pkg);
+    {
+        let mut g = state.graph.lock().await;
+        for pkg in pre_resolved {
+            let key = ResolvedGraph::key(&pkg.name, &pkg.version);
+            g.packages.insert(key, pkg);
+        }
     }
 
-    // Resolve regular dependencies
-    for (name, range) in root_deps {
-        resolve_recursive(name, range, &mut state).await?;
+    // Seed queue with root deps
+    let mut queue: VecDeque<ResolveTask> = VecDeque::new();
+    for (name, range) in root_deps.iter().chain(root_dev_deps.iter()) {
+        queue.push_back(ResolveTask {
+            name: name.clone(),
+            range: range.clone(),
+            parent_chain: vec![],
+        });
     }
 
-    // Resolve dev dependencies (but their transitive devDeps will be skipped)
-    for (name, range) in root_dev_deps {
-        resolve_recursive(name, range, &mut state).await?;
+    let mut pending = FuturesUnordered::new();
+    let mut resolved_count = 0usize;
+
+    loop {
+        // Drain queue into pending futures for concurrent execution
+        while let Some(task) = queue.pop_front() {
+            pending.push(resolve_one_task(
+                task, registry, lockfile, overrides, &state,
+            ));
+        }
+
+        if pending.is_empty() {
+            break;
+        }
+
+        // Wait for any one future to complete
+        match pending.next().await {
+            Some(Ok((added, new_tasks))) => {
+                if added {
+                    resolved_count += 1;
+                    if let Some(cb) = on_progress {
+                        cb(resolved_count);
+                    }
+                }
+                for task in new_tasks {
+                    queue.push_back(task);
+                }
+            }
+            Some(Err(e)) => return Err(e),
+            None => break,
+        }
     }
 
-    Ok((state.graph, state.override_applications))
+    // Drop pending futures before consuming shared state
+    drop(pending);
+
+    let graph = state.graph.into_inner();
+    let override_apps = state.override_apps.into_inner().unwrap();
+
+    Ok((graph, override_apps))
 }
 
-#[async_recursion::async_recursion]
-async fn resolve_recursive(
-    name: &str,
-    range: &str,
-    state: &mut ResolveState<'_>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Resolve a single package and return its transitive deps as new tasks.
+/// Returns `(true, deps)` if a new package was added to the graph,
+/// `(false, deps)` if skipped (cycle/duplicate) but deps may still be returned
+/// for GitHub packages whose transitive deps need resolution.
+async fn resolve_one_task<'a>(
+    task: ResolveTask,
+    registry: &'a RegistryClient,
+    lockfile: &'a Lockfile,
+    overrides: &'a OverrideMap,
+    state: &'a SharedResolveState,
+) -> Result<(bool, Vec<ResolveTask>), Box<dyn std::error::Error + Send + Sync>> {
+    let name = &task.name;
+    let range = &task.range;
+    let parent_chain = &task.parent_chain;
+
     // Check for override BEFORE visited check — the override applies to THIS dep
-    // Use the original range for the visited key (preserves lockfile keying invariant)
     let effective_range =
-        if let Some(override_version) = state.overrides.find_override(name, &state.parent_chain) {
-            // Record the override application
-            let pattern = if state.parent_chain.is_empty() {
+        if let Some(override_version) = overrides.find_override(name, parent_chain) {
+            let pattern = if parent_chain.is_empty() {
                 name.to_string()
             } else {
-                format!("{}>{}", state.parent_chain.join(">"), name)
+                format!("{}>{}", parent_chain.join(">"), name)
             };
-            state.override_applications.push(OverrideApplication {
-                target: name.to_string(),
-                original_range: range.to_string(),
-                forced_version: override_version.to_string(),
-                pattern,
-            });
+            state
+                .override_apps
+                .lock()
+                .unwrap()
+                .push(OverrideApplication {
+                    target: name.to_string(),
+                    original_range: range.to_string(),
+                    forced_version: override_version.to_string(),
+                    pattern,
+                });
             override_version.to_string()
         } else {
             range.to_string()
         };
 
-    // Use EFFECTIVE range for visited key — scoped overrides need separate resolution
-    // paths for the same package@original_range when different parents have different overrides.
+    // Atomic visited check-and-insert using effective range
     let visit_key = format!("{}@{}", name, effective_range);
-
-    // Break cycles
-    if state.visited.contains(&visit_key) {
-        return Ok(());
+    {
+        let mut v = state.visited.lock().unwrap();
+        if v.contains(&visit_key) {
+            return Ok((false, vec![]));
+        }
+        v.insert(visit_key);
     }
-    state.visited.insert(visit_key);
 
-    // GitHub specifiers: look up the pre-resolved package in the graph, then resolve
-    // its transitive npm deps. No registry calls needed.
+    // GitHub specifiers: look up the pre-resolved package in the graph, then
+    // return its transitive npm deps as new tasks. No registry calls needed.
     if effective_range.starts_with("github:") {
-        // Find the pre-resolved package by name
-        let pkg = state
-            .graph
-            .packages
-            .values()
-            .find(|p| p.name == name)
-            .cloned();
+        let pkg = {
+            let g = state.graph.lock().await;
+            g.packages.values().find(|p| p.name == *name).cloned()
+        };
 
         if let Some(pkg) = pkg {
-            // Resolve transitive deps (which are normal npm deps)
-            state.parent_chain.push(name.to_string());
-            let deps: Vec<_> = pkg.dependencies.clone().into_iter().collect();
-            for (dep_name, dep_range) in &deps {
-                resolve_recursive(dep_name, dep_range, state).await?;
-            }
-            state.parent_chain.pop();
-        } else if !state.parent_chain.is_empty() {
-            // Transitive GitHub dep from an npm package — not supported yet.
-            // Root-level GitHub deps are always pre-resolved by install().
+            let mut child_chain = parent_chain.clone();
+            child_chain.push(name.to_string());
+            let deps: Vec<ResolveTask> = pkg
+                .dependencies
+                .iter()
+                .map(|(n, r)| ResolveTask {
+                    name: n.clone(),
+                    range: r.clone(),
+                    parent_chain: child_chain.clone(),
+                })
+                .collect();
+            return Ok((false, deps));
+        } else if !parent_chain.is_empty() {
             eprintln!(
                 "warning: transitive GitHub dependency \"{}\" ({}) from {} is not supported — skipping",
                 name,
                 effective_range,
-                state.parent_chain.last().unwrap_or(&"root".to_string())
+                parent_chain.last().unwrap_or(&"root".to_string())
             );
         }
-        // If not pre-resolved at root level, skip — the caller should have pre-inserted it.
-        return Ok(());
+        return Ok((false, vec![]));
     }
 
     // Check lockfile first for pinned version (use ORIGINAL range for lockfile key)
     let lockfile_key = Lockfile::spec_key(name, range);
-    if let Some(entry) = state.lockfile.entries.get(&lockfile_key) {
+    if let Some(entry) = lockfile.entries.get(&lockfile_key) {
         // If override is active, ignore lockfile version — use override instead
-        if effective_range == range {
+        if effective_range == *range {
             let graph_key = ResolvedGraph::key(name, &entry.version);
-            if state.graph.packages.contains_key(&graph_key) {
-                return Ok(());
-            }
 
-            // Use lockfile data directly — no registry fetch needed.
-            // The lockfile stores version, tarball URL, integrity, dependencies,
-            // bin, and scripts, which is everything we need.
             let resolved = ResolvedPackage {
                 name: name.to_string(),
                 version: entry.version.clone(),
@@ -216,28 +271,54 @@ async fn resolve_recursive(
                 bin: entry.bin.clone(),
                 nest_path: vec![],
             };
-            if !entry.scripts.is_empty() {
-                state
-                    .graph
-                    .scripts
-                    .insert(graph_key.clone(), entry.scripts.clone());
-            }
-            state.graph.packages.insert(graph_key, resolved);
 
-            // Resolve transitive deps from lockfile entry
-            state.parent_chain.push(name.to_string());
-            let deps: Vec<_> = entry.dependencies.clone().into_iter().collect();
-            for (dep_name, dep_range) in &deps {
-                resolve_recursive(dep_name, dep_range, state).await?;
+            // Atomic check-and-insert into graph
+            {
+                let mut g = state.graph.lock().await;
+                if g.packages.contains_key(&graph_key) {
+                    return Ok((false, vec![]));
+                }
+                if !entry.scripts.is_empty() {
+                    g.scripts.insert(graph_key.clone(), entry.scripts.clone());
+                }
+                g.packages.insert(graph_key, resolved);
             }
-            state.parent_chain.pop();
 
-            return Ok(());
+            let mut child_chain = parent_chain.clone();
+            child_chain.push(name.to_string());
+            let deps: Vec<ResolveTask> = entry
+                .dependencies
+                .iter()
+                .map(|(n, r)| ResolveTask {
+                    name: n.clone(),
+                    range: r.clone(),
+                    parent_chain: child_chain.clone(),
+                })
+                .collect();
+
+            return Ok((true, deps));
         }
     }
 
-    // Fetch metadata from registry
-    let metadata = get_or_fetch_metadata(name, state.registry, &mut state.metadata_cache).await?;
+    // Fetch metadata from registry using abbreviated install format (10-100x smaller)
+    let metadata = {
+        // Fast path: check in-memory cache
+        let cached = {
+            let cache = state.metadata_cache.lock().await;
+            cache.get(name.as_str()).cloned()
+        };
+        if let Some(meta) = cached {
+            meta
+        } else {
+            // Slow path: fetch from registry (no lock held during network I/O)
+            let meta = registry.fetch_metadata_for_install(name).await?;
+            let mut cache = state.metadata_cache.lock().await;
+            cache
+                .entry(name.to_string())
+                .or_insert_with(|| meta.clone());
+            meta
+        }
+    };
 
     // Resolve version (using effective range which may be overridden)
     let version_meta = resolve_version(&effective_range, &metadata.versions, &metadata.dist_tags)
@@ -249,9 +330,6 @@ async fn resolve_recursive(
     })?;
 
     let graph_key = ResolvedGraph::key(name, &version_meta.version);
-    if state.graph.packages.contains_key(&graph_key) {
-        return Ok(());
-    }
 
     let resolved = ResolvedPackage {
         name: name.to_string(),
@@ -262,36 +340,34 @@ async fn resolve_recursive(
         bin: version_meta.bin.to_map(name),
         nest_path: vec![],
     };
-    if !version_meta.scripts.is_empty() {
-        state
-            .graph
-            .scripts
-            .insert(graph_key.clone(), version_meta.scripts.clone());
-    }
-    state.graph.packages.insert(graph_key, resolved);
 
-    // Resolve transitive deps (skip transitive devDeps — only root devDeps are resolved)
-    state.parent_chain.push(name.to_string());
-    let deps = version_meta.dependencies.clone();
-    for (dep_name, dep_range) in &deps {
-        resolve_recursive(dep_name, dep_range, state).await?;
+    // Atomic check-and-insert into graph
+    {
+        let mut g = state.graph.lock().await;
+        if g.packages.contains_key(&graph_key) {
+            return Ok((false, vec![]));
+        }
+        if !version_meta.scripts.is_empty() {
+            g.scripts
+                .insert(graph_key.clone(), version_meta.scripts.clone());
+        }
+        g.packages.insert(graph_key, resolved);
     }
-    state.parent_chain.pop();
 
-    Ok(())
-}
+    // Queue transitive deps (skip transitive devDeps — only root devDeps are resolved)
+    let mut child_chain = parent_chain.clone();
+    child_chain.push(name.to_string());
+    let deps: Vec<ResolveTask> = version_meta
+        .dependencies
+        .iter()
+        .map(|(n, r)| ResolveTask {
+            name: n.clone(),
+            range: r.clone(),
+            parent_chain: child_chain.clone(),
+        })
+        .collect();
 
-async fn get_or_fetch_metadata(
-    name: &str,
-    registry: &RegistryClient,
-    cache: &mut HashMap<String, PackageMetadata>,
-) -> Result<PackageMetadata, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(meta) = cache.get(name) {
-        return Ok(meta.clone());
-    }
-    let meta = registry.fetch_metadata(name).await?;
-    cache.insert(name.to_string(), meta.clone());
-    Ok(meta)
+    Ok((true, deps))
 }
 
 /// Hoisting algorithm: determine which packages go at root vs nested
