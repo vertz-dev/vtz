@@ -201,6 +201,11 @@ pub async fn install(
     // Resolve dependency graph (required deps)
     output.resolve_started();
 
+    let progress_output = output.clone();
+    let on_progress = move |resolved: usize| {
+        progress_output.resolve_progress(resolved);
+    };
+
     let (mut graph, override_applications) = resolver::resolve_all(
         &resolved_deps,
         &resolved_dev_deps,
@@ -208,6 +213,7 @@ pub async fn install(
         &existing_lockfile,
         &override_map,
         pre_resolved,
+        Some(&on_progress),
     )
     .await
     .map_err(|e| format!("{}", e))?;
@@ -224,6 +230,7 @@ pub async fn install(
             &existing_lockfile,
             &empty_overrides,
             Vec::new(),
+            None,
         )
         .await
         {

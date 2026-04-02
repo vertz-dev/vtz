@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::Semaphore;
 
 const REGISTRY_URL: &str = "https://registry.npmjs.org";
-const MAX_CONCURRENT_REQUESTS: usize = 16;
+const MAX_CONCURRENT_REQUESTS: usize = 50;
 const MAX_RETRIES: u32 = 3;
 
 /// HTTP client for the npm registry with ETag caching
@@ -55,6 +55,46 @@ impl RegistryClient {
             }
 
             match self.fetch_with_etag(&url, &cache_file, &etag_file).await {
+                Ok(metadata) => return Ok(metadata),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "Unknown error fetching metadata".into()))
+    }
+
+    /// Fetch package metadata using the abbreviated npm install format.
+    /// Uses `Accept: application/vnd.npm.install-v1+json` for 10-100x smaller payloads
+    /// while still returning full `PackageMetadata` (deps, dist, bin are all included).
+    /// This is the preferred method for dependency resolution.
+    pub async fn fetch_metadata_for_install(
+        &self,
+        package_name: &str,
+    ) -> Result<PackageMetadata, Box<dyn std::error::Error + Send + Sync>> {
+        let _permit = self.semaphore.acquire().await?;
+
+        let encoded_name = if package_name.starts_with('@') {
+            package_name.replacen('/', "%2f", 1)
+        } else {
+            package_name.to_string()
+        };
+        let url = format!("{}/{}", REGISTRY_URL, encoded_name);
+        let cache_file = self.cache_path(&format!("{}__install", package_name));
+        let etag_file = self.etag_path(&format!("{}__install", package_name));
+
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100 * 2u64.pow(attempt))).await;
+            }
+
+            match self
+                .fetch_install_with_etag(&url, &cache_file, &etag_file)
+                .await
+            {
                 Ok(metadata) => return Ok(metadata),
                 Err(e) => {
                     last_error = Some(e);
@@ -144,6 +184,58 @@ impl RegistryClient {
                 std::fs::write(cache_file, &body).ok();
 
                 let metadata: AbbreviatedMetadata = serde_json::from_str(&body)?;
+                Ok(metadata)
+            }
+            reqwest::StatusCode::NOT_FOUND => Err(format!(
+                "package '{}' not found on registry",
+                url.rsplit('/').next().unwrap_or(url)
+            )
+            .into()),
+            status => Err(format!("registry returned HTTP {}", status).into()),
+        }
+    }
+
+    async fn fetch_install_with_etag(
+        &self,
+        url: &str,
+        cache_file: &Path,
+        etag_file: &Path,
+    ) -> Result<PackageMetadata, Box<dyn std::error::Error + Send + Sync>> {
+        let mut request = self
+            .client
+            .get(url)
+            .header("Accept", "application/vnd.npm.install-v1+json");
+
+        if let Ok(etag) = std::fs::read_to_string(etag_file) {
+            request = request.header("If-None-Match", etag);
+        }
+
+        let response = request.send().await?;
+
+        match response.status() {
+            status if status == reqwest::StatusCode::NOT_MODIFIED => {
+                let cached = std::fs::read_to_string(cache_file)?;
+                let metadata: PackageMetadata = serde_json::from_str(&cached)?;
+                Ok(metadata)
+            }
+            status if status.is_success() => {
+                if let Some(etag) = response.headers().get("etag") {
+                    if let Ok(etag_str) = etag.to_str() {
+                        if let Some(parent) = etag_file.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::write(etag_file, etag_str).ok();
+                    }
+                }
+
+                let body = response.text().await?;
+
+                if let Some(parent) = cache_file.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::write(cache_file, &body).ok();
+
+                let metadata: PackageMetadata = serde_json::from_str(&body)?;
                 Ok(metadata)
             }
             reqwest::StatusCode::NOT_FOUND => Err(format!(
@@ -521,6 +613,15 @@ mod tests {
         let client = RegistryClient::new(dir.path());
         let path = client.cache_path("zod");
         assert!(path.to_str().unwrap().ends_with("zod.json"));
+    }
+
+    #[test]
+    fn test_cache_path_install_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new(dir.path());
+        // Install metadata uses __install suffix to avoid colliding with full metadata cache
+        let path = client.cache_path("zod__install");
+        assert!(path.to_str().unwrap().ends_with("zod__install.json"));
     }
 
     #[test]

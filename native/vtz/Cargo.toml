@@ -12,7 +12,6 @@ name = "vtz"
 path = "src/main.rs"
 
 [dependencies]
-async-recursion = "1"
 axum = { version = "0.7", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4", features = ["derive"] }
