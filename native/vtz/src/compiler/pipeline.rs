@@ -1225,20 +1225,27 @@ pub fn fix_module_id(code: &str, file_path: &Path, root_dir: &Path) -> String {
         .replace(&format!("\"{}\"", abs_path), &format!("\"{}\"", url_path))
 }
 
-/// Apply post-processing fixes to compiled output.
+/// Apply generic post-processing fixes to compiled output.
 ///
-/// Both the browser pipeline and the SSR module loader need these fixes:
-/// 1. Fix wrong API names: compiler emits `effect` but the API is `domEffect`
-/// 2. Move internal APIs from `@vertz/ui` to `@vertz/ui/internals`
-/// 3. Strip leftover TypeScript syntax artifacts
-/// 4. Deduplicate imports to prevent "already been declared" errors
-pub fn post_process_compiled(code: &str) -> String {
-    let fixed = fix_compiler_api_names(code);
-    let internals_fixed = fix_internals_imports(&fixed);
-    let cleaned = strip_leftover_typescript(&internals_fixed);
+/// These are framework-agnostic transforms that any plugin can use:
+/// 1. Strip leftover TypeScript syntax artifacts
+/// 2. Deduplicate imports to prevent "already been declared" errors
+/// 3. Strip import.meta.hot (Bun HMR API)
+pub fn generic_post_process(code: &str) -> String {
+    let cleaned = strip_leftover_typescript(code);
     let deduped = deduplicate_imports(&cleaned);
     let no_cross_dupes = remove_cross_specifier_duplicates(&deduped);
     strip_import_meta_hot(&no_cross_dupes)
+}
+
+/// Apply all post-processing fixes including Vertz-specific ones.
+///
+/// Equivalent to calling Vertz-specific transforms followed by `generic_post_process()`.
+/// Used by the Vertz plugin — other plugins should only call `generic_post_process()`.
+pub fn post_process_compiled(code: &str) -> String {
+    let fixed = fix_compiler_api_names(code);
+    let internals_fixed = fix_internals_imports(&fixed);
+    generic_post_process(&internals_fixed)
 }
 
 /// Simple hash function for generating CSS keys.
@@ -2140,6 +2147,32 @@ export function App() {
         let code = "const __$moduleId = '/other/app.tsx';";
         let result = fix_module_id(code, Path::new("/other/app.tsx"), Path::new("/project"));
         assert_eq!(result, code);
+    }
+
+    // ── generic_post_process ──────────────────────────────────────
+
+    #[test]
+    fn test_generic_post_process_strips_typescript_and_deduplicates() {
+        let code = "import type { Foo } from 'bar';\nimport { x } from 'mod';\nimport { x } from 'mod';\nimport.meta.hot.accept();\nconst y = 1;";
+        let result = generic_post_process(code);
+        // import type stripped
+        assert!(!result.contains("import type"));
+        // import.meta.hot stripped
+        assert!(!result.contains("import.meta.hot"));
+        // duplicates removed
+        assert!(result.contains("const y = 1"));
+        // Does NOT fix Vertz-specific API names (that's not generic)
+    }
+
+    #[test]
+    fn test_generic_post_process_does_not_rename_effect() {
+        let code = "import { effect } from '@vertz/ui';\neffect(() => {});";
+        let result = generic_post_process(code);
+        // generic_post_process should NOT rename effect to domEffect
+        assert!(
+            result.contains("effect"),
+            "generic_post_process should not touch Vertz-specific API names"
+        );
     }
 
     // ── post_process_compiled (integration) ─────────────────────────
