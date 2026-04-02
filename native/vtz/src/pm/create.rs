@@ -1,6 +1,7 @@
 use super::github::GitHubClient;
 use super::output::PmOutput;
-use super::tarball::extract_github_tarball;
+use super::registry::RegistryClient;
+use super::tarball::{extract_github_tarball, extract_tarball};
 use super::vertzrc::ScriptPolicy;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,6 +11,8 @@ use std::sync::Arc;
 pub enum CreateError {
     /// Template string could not be parsed
     InvalidTemplate(String),
+    /// Package not found on NPM registry
+    PackageNotFound(String),
     /// Destination directory already exists and is not empty
     DestinationExists(PathBuf),
     /// GitHub API error
@@ -22,6 +25,9 @@ impl std::fmt::Display for CreateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CreateError::InvalidTemplate(t) => write!(f, "invalid template: \"{}\"", t),
+            CreateError::PackageNotFound(name) => {
+                write!(f, "package \"{}\" not found on npm registry", name)
+            }
             CreateError::DestinationExists(p) => {
                 write!(
                     f,
@@ -43,20 +49,22 @@ impl From<super::github::GitHubError> for CreateError {
     }
 }
 
-/// Parsed template identifying a GitHub repository.
+/// Where to fetch the template from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplateRef {
-    pub owner: String,
-    pub repo: String,
+pub enum TemplateSource {
+    /// NPM package (e.g. `create-vertz`). Default for short names.
+    Npm { package_name: String },
+    /// GitHub repository (e.g. `owner/repo`). Used for owner/repo and full URLs.
+    GitHub { owner: String, repo: String },
 }
 
-/// Parse a template string into owner/repo.
+/// Parse a template string into a source.
 ///
-/// Supported formats:
-/// - Short name: `react` → `vertz-dev/create-react`
-/// - Owner/repo: `vertz-dev/template-react`
-/// - Full URL: `https://github.com/owner/repo`
-pub fn parse_template(template: &str) -> Result<TemplateRef, CreateError> {
+/// Resolution order (matches `bun create` / `npm create`):
+/// - Full GitHub URL (`https://github.com/owner/repo`) → GitHub
+/// - `owner/repo` → GitHub
+/// - Short name (`vertz`) → NPM package `create-vertz`
+pub fn parse_template(template: &str) -> Result<TemplateSource, CreateError> {
     let template = template.trim();
 
     if template.is_empty() {
@@ -71,7 +79,7 @@ pub fn parse_template(template: &str) -> Result<TemplateRef, CreateError> {
     // owner/repo format (contains exactly one slash, no protocol)
     if let Some((owner, repo)) = template.split_once('/') {
         if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            return Ok(TemplateRef {
+            return Ok(TemplateSource::GitHub {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
             });
@@ -79,28 +87,24 @@ pub fn parse_template(template: &str) -> Result<TemplateRef, CreateError> {
         return Err(CreateError::InvalidTemplate(template.to_string()));
     }
 
-    // Short name: maps to vertz-dev/create-<name>
-    Ok(TemplateRef {
-        owner: "vertz-dev".to_string(),
-        repo: format!("create-{}", template),
+    // Short name: maps to create-<name> NPM package
+    Ok(TemplateSource::Npm {
+        package_name: format!("create-{}", template),
     })
 }
 
-fn parse_github_url(url: &str) -> Result<TemplateRef, CreateError> {
-    // Strip protocol and host
+fn parse_github_url(url: &str) -> Result<TemplateSource, CreateError> {
     let path = url
         .strip_prefix("https://github.com/")
         .or_else(|| url.strip_prefix("http://github.com/"))
         .unwrap_or("");
 
-    // Strip trailing .git
     let path = path.strip_suffix(".git").unwrap_or(path);
-    // Strip trailing slash
     let path = path.strip_suffix('/').unwrap_or(path);
 
     match path.split_once('/') {
         Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') => {
-            Ok(TemplateRef {
+            Ok(TemplateSource::GitHub {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
             })
@@ -109,28 +113,32 @@ fn parse_github_url(url: &str) -> Result<TemplateRef, CreateError> {
     }
 }
 
+/// Derive a default directory name from the template source.
+fn default_dir_name(source: &TemplateSource) -> String {
+    match source {
+        TemplateSource::Npm { package_name } => package_name
+            .strip_prefix("create-")
+            .unwrap_or(package_name)
+            .to_string(),
+        TemplateSource::GitHub { repo, .. } => {
+            repo.strip_prefix("create-").unwrap_or(repo).to_string()
+        }
+    }
+}
+
 /// Determine the destination directory.
 ///
-/// If `dest` is provided, use it. Otherwise derive from the repo name
-/// (stripping `create-` prefix if present).
-pub fn resolve_destination(dest: Option<&str>, template_ref: &TemplateRef) -> PathBuf {
+/// If `dest` is provided, use it. Otherwise derive from the template source.
+pub fn resolve_destination(dest: Option<&str>, source: &TemplateSource) -> PathBuf {
     if let Some(d) = dest {
         return PathBuf::from(d);
     }
-
-    // For short-name templates (create-react), strip the "create-" prefix
-    let name = template_ref
-        .repo
-        .strip_prefix("create-")
-        .unwrap_or(&template_ref.repo);
-
-    PathBuf::from(name)
+    PathBuf::from(default_dir_name(source))
 }
 
 /// Check that the destination is usable (doesn't exist or is empty).
 pub fn validate_destination(dest: &Path) -> Result<(), CreateError> {
     if dest.exists() {
-        // Allow if directory is empty
         if dest.is_dir() {
             let is_empty = std::fs::read_dir(dest)
                 .map(|mut entries| entries.next().is_none())
@@ -195,51 +203,95 @@ fn git_init(dest: &Path) -> Result<(), CreateError> {
     Ok(())
 }
 
-/// Create a new project from a GitHub template.
-///
-/// Steps:
-/// 1. Parse template → owner/repo
-/// 2. Resolve destination directory
-/// 3. Download & extract template tarball from GitHub
-/// 4. Update package.json name
-/// 5. Run `vtz install`
-/// 6. `git init` + initial commit
-pub async fn create(
-    template: &str,
-    dest: Option<&str>,
-    output: Arc<dyn PmOutput>,
-) -> Result<PathBuf, CreateError> {
-    // 1. Parse template
-    let template_ref = parse_template(template)?;
+/// Download and extract an NPM package tarball to the destination.
+async fn fetch_npm_template(
+    package_name: &str,
+    dest: &Path,
+    output: &Arc<dyn PmOutput>,
+) -> Result<(), CreateError> {
+    output.info(&format!("Resolving {}...", package_name));
+    let cache_dir = super::registry::default_cache_dir();
+    let registry = RegistryClient::new(&cache_dir);
+
+    let metadata = registry
+        .fetch_metadata(package_name)
+        .await
+        .map_err(|e| CreateError::Other(format!("failed to fetch package metadata: {}", e)))?;
+
+    let latest_version = metadata
+        .dist_tags
+        .get("latest")
+        .ok_or_else(|| CreateError::PackageNotFound(package_name.to_string()))?;
+
+    let version_meta = metadata
+        .versions
+        .get(latest_version)
+        .ok_or_else(|| CreateError::PackageNotFound(package_name.to_string()))?;
+
+    let tarball_url = &version_meta.dist.tarball;
+    let integrity = &version_meta.dist.integrity;
+
     output.info(&format!(
-        "Using template {}/{}",
-        template_ref.owner, template_ref.repo
+        "Downloading {} v{}...",
+        package_name, latest_version
     ));
 
-    // 2. Resolve & validate destination
-    let dest_dir = resolve_destination(dest, &template_ref);
-    let dest_dir = if dest_dir.is_relative() {
-        std::env::current_dir()
-            .map_err(|e| CreateError::Other(format!("failed to get current dir: {}", e)))?
-            .join(&dest_dir)
-    } else {
-        dest_dir
-    };
-    validate_destination(&dest_dir)?;
+    let client = reqwest::Client::builder()
+        .user_agent("vtz")
+        .build()
+        .map_err(|e| CreateError::Other(format!("failed to create HTTP client: {}", e)))?;
 
-    let project_name = dest_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "my-app".to_string());
+    let response = client
+        .get(tarball_url)
+        .send()
+        .await
+        .map_err(|e| CreateError::Other(format!("failed to download template: {}", e)))?;
 
-    // 3. Resolve latest commit and download tarball
+    if !response.status().is_success() {
+        return Err(CreateError::Other(format!(
+            "failed to download {}: HTTP {}",
+            package_name,
+            response.status()
+        )));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| CreateError::Other(format!("failed to read tarball: {}", e)))?;
+
+    // Verify integrity if available
+    if !integrity.is_empty() {
+        super::tarball::verify_integrity_public(&bytes, integrity)
+            .map_err(|e| CreateError::Other(format!("integrity check failed: {}", e)))?;
+    }
+
+    output.info("Extracting template...");
+    std::fs::create_dir_all(dest)
+        .map_err(|e| CreateError::Other(format!("failed to create destination: {}", e)))?;
+
+    let dest_clone = dest.to_path_buf();
+    let bytes_vec = bytes.to_vec();
+    tokio::task::spawn_blocking(move || extract_tarball(&bytes_vec, &dest_clone))
+        .await
+        .map_err(|e| CreateError::Other(format!("extraction task failed: {}", e)))?
+        .map_err(|e| CreateError::Other(format!("failed to extract template: {}", e)))?;
+
+    Ok(())
+}
+
+/// Download and extract a GitHub repo tarball to the destination.
+async fn fetch_github_template(
+    owner: &str,
+    repo: &str,
+    dest: &Path,
+    output: &Arc<dyn PmOutput>,
+) -> Result<(), CreateError> {
     output.info("Resolving template...");
     let github = GitHubClient::new();
-    let sha = github
-        .resolve_ref(&template_ref.owner, &template_ref.repo, None)
-        .await?;
+    let sha = github.resolve_ref(owner, repo, None).await?;
 
-    let tarball_url = GitHubClient::tarball_url(&template_ref.owner, &template_ref.repo, &sha);
+    let tarball_url = GitHubClient::tarball_url(owner, repo, &sha);
 
     output.info("Downloading template...");
     let client = reqwest::Client::builder()
@@ -263,25 +315,75 @@ pub async fn create(
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| CreateError::Other(format!("failed to read template tarball: {}", e)))?;
+        .map_err(|e| CreateError::Other(format!("failed to read tarball: {}", e)))?;
 
-    // 4. Extract to destination
     output.info("Extracting template...");
-    std::fs::create_dir_all(&dest_dir)
+    std::fs::create_dir_all(dest)
         .map_err(|e| CreateError::Other(format!("failed to create destination: {}", e)))?;
 
-    let dest_clone = dest_dir.clone();
+    let dest_clone = dest.to_path_buf();
     let bytes_vec = bytes.to_vec();
     tokio::task::spawn_blocking(move || extract_github_tarball(&bytes_vec, &dest_clone))
         .await
         .map_err(|e| CreateError::Other(format!("extraction task failed: {}", e)))?
         .map_err(|e| CreateError::Other(format!("failed to extract template: {}", e)))?;
 
-    // 5. Update package.json name
+    Ok(())
+}
+
+/// Create a new project from a template.
+///
+/// Template resolution (like `bun create` / `npm create`):
+/// - Short name (`vertz`) → NPM package `create-vertz`
+/// - `owner/repo` → GitHub repository
+/// - `https://github.com/owner/repo` → GitHub repository
+///
+/// Post-creation steps:
+/// 1. Download & extract template
+/// 2. Update package.json name
+/// 3. Run `vtz install`
+/// 4. `git init` + initial commit
+pub async fn create(
+    template: &str,
+    dest: Option<&str>,
+    output: Arc<dyn PmOutput>,
+) -> Result<PathBuf, CreateError> {
+    // 1. Parse template
+    let source = parse_template(template)?;
+
+    // 2. Resolve & validate destination
+    let dest_dir = resolve_destination(dest, &source);
+    let dest_dir = if dest_dir.is_relative() {
+        std::env::current_dir()
+            .map_err(|e| CreateError::Other(format!("failed to get current dir: {}", e)))?
+            .join(&dest_dir)
+    } else {
+        dest_dir
+    };
+    validate_destination(&dest_dir)?;
+
+    let project_name = dest_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "my-app".to_string());
+
+    // 3. Download & extract template
+    match &source {
+        TemplateSource::Npm { package_name } => {
+            output.info(&format!("Using npm package {}", package_name));
+            fetch_npm_template(package_name, &dest_dir, &output).await?;
+        }
+        TemplateSource::GitHub { owner, repo } => {
+            output.info(&format!("Using GitHub template {}/{}", owner, repo));
+            fetch_github_template(owner, repo, &dest_dir, &output).await?;
+        }
+    }
+
+    // 4. Update package.json name
     update_package_name(&dest_dir, &project_name)
         .map_err(|e| CreateError::Other(format!("failed to update package.json: {}", e)))?;
 
-    // 6. Install dependencies
+    // 5. Install dependencies
     output.info("Installing dependencies...");
     if let Err(e) = super::install(
         &dest_dir,
@@ -298,7 +400,7 @@ pub async fn create(
         ));
     }
 
-    // 7. git init + initial commit
+    // 6. git init + initial commit
     output.info("Initializing git repository...");
     if let Err(e) = git_init(&dest_dir) {
         output.warning(&format!("git init failed: {}", e));
@@ -319,23 +421,33 @@ mod tests {
     // --- parse_template tests ---
 
     #[test]
-    fn test_parse_short_name() {
-        let result = parse_template("react").unwrap();
+    fn test_parse_short_name_resolves_to_npm() {
+        let result = parse_template("vertz").unwrap();
         assert_eq!(
             result,
-            TemplateRef {
-                owner: "vertz-dev".to_string(),
-                repo: "create-react".to_string(),
+            TemplateSource::Npm {
+                package_name: "create-vertz".to_string(),
             }
         );
     }
 
     #[test]
-    fn test_parse_owner_repo() {
+    fn test_parse_short_name_react() {
+        let result = parse_template("react").unwrap();
+        assert_eq!(
+            result,
+            TemplateSource::Npm {
+                package_name: "create-react".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_owner_repo_resolves_to_github() {
         let result = parse_template("vertz-dev/template-react").unwrap();
         assert_eq!(
             result,
-            TemplateRef {
+            TemplateSource::GitHub {
                 owner: "vertz-dev".to_string(),
                 repo: "template-react".to_string(),
             }
@@ -347,7 +459,7 @@ mod tests {
         let result = parse_template("https://github.com/owner/my-template").unwrap();
         assert_eq!(
             result,
-            TemplateRef {
+            TemplateSource::GitHub {
                 owner: "owner".to_string(),
                 repo: "my-template".to_string(),
             }
@@ -359,7 +471,7 @@ mod tests {
         let result = parse_template("https://github.com/owner/repo.git").unwrap();
         assert_eq!(
             result,
-            TemplateRef {
+            TemplateSource::GitHub {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
             }
@@ -371,7 +483,7 @@ mod tests {
         let result = parse_template("https://github.com/owner/repo/").unwrap();
         assert_eq!(
             result,
-            TemplateRef {
+            TemplateSource::GitHub {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
             }
@@ -391,7 +503,12 @@ mod tests {
     #[test]
     fn test_parse_trims_whitespace() {
         let result = parse_template("  react  ").unwrap();
-        assert_eq!(result.repo, "create-react");
+        assert_eq!(
+            result,
+            TemplateSource::Npm {
+                package_name: "create-react".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -408,32 +525,40 @@ mod tests {
 
     #[test]
     fn test_resolve_dest_explicit() {
-        let tpl = TemplateRef {
-            owner: "vertz-dev".to_string(),
-            repo: "create-react".to_string(),
+        let src = TemplateSource::Npm {
+            package_name: "create-react".to_string(),
         };
-        let dest = resolve_destination(Some("my-app"), &tpl);
+        let dest = resolve_destination(Some("my-app"), &src);
         assert_eq!(dest, PathBuf::from("my-app"));
     }
 
     #[test]
-    fn test_resolve_dest_from_short_name_template() {
-        let tpl = TemplateRef {
-            owner: "vertz-dev".to_string(),
-            repo: "create-react".to_string(),
+    fn test_resolve_dest_from_npm_strips_create_prefix() {
+        let src = TemplateSource::Npm {
+            package_name: "create-vertz".to_string(),
         };
-        let dest = resolve_destination(None, &tpl);
-        assert_eq!(dest, PathBuf::from("react"));
+        let dest = resolve_destination(None, &src);
+        assert_eq!(dest, PathBuf::from("vertz"));
     }
 
     #[test]
-    fn test_resolve_dest_from_owner_repo_template() {
-        let tpl = TemplateRef {
+    fn test_resolve_dest_from_github() {
+        let src = TemplateSource::GitHub {
             owner: "someone".to_string(),
             repo: "my-template".to_string(),
         };
-        let dest = resolve_destination(None, &tpl);
+        let dest = resolve_destination(None, &src);
         assert_eq!(dest, PathBuf::from("my-template"));
+    }
+
+    #[test]
+    fn test_resolve_dest_from_github_strips_create_prefix() {
+        let src = TemplateSource::GitHub {
+            owner: "someone".to_string(),
+            repo: "create-foo".to_string(),
+        };
+        let dest = resolve_destination(None, &src);
+        assert_eq!(dest, PathBuf::from("foo"));
     }
 
     // --- validate_destination tests ---
@@ -489,7 +614,6 @@ mod tests {
     #[test]
     fn test_update_package_name_no_package_json_is_ok() {
         let dir = tempfile::tempdir().unwrap();
-        // No package.json — should be a no-op
         assert!(update_package_name(dir.path(), "my-app").is_ok());
     }
 
@@ -510,5 +634,32 @@ mod tests {
         assert_eq!(parsed["name"], "new-name");
         assert_eq!(parsed["version"], "1.0.0");
         assert_eq!(parsed["dependencies"]["foo"], "^1.0.0");
+    }
+
+    // --- default_dir_name tests ---
+
+    #[test]
+    fn test_default_dir_name_npm_strips_prefix() {
+        let src = TemplateSource::Npm {
+            package_name: "create-vertz".to_string(),
+        };
+        assert_eq!(default_dir_name(&src), "vertz");
+    }
+
+    #[test]
+    fn test_default_dir_name_npm_no_prefix() {
+        let src = TemplateSource::Npm {
+            package_name: "my-scaffold".to_string(),
+        };
+        assert_eq!(default_dir_name(&src), "my-scaffold");
+    }
+
+    #[test]
+    fn test_default_dir_name_github() {
+        let src = TemplateSource::GitHub {
+            owner: "x".to_string(),
+            repo: "create-foo".to_string(),
+        };
+        assert_eq!(default_dir_name(&src), "foo");
     }
 }
