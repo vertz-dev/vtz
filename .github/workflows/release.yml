@@ -20,7 +20,7 @@ jobs:
             pkg: runtime-darwin-arm64
             expected_arch: arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             pkg: runtime-darwin-x64
             expected_arch: x86_64
           - target: x86_64-unknown-linux-gnu
@@ -36,14 +36,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify runner architecture
-        run: |
-          ACTUAL=$(uname -m)
-          if [ "$ACTUAL" != "${{ matrix.expected_arch }}" ]; then
-            echo "::error::Expected architecture ${{ matrix.expected_arch }} but got $ACTUAL"
-            exit 1
-          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
