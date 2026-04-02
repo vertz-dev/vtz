@@ -32,7 +32,8 @@ owo-colors = "4"
 base64 = "0.22"
 rand = "0.8"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+regex = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

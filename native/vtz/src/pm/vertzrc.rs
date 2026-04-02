@@ -26,6 +26,11 @@ pub struct VertzConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
 
+    /// Dev server proxy configuration.
+    /// Maps path prefixes to proxy targets for API forwarding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<serde_json::Value>,
+
     /// Preserve unknown fields for forward compatibility.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -42,6 +47,7 @@ impl Default for VertzConfig {
             auto_install: true,
             extra_watch_paths: Vec::new(),
             plugin: None,
+            proxy: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -741,5 +747,71 @@ mod tests {
         let loaded = load_vertzrc(dir.path()).unwrap();
         assert_eq!(loaded.trust_scripts, vec!["esbuild", "sharp"]);
         assert_eq!(loaded.extra_watch_paths, vec!["../lib/dist"]);
+    }
+
+    // --- proxy field tests ---
+
+    #[test]
+    fn test_proxy_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_vertzrc(dir.path()).unwrap();
+        assert!(config.proxy.is_none());
+    }
+
+    #[test]
+    fn test_proxy_from_vertzrc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".vertzrc"),
+            r#"{"proxy": {"/api": {"target": "http://localhost:8080"}}}"#,
+        )
+        .unwrap();
+        let config = load_vertzrc(dir.path()).unwrap();
+        assert!(config.proxy.is_some());
+        let proxy = config.proxy.unwrap();
+        assert!(proxy.get("/api").is_some());
+    }
+
+    #[test]
+    fn test_proxy_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy_value = serde_json::json!({
+            "/api": {
+                "target": "http://localhost:8080",
+                "rewrite": { "^/api": "" },
+                "changeOrigin": true
+            }
+        });
+        let config = VertzConfig {
+            proxy: Some(proxy_value.clone()),
+            ..Default::default()
+        };
+        save_vertzrc(dir.path(), &config).unwrap();
+        let loaded = load_vertzrc(dir.path()).unwrap();
+        assert_eq!(loaded.proxy, Some(proxy_value));
+    }
+
+    #[test]
+    fn test_proxy_preserved_with_other_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".vertzrc"),
+            r#"{"trustScripts": ["esbuild"], "proxy": {"/api": {"target": "http://localhost:8080"}}}"#,
+        )
+        .unwrap();
+        config_add_trust_scripts(dir.path(), &["sharp".to_string()]).unwrap();
+        let loaded = load_vertzrc(dir.path()).unwrap();
+        assert_eq!(loaded.trust_scripts, vec!["esbuild", "sharp"]);
+        assert!(loaded.proxy.is_some());
+    }
+
+    #[test]
+    fn test_proxy_not_serialized_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = VertzConfig::default();
+        save_vertzrc(dir.path(), &config).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join(".vertzrc")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.get("proxy").is_none());
     }
 }
